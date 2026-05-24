@@ -1,4 +1,8 @@
-#[derive(Debug, Eq, PartialEq, PartialOrd, Ord)]
+use::std::cmp::Ordering;
+
+use std::collections::BinaryHeap;
+
+#[derive(Debug, PartialEq, Eq)]
 pub struct Job {
     pub id: u64,
     pub job_type: u64,
@@ -9,10 +13,34 @@ pub struct Job {
     pub state: JobState,
 }
 
+impl Ord for Job {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // compare by priority first (highest goes first)
+        match self.priority.cmp(&other.priority) {
+            Ordering::Equal => {
+                //if priorities are equal, compare the created_at time to decide which one is ordered first
+                self.created_at.cmp(&other.created_at).reverse() 
+                //use .reverse() so that earlier jobs come first if priorities are same
+            }
+            other => other, //if different priorites, give the ordering as is
+        }
+    }
+
+
+}
+
+impl PartialOrd for Job {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+        //calls the custom cmp implementation for ord trait
+    }
+}
+
+
 //removed retry_policy struct field from Job to make the retry policy belong to the type of job for simplicity
 //remember to add this later
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum JobState {
     Queued,
     Running {
@@ -38,7 +66,42 @@ pub enum JobState {
 
 //for now i didn't put the specific datatypes in for the fields, as they can be adjusted later based on the actual implementation and requirements of the job processing system.
 
+#[derive(Debug, PartialEq, Eq)]
 pub enum QueueError {
     EmptyQueueDequeue,
     EmptyQueuePeek,
+}
+
+pub struct JobQueue {
+    heap: BinaryHeap<Job>,
+
+}
+
+impl JobQueue {
+    pub fn new() -> Self {
+        JobQueue {
+            heap: BinaryHeap::new(),
+        }
+    }
+
+    pub fn enqueue(&mut self, job: Job) {
+        self.heap.push(job);
+    }
+
+    pub fn dequeue(&mut self) -> Result<Job, QueueError> {
+        self.heap.pop().ok_or(QueueError::EmptyQueueDequeue)
+    }
+
+    pub fn peek(&self) -> Result<&Job, QueueError> {
+        self.heap.peek().ok_or(QueueError::EmptyQueuePeek)
+    }
+
+    pub fn len(&self) -> usize {
+        self.heap.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.heap.is_empty()
+    }
+
 }
