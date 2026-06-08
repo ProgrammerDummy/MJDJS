@@ -1,4 +1,4 @@
-use::std::cmp::Ordering;
+use std::cmp::Ordering;
 
 use std::collections::BinaryHeap;
 
@@ -8,6 +8,7 @@ pub struct Job {
     pub job_type: u64,
     pub payload: u64,
     pub priority: u64,
+    pub available_retry_attempts: u64,
     pub retry_count: u64,
     pub created_at: u64,
     pub state: JobState,
@@ -40,7 +41,7 @@ impl PartialOrd for Job {
 //removed retry_policy struct field from Job to make the retry policy belong to the type of job for simplicity
 //remember to add this later
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum JobState {
     Queued,
     Running {
@@ -53,11 +54,9 @@ pub enum JobState {
     },
     Failed {
         error: u64,
-        attempts: u64,
     },
     Retrying {
         retry_at: u64,
-        attempts: u64,
     },
     DeadLettered {
         reason: String,
