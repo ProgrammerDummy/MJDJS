@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 
 use std::collections::BinaryHeap;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Job {
     pub id: u64,
     pub job_type: u64,
