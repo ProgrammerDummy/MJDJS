@@ -90,7 +90,7 @@ pub fn transition(job: &mut Job, event: JobEvent) -> Result<(), TransitionError>
 mod tests {
     use super::*;
     use crate::job_data_structures::{Job, JobQueue, JobState, QueueError};
-
+ 
     fn make_job(state: JobState) -> Job {
         Job {
             id: 1,
