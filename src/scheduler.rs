@@ -153,3 +153,20 @@ async fn simulate_job_execution(job: Job, worker_id: u64, sender: Sender<JobResu
         event: JobOutcome::Success { result: 1 },
     }).await;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn job_dispatched_and_completed() {
+        let mut scheduler = Scheduler::new();
+        
+        // register a worker
+        // enqueue a job
+        // spawn scheduler.run() as a background task
+        // wait long enough for the job to complete (hint: sleep)
+        // assert in_flight is empty
+        // assert worker is idle again
+    }
+}
