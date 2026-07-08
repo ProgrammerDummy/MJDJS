@@ -11,7 +11,7 @@ pub enum JobEvent {
         result: u64,
     },
     Retry {
-        retry_at: u64,
+        retry_at: std::time::Duration,
     },
     Fail {
         error: u64,
@@ -30,14 +30,17 @@ pub enum TransitionError {
     RetryLimitReached, //when the retry count reaches its maximum so must be deadlettered
 }
 
-pub fn determine_next_event(job: &Job) -> JobEvent { //this is for determining if a failed job should be deadlettered or retried
-    if job.available_retry_attempts != 0 {
-        return JobEvent::Retry { retry_at: 100 }; //just a place holder for retry_at for now
+pub fn determine_next_event(job: &mut Job) -> JobEvent { //this is for determining if a failed job should be deadlettered or retried
+    match job.retry_policy.next_delay(job.retry_count) {
+        Some(delay) => {
+            //let now = std::time::Instant::now();
+            return JobEvent::Retry { retry_at: delay }
+        },
+
+        None => {
+            return JobEvent::DeadLetter { reason: "retries exhausted".to_string() }
+        }
     }
-    else {
-        return JobEvent::DeadLetter { reason: String::from("placeholder reason") };
-    }
-    
 }
 
 //transition should be a pure function 
@@ -188,7 +191,7 @@ mod tests {
     //tests for determine_next_event to see if decision making for if a job should retry or not is correct
     #[test]
     fn expected_return_retry() {
-        let job = Job {
+        let mut job = Job {
             id: 1,
             job_type: 1,
             payload: 1,
@@ -199,13 +202,13 @@ mod tests {
             state: JobState::Failed { error: 1 },
             retry_policy: RetryPolicy::NoRetry,
         };
-        let result = determine_next_event(&job);
+        let result = determine_next_event(&mut job);
 
         assert_eq!(result, JobEvent::Retry { retry_at: 100 });
     }
     #[test]
     fn expected_return_deadletter() {
-        let job = Job {
+        let mut job = Job {
             id: 1,
             job_type: 1,
             payload: 1,
@@ -216,7 +219,7 @@ mod tests {
             state: JobState::Failed { error: 1 },
             retry_policy: RetryPolicy::NoRetry,
         };
-        let result = determine_next_event(&job);
+        let result = determine_next_event(&mut job);
 
         assert_eq!(result, JobEvent::DeadLetter { reason: "placeholder reason".to_string() });
     }

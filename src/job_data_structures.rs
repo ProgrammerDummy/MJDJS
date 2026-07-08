@@ -4,6 +4,8 @@ use std::collections::BinaryHeap;
 
 use ordered_float::OrderedFloat;
 
+use crate::job_data_structures::RetryPolicy::{ExponentialBackoff, FixedDelay, NoRetry};
+
 #[derive(Debug, PartialEq, Clone, Eq)]
 pub struct Job {
     pub id: u64,
@@ -59,11 +61,47 @@ pub enum RetryPolicy { //a retry policy which has three options, to not retry, a
     },
 }
 
+/*
+job fails → transition() records the Fail → determine_next_event(job) 
+  → calls job.retry_policy.next_delay(job.retry_count) 
+  → Some(delay) => JobEvent::Retry { retry_at: now + delay }
+  → None        => JobEvent::DeadLetter { reason: "retries exhausted" }
+
+*/
+
 impl RetryPolicy {
-    pub fn next_delay(&mut self, retry_count: u64) -> Option<u64> { //returns a duration computed
-        
-        
-        todo!()
+    pub fn next_delay(&mut self, retry_count: u64) -> Option<std::time::Duration> { //returns a duration computed
+        match self {
+            NoRetry => {
+                return None
+            },
+
+            FixedDelay { delay_ms, max_attempts} => {
+                if retry_count >= *max_attempts as u64 {
+                    return None
+                }
+
+                return Some(std::time::Duration::from_millis(*delay_ms))
+            },
+
+            ExponentialBackoff {
+                base_ms, 
+                multiplier, 
+                max_attempts, 
+                max_delay_ms } => {
+                    if retry_count >= *max_attempts as u64 {
+                        return None
+                    }
+
+                    if base_ms >= max_delay_ms { //clamp to max_delay_ms
+                        return Some(std::time::Duration::from_millis(*max_delay_ms));
+                    }
+                    return Some(std::time::Duration::from_millis(((*base_ms as f64) * multiplier.powf(retry_count as f64) * rand::random_range(0.75..1.25)) as u64))
+                    //jitter added in exponential backoff as well
+                }
+
+        }
+
     }
 }
 
