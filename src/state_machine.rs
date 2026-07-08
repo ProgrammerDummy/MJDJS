@@ -1,4 +1,4 @@
-use crate::job_data_structures::{JobState, Job};
+use crate::job_data_structures::{JobState, Job, RetryPolicy};
 
 #[derive(PartialEq, Debug)]
 pub enum JobEvent {
@@ -101,6 +101,7 @@ mod tests {
             retry_count: 0,
             created_at: 0,
             state,
+            retry_policy: RetryPolicy::NoRetry,
         }
     }
 
@@ -196,6 +197,7 @@ mod tests {
             retry_count: 0,
             created_at: 0,
             state: JobState::Failed { error: 1 },
+            retry_policy: RetryPolicy::NoRetry,
         };
         let result = determine_next_event(&job);
 
@@ -212,6 +214,7 @@ mod tests {
             retry_count: 0,
             created_at: 0,
             state: JobState::Failed { error: 1 },
+            retry_policy: RetryPolicy::NoRetry,
         };
         let result = determine_next_event(&job);
 
@@ -230,7 +233,8 @@ mod tests {
             available_retry_attempts: 3, 
             retry_count: 0, 
             created_at: 12, 
-            state: JobState::Queued 
+            state: JobState::Queued,
+            retry_policy: RetryPolicy::NoRetry,
         });
 
         queue.enqueue(Job { 
@@ -241,7 +245,8 @@ mod tests {
             available_retry_attempts: 3, 
             retry_count: 0, 
             created_at: 12, 
-            state: JobState::Queued 
+            state: JobState::Queued,
+            retry_policy: RetryPolicy::NoRetry, 
         });
 
         assert_eq!(queue.dequeue(), Ok(Job { 
@@ -252,7 +257,8 @@ mod tests {
             available_retry_attempts: 3, 
             retry_count: 0, 
             created_at: 12, 
-            state: JobState::Queued 
+            state: JobState::Queued,
+            retry_policy: RetryPolicy::NoRetry, 
         }));
 
         assert_eq!(queue.dequeue(), Ok(Job { 
@@ -263,7 +269,8 @@ mod tests {
             available_retry_attempts: 3, 
             retry_count: 0, 
             created_at: 12, 
-            state: JobState::Queued 
+            state: JobState::Queued,
+            retry_policy: RetryPolicy::NoRetry,
         }));        
         
         
@@ -279,7 +286,8 @@ mod tests {
             available_retry_attempts: 3, 
             retry_count: 0, 
             created_at: 12, 
-            state: JobState::Queued 
+            state: JobState::Queued,
+            retry_policy: RetryPolicy::NoRetry, 
         });
 
         queue.enqueue(Job { 
@@ -290,7 +298,8 @@ mod tests {
             available_retry_attempts: 3, 
             retry_count: 0, 
             created_at: 10, 
-            state: JobState::Queued 
+            state: JobState::Queued,
+            retry_policy: RetryPolicy::NoRetry, 
         });
 
         assert_eq!(queue.dequeue(), Ok(Job { 
@@ -301,7 +310,8 @@ mod tests {
             available_retry_attempts: 3, 
             retry_count: 0, 
             created_at: 10, 
-            state: JobState::Queued 
+            state: JobState::Queued,
+            retry_policy: RetryPolicy::NoRetry, 
         }));
 
         assert_eq!(queue.dequeue(), Ok(Job { 
@@ -312,7 +322,8 @@ mod tests {
             available_retry_attempts: 3, 
             retry_count: 0, 
             created_at: 12, 
-            state: JobState::Queued 
+            state: JobState::Queued,
+            retry_policy: RetryPolicy::NoRetry, 
         }));        
     }
     #[test]

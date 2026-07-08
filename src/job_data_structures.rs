@@ -2,7 +2,9 @@ use std::cmp::Ordering;
 
 use std::collections::BinaryHeap;
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+use ordered_float::OrderedFloat;
+
+#[derive(Debug, PartialEq, Clone, Eq)]
 pub struct Job {
     pub id: u64,
     pub job_type: u64,
@@ -12,6 +14,7 @@ pub struct Job {
     pub retry_count: u64,
     pub created_at: u64,
     pub state: JobState,
+    pub retry_policy: RetryPolicy,
 }
 
 impl Ord for Job {
@@ -40,6 +43,29 @@ impl PartialOrd for Job {
 
 //removed retry_policy struct field from Job to make the retry policy belong to the type of job for simplicity
 //remember to add this later
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetryPolicy { //a retry policy which has three options, to not retry, a fixed delay between retries, or an exponential backoff
+    NoRetry,
+    FixedDelay {
+        delay_ms: u64,
+        max_attempts: u32,
+    },
+    ExponentialBackoff {
+        base_ms: u64,
+        multiplier: OrderedFloat<f64>,
+        max_attempts: u32,
+        max_delay_ms: u64,
+    },
+}
+
+impl RetryPolicy {
+    pub fn next_delay(&mut self, retry_count: u64) -> Option<u64> { //returns a duration computed
+        
+        
+        todo!()
+    }
+}
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum JobState {
