@@ -25,12 +25,17 @@ pub struct Worker {
     job_id: Option<u64>,
 }
 
-pub struct WorkerPool {
-    pool: HashMap<u64, Worker>,
-    //hashmap with KV pair of worker_id and the worker
+
+pub trait Runnable {
+    fn run(&self) -> Result<(), WorkerPoolError>;
 }
 
-impl WorkerPool {
+pub struct WorkerPool<T> {
+    pool: HashMap<u64, T>,
+    //hashmap with KV pair of worker_id and the worker with generic type
+}
+
+impl<T: Runnable> WorkerPool<T> {
     pub fn new() -> Self {
         WorkerPool { pool: HashMap::new() }
     }
