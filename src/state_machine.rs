@@ -11,7 +11,7 @@ pub enum JobEvent {
         result: u64,
     },
     Retry {
-        retry_at: std::time::Duration,
+        retry_after: std::time::Duration,
     },
     Fail {
         error: u64,
@@ -30,11 +30,11 @@ pub enum TransitionError {
     RetryLimitReached, //when the retry count reaches its maximum so must be deadlettered
 }
 
-pub fn determine_next_event(job: &mut Job) -> JobEvent { //this is for determining if a failed job should be deadlettered or retried
+pub fn determine_next_event(job: &Job) -> JobEvent { //this is for determining if a failed job should be deadlettered or retried
     match job.retry_policy.next_delay(job.retry_count) {
         Some(delay) => {
             //let now = std::time::Instant::now();
-            return JobEvent::Retry { retry_at: delay }
+            return JobEvent::Retry { retry_after: delay }
         },
 
         None => {
@@ -66,17 +66,17 @@ pub fn transition(job: &mut Job, event: JobEvent) -> Result<(), TransitionError>
             Ok(()) 
         },
 
-        (JobState::Failed { error: _ }, JobEvent::Retry { retry_at }) => {
-            job.state = JobState::Retrying { retry_at };
+        (JobState::Failed { error: _ }, JobEvent::Retry { retry_after }) => {
+            job.state = JobState::Retrying { retry_after };
             Ok(())
         },
 
-        (JobState::Retrying { retry_at: _}, JobEvent::Run { worker_id, started_at }) => {
+        (JobState::Retrying { retry_after: _}, JobEvent::Run { worker_id, started_at }) => {
             job.state = JobState::Running { worker_id, started_at }; //must check for the number of attempts as well later on
             Ok(())
         },
 
-        (JobState::Retrying { retry_at: _}, JobEvent::DeadLetter { reason }) => {
+        (JobState::Retrying { retry_after: _}, JobEvent::DeadLetter { reason }) => {
             job.state = JobState::DeadLettered { reason };
             Ok(())
         },
@@ -131,14 +131,14 @@ mod tests {
     #[test]
     fn failed_plus_retry_to_retrying() {
         let mut job = make_job(JobState::Failed { error: 1 });
-        let event = JobEvent::Retry { retry_at: 2 };
+        let event = JobEvent::Retry { retry_after: std::time::Duration::from_millis(200) };
         let result = transition(&mut job, event);
         assert_eq!(result, Ok(()));
-        assert_eq!(job.state, JobState::Retrying { retry_at: 2 });
+        assert_eq!(job.state, JobState::Retrying { retry_after: std::time::Duration::from_millis(200) });
     }
     #[test]
     fn retrying_plus_run_to_running() {
-        let mut job = make_job(JobState::Retrying { retry_at: 1 });
+        let mut job = make_job(JobState::Retrying { retry_after: std::time::Duration::from_millis(200) });
         let event = JobEvent::Run { worker_id: 1, started_at: 1 };
         let result = transition(&mut job, event);
         assert_eq!(result, Ok(()));
@@ -146,7 +146,7 @@ mod tests {
     }
     #[test]
     fn retrying_plus_deadletter_to_deadlettered() {
-        let mut job = make_job(JobState::Retrying { retry_at: 1 });
+        let mut job = make_job(JobState::Retrying { retry_after: std::time::Duration::from_millis(200) });
         let event = JobEvent::DeadLetter { reason: "unknown for now".to_string() };
         let result = transition(&mut job, event);
         assert_eq!(result, Ok(()));
@@ -181,9 +181,9 @@ mod tests {
     #[test]
     fn running_plus_retry_to_running() {
         let mut job = make_job(JobState::Running { worker_id: 1, started_at: 300 });
-        let event = JobEvent::Retry { retry_at: 10 };
+        let event = JobEvent::Retry { retry_after: std::time::Duration::from_millis(200) };
         let result = transition(&mut job, event);
-        assert_eq!(result, Err(TransitionError::InvalidTransition { previous_state: JobState::Running { worker_id: 1, started_at: 300 }, attempted_transition: JobEvent::Retry { retry_at: 10 }}));
+        assert_eq!(result, Err(TransitionError::InvalidTransition { previous_state: JobState::Running { worker_id: 1, started_at: 300 }, attempted_transition: JobEvent::Retry { retry_after: std::time::Duration::from_millis(200)}}));
         assert_eq!(job.state, JobState::Running { worker_id: 1, started_at: 300 }); 
     }
 
@@ -200,11 +200,17 @@ mod tests {
             retry_count: 0,
             created_at: 0,
             state: JobState::Failed { error: 1 },
-            retry_policy: RetryPolicy::NoRetry,
+            retry_policy: RetryPolicy::FixedDelay { delay_ms: 300, max_attempts: 3 },
         };
         let result = determine_next_event(&mut job);
 
-        assert_eq!(result, JobEvent::Retry { retry_at: 100 });
+        match result {
+            JobEvent::Retry { retry_after } => {
+                assert!((225..375).contains(&retry_after.as_millis()));
+            },
+
+            _ => panic!("expected Retry, got {:?}", result),
+        }
     }
     #[test]
     fn expected_return_deadletter() {
@@ -221,7 +227,23 @@ mod tests {
         };
         let result = determine_next_event(&mut job);
 
-        assert_eq!(result, JobEvent::DeadLetter { reason: "placeholder reason".to_string() });
+        assert_eq!(result, JobEvent::DeadLetter { reason: "retries exhausted".to_string() });
+
+        let mut job = Job {
+            id: 1,
+            job_type: 1,
+            payload: 1,
+            priority: 1,
+            available_retry_attempts: 0,
+            retry_count: 4,
+            created_at: 0,
+            state: JobState::Failed { error: 1 },
+            retry_policy: RetryPolicy::ExponentialBackoff { base_ms: 200, multiplier: ordered_float::OrderedFloat(1.5), max_attempts: 3, max_delay_ms: 1000 },
+        };
+
+        let result = determine_next_event(&mut job);
+
+        assert_eq!(result, JobEvent::DeadLetter { reason: "retries exhausted".to_string() });
     }
 
     #[test]

@@ -70,7 +70,7 @@ job fails → transition() records the Fail → determine_next_event(job)
 */
 
 impl RetryPolicy {
-    pub fn next_delay(&mut self, retry_count: u64) -> Option<std::time::Duration> { //returns a duration computed
+    pub fn next_delay(&self, retry_count: u64) -> Option<std::time::Duration> { //returns a duration computed
         match self {
             NoRetry => {
                 return None
@@ -81,7 +81,7 @@ impl RetryPolicy {
                     return None
                 }
 
-                return Some(std::time::Duration::from_millis(*delay_ms))
+                return Some(std::time::Duration::from_millis(((*delay_ms as f64)*rand::random_range(0.75..1.25)) as u64)) //added jitter to fixed delay
             },
 
             ExponentialBackoff {
@@ -93,11 +93,15 @@ impl RetryPolicy {
                         return None
                     }
 
-                    if base_ms >= max_delay_ms { //clamp to max_delay_ms
+                    let computed_delay = (((*base_ms as f64) * multiplier.powf(retry_count as f64) * rand::random_range(0.75..1.25)) as u64);
+                    //jitter added between a range of 0.75 and 1.25
+
+                    if computed_delay >= *max_delay_ms { //clamp to max_delay_ms
                         return Some(std::time::Duration::from_millis(*max_delay_ms));
                     }
-                    return Some(std::time::Duration::from_millis(((*base_ms as f64) * multiplier.powf(retry_count as f64) * rand::random_range(0.75..1.25)) as u64))
-                    //jitter added in exponential backoff as well
+
+                    return Some(std::time::Duration::from_millis(computed_delay))
+                    
                 }
 
         }
@@ -120,7 +124,7 @@ pub enum JobState {
         error: u64,
     },
     Retrying {
-        retry_at: u64,
+        retry_after: std::time::Duration,
     },
     DeadLettered {
         reason: String,

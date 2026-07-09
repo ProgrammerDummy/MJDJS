@@ -63,8 +63,8 @@ impl Scheduler {
                                     let _ = transition(job, JobEvent::Fail {error}); //another placeholder
 
                                     match determine_next_event(job) {
-                                        JobEvent::Retry {retry_at} => {
-                                            let _ = transition(job, JobEvent::Retry { retry_at });
+                                        JobEvent::Retry {retry_after} => {
+                                            let _ = transition(job, JobEvent::Retry { retry_after });
                                             {
                                                 let mut queue_lock = self.queue.lock().unwrap();
                                                 queue_lock.enqueue(job.clone()); 
