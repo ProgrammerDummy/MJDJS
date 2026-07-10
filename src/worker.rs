@@ -128,18 +128,18 @@ mod tests {
 
     #[test]
     fn register_worker_check() {
-        let mut dum = WorkerPool::new();
+        let mut dum: WorkerPool<Worker> = WorkerPool::new();
 
-        dum.register_worker(1);
+        dum.register_worker(Worker { worker_id: 1, job_id: None });
 
         assert_eq!(dum.find_idle_worker(), Some(1));
     }
 
     #[test]
     fn assign_job_test() {
-        let mut dum = WorkerPool::new();
+        let mut dum: WorkerPool<Worker> = WorkerPool::new();
 
-        dum.register_worker(1);
+        dum.register_worker(Worker { worker_id: 1, job_id: None });
 
         assert_eq!(dum.assign_job(1, 2), Ok(()));
 
@@ -152,9 +152,9 @@ mod tests {
 
     #[test]
     fn free_worker_test() {
-        let mut dum = WorkerPool::new();
+        let mut dum: WorkerPool<Worker> = WorkerPool::new();
 
-        dum.register_worker(1);
+        dum.register_worker(Worker { worker_id: 1, job_id: None });
 
         dum.free_worker(1);
 
@@ -166,7 +166,7 @@ mod tests {
 
     #[test]
     fn find_idle_worker() {
-        let mut dum = WorkerPool::new();
+        let mut dum: WorkerPool<Worker> = WorkerPool::new();
 
         assert_eq!(dum.find_idle_worker(), None);
     }
