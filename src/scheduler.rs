@@ -1,5 +1,5 @@
 use crate::job_data_structures::{Job, JobQueue};
-use crate::worker::{WorkerPool};
+use crate::worker::{WorkerPool, Runnable, Worker};
 use crate::state_machine::{transition, determine_next_event, JobEvent};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::{Receiver, Sender, channel};
@@ -19,16 +19,16 @@ pub struct JobResult {
     pub worker_id: u64,
     event: JobOutcome,
 }
-pub struct Scheduler {
+pub struct Scheduler<T> {
     //main scheduler struct
     pub queue: Arc<Mutex<JobQueue>>,
-    pub worker_pool: Arc<Mutex<WorkerPool>>,
+    pub worker_pool: Arc<Mutex<WorkerPool<T>>>,
     pub job_results: Receiver<JobResult>, //wil receive JobResult from mpsc channel
     pub sender: Sender<JobResult>,
     pub in_flight: HashMap<u64, Job>, //represents jobs currently managed by scheduler
 }
 
-impl Scheduler {
+impl <T: Runnable> Scheduler<T> {
     pub fn new() -> Self {
         let (tx, rx) = channel(100);
 
@@ -86,7 +86,10 @@ impl Scheduler {
                             {
                                 //regardless of outcome, free the worker
                                 let mut worker_pool_lock = self.worker_pool.lock().unwrap();
-                                worker_pool_lock.free_worker(msg.worker_id);
+                                //in case free_worker returns an error, which should be impossible for now, it will log it and continue the loop
+                                if let Err(e) = worker_pool_lock.free_worker(msg.worker_id) {
+                                    eprintln!("free_worker failed for worker {}: {:?}", msg.worker_id, e);
+                                }
                             }
                         }
                     }
@@ -160,7 +163,7 @@ mod tests {
 
     #[tokio::test]
     async fn job_dispatched_and_completed() {
-        let mut scheduler = Scheduler::new();
+        let mut scheduler: Scheduler<Worker> = Scheduler::new();
         
         // register a worker
         // enqueue a job
