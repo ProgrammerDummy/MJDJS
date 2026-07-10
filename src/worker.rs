@@ -21,17 +21,43 @@ pub enum WorkerPoolError {
 
 pub struct Worker {
     pub worker_id: u64,
-    pub status: WorkerStatus,
     job_id: Option<u64>,
 }
 
 
 pub trait Runnable {
     fn run(&self) -> Result<(), WorkerPoolError>;
+    fn get_worker_id(&self) -> u64;
+    fn get_job_id(&self) -> Option<u64>;
+    fn change_job_id(&mut self, job_id: Option<u64>);
+}
+
+impl Runnable for Worker {
+    fn run(&self) -> Result<(), WorkerPoolError> {
+        todo!() //this will replace simulate_job_execution in scheduler.rs in the future, for now just a placeholder
+    }
+
+    fn get_worker_id(&self) -> u64 {
+        self.worker_id
+    }
+
+    fn get_job_id(&self) -> Option<u64> {
+        self.job_id
+    }
+
+    fn change_job_id(&mut self, job_id: Option<u64>) {
+    
+        self.job_id = job_id;
+    }
+}
+
+pub struct PoolEntry<T> {
+    pub worker: T,
+    pub status: WorkerStatus,
 }
 
 pub struct WorkerPool<T> {
-    pool: HashMap<u64, T>,
+    pool: HashMap<u64, PoolEntry<T>>,
     //hashmap with KV pair of worker_id and the worker with generic type
 }
 
@@ -40,8 +66,8 @@ impl<T: Runnable> WorkerPool<T> {
         WorkerPool { pool: HashMap::new() }
     }
 
-    pub fn register_worker(&mut self, worker_id: u64) {
-        self.pool.insert(worker_id, Worker { worker_id, status: WorkerStatus::Idle, job_id: None });
+    pub fn register_worker(&mut self, worker: T) {
+        self.pool.insert(worker.get_worker_id(), PoolEntry { worker, status: WorkerStatus::Idle });
     }
 
     pub fn find_idle_worker(&self) -> Option<u64> {
@@ -56,17 +82,17 @@ impl<T: Runnable> WorkerPool<T> {
     } 
 
     pub fn assign_job(&mut self, worker_id: u64, job_id: u64) -> Result<(), WorkerPoolError> {
-        let worker = self.pool.get_mut(&worker_id);
+        let pool_entry = self.pool.get_mut(&worker_id);
 
-        match worker {
-            Some(worker) => {
-                if worker.status == WorkerStatus::Busy || worker.status == WorkerStatus::Dead {
+        match pool_entry {
+            Some(pool_entry) => {
+                if pool_entry.status == WorkerStatus::Busy || pool_entry.status == WorkerStatus::Dead {
                     Err(WorkerPoolError::WorkerUnavailable)
                 }
 
                 else {
-                    worker.status = WorkerStatus::Busy;
-                    worker.job_id = Some(job_id);
+                    pool_entry.status = WorkerStatus::Busy;
+                    pool_entry.worker.change_job_id(Some(job_id));
                     Ok(())
                 }
             },
@@ -75,17 +101,17 @@ impl<T: Runnable> WorkerPool<T> {
     }
 
     pub fn free_worker(&mut self, worker_id: u64) -> Result<(), WorkerPoolError> {
-        let worker = self.pool.get_mut(&worker_id);
+        let pool_entry = self.pool.get_mut(&worker_id);
 
-        match worker {
-            Some(worker) => {
-                if worker.status == WorkerStatus::Dead {
+        match pool_entry {
+            Some(pool_entry) => {
+                if pool_entry.status == WorkerStatus::Dead {
                     Err(WorkerPoolError::WorkerUnavailable)
                 }
 
                 else {
-                    worker.status = WorkerStatus::Idle;
-                    worker.job_id = None;
+                    pool_entry.status = WorkerStatus::Idle;
+                    pool_entry.worker.change_job_id(None);
                     Ok(())
                 } 
             },
