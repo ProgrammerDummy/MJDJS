@@ -4,6 +4,7 @@ a worker needs a unique id, a status, and a job if it is running one currently
 
 use crate::{worker};
 use std::collections::HashMap;
+use thiserror::Error;
 
 #[derive(PartialEq, Debug)]
 pub enum WorkerStatus {
@@ -12,10 +13,13 @@ pub enum WorkerStatus {
     Dead,
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(Error, PartialEq, Debug)]
 pub enum WorkerPoolError {
-    InvalidAssignment,
+    #[error("Invalid assignment attempted")]
+    InvalidAssignment, //currently a placeholder, not constructed anywhere
+    #[error("Worker not found")]
     WorkerNotFound,
+    #[error("Worker is currently unavailable")]
     WorkerUnavailable,
 } 
 

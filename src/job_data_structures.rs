@@ -4,6 +4,8 @@ use std::collections::BinaryHeap;
 
 use ordered_float::OrderedFloat;
 
+use thiserror::Error;
+
 use crate::job_data_structures::RetryPolicy::{ExponentialBackoff, FixedDelay, NoRetry};
 
 #[derive(Debug, PartialEq, Clone, Eq)]
@@ -62,7 +64,7 @@ pub enum RetryPolicy { //a retry policy which has three options, to not retry, a
 }
 
 /*
-job fails → transition() records the Fail → determine_next_event(job) 
+job fail s → transition() records the Fail → determine_next_event(job) 
   → calls job.retry_policy.next_delay(job.retry_count) 
   → Some(delay) => JobEvent::Retry { retry_at: now + delay }
   → None        => JobEvent::DeadLetter { reason: "retries exhausted" }
@@ -133,9 +135,11 @@ pub enum JobState {
 
 //for now i didn't put the specific datatypes in for the fields, as they can be adjusted later based on the actual implementation and requirements of the job processing system.
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Error, Debug, PartialEq, Eq)]
 pub enum QueueError {
+    #[error("Attempted to dequeue on an empty queue")]
     EmptyQueueDequeue,
+    #[error("Attempted to peek on an empty queue")]
     EmptyQueuePeek,
 }
 

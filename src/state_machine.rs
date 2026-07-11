@@ -1,4 +1,5 @@
 use crate::job_data_structures::{JobState, Job, RetryPolicy};
+use thiserror::Error;
 
 #[derive(PartialEq, Debug)]
 pub enum JobEvent {
@@ -21,13 +22,16 @@ pub enum JobEvent {
     },
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(Error, PartialEq, Debug)]
 pub enum TransitionError {
+    #[error("Invalid transition attempted, previous state: {previous_state:?}, attempted state: {attempted_transition:?}")]
     InvalidTransition {
         previous_state: JobState,
         attempted_transition: JobEvent,
     }, //an example of an invalid transition between states would be success and run
-    RetryLimitReached, //when the retry count reaches its maximum so must be deadlettered
+    #[error("Retry limit reached maximum")]
+    RetryLimitReached, 
+    //when the retry count reaches its maximum so must be deadlettered, for now the error is unreachable so just a placeholder rn
 }
 
 pub fn determine_next_event(job: &Job) -> JobEvent { //this is for determining if a failed job should be deadlettered or retried
