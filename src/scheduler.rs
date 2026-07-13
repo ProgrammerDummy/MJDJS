@@ -355,6 +355,9 @@ use super::*;
 
         scheduler.register_worker(Worker::new(1));
 
+        let in_flight = scheduler.in_flight.clone();
+        let worker_pool = scheduler.worker_pool.clone();
+
         let handle = tokio::spawn(async move {
             scheduler.run(cancel_clone).await;
         });
@@ -363,6 +366,12 @@ use super::*;
         cancel.cancel();
         
         let dum = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+
+        assert!(in_flight.lock().unwrap().is_empty());
+
+        assert_eq!(worker_pool.lock().unwrap().get_worker_status(1), Some(WorkerStatus::Idle));
+
+
     }
 
     #[tokio::test]
@@ -387,6 +396,10 @@ use super::*;
 
         scheduler.register_worker(Worker::new(1));
 
+        let in_flight = scheduler.in_flight.clone();
+        let worker_pool = scheduler.worker_pool.clone();
+        let dead_letter_queue = scheduler.dead_lettered.clone();
+
         let handle = tokio::spawn(async move {
             scheduler.run(cancel_clone).await;
         });
@@ -395,6 +408,23 @@ use super::*;
         cancel.cancel();
         
         let dum = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;        
+
+
+        assert!(in_flight.lock().unwrap().is_empty());
+
+        assert_eq!(worker_pool.lock().unwrap().get_worker_status(1), Some(WorkerStatus::Idle));
+
+        assert_eq!(dead_letter_queue.lock().unwrap().get(&1), Some(&Job { 
+            id: 1,
+            job_type: 1, 
+            payload: 1, 
+            priority: 1, 
+            available_retry_attempts: 0, 
+            retry_count: 1, 
+            created_at: 0, 
+            state: JobState::DeadLettered { reason: "retries exhausted".to_string() }, 
+            retry_policy: RetryPolicy::FixedDelay { delay_ms: 150, max_attempts: 1 }, 
+        }));
 
     }
 }
