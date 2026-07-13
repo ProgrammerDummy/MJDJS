@@ -21,6 +21,7 @@ pub struct JobResult {
     pub worker_id: u64,
     event: JobOutcome,
 }
+
 pub struct Scheduler<T> {
     //main scheduler struct
     pub queue: Arc<Mutex<JobQueue>>,
@@ -29,6 +30,7 @@ pub struct Scheduler<T> {
     pub sender: Sender<JobResult>,
     pub in_flight: Arc<Mutex<HashMap<u64, Job>>>, //represents jobs currently managed by scheduler
     pub notify: Arc<Notify>,
+    pub waiting_retry: Arc<Mutex<HashMap<u64, Job>>>
 }
 
 impl <T: Runnable> Scheduler<T> {
@@ -42,6 +44,7 @@ impl <T: Runnable> Scheduler<T> {
             sender: tx, 
             in_flight: Arc::new(Mutex::new(HashMap::new())),
             notify: Arc::new(Notify::new()),
+            waiting_retry: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -92,9 +95,31 @@ impl <T: Runnable> Scheduler<T> {
                                                 JobEvent::Retry {retry_after} => {
                                                     let _ = transition(job, JobEvent::Retry { retry_after });
                                                     {
-                                                        let mut queue_lock = self.queue.lock().unwrap();
-                                                        queue_lock.enqueue(job.clone()); 
+                                                        {
+                                                            let mut waiting_retry = self.waiting_retry.lock().unwrap();
+
+                                                            waiting_retry.insert(msg.job_id, job.clone());
+                                                        }
+
+                                                        let notify = self.notify.clone();
+                                                        let waiting_retry_lock = self.waiting_retry.clone();
+                                                        let queue_lock = self.queue.clone();
+                                                        let job_clone = job.clone();
+
+                                                        tokio::spawn(async move { //make job sleep until its retry_after duration finishes, remove from waiting_retry and re-enqueue
+                                                            tokio::time::sleep(retry_after).await; 
+                                                            let mut waiting_retry = waiting_retry_lock.lock().unwrap();
+                                                            waiting_retry.remove(&job_clone.id);
+                                                            
+                                                            let mut queue = queue_lock.lock().unwrap();
+                                                            queue.enqueue(job_clone);
+
+                                                            notify.notify_one();
+
+                                                        });
+        
                                                     }
+                                                    in_flight.remove(&msg.job_id);
                                                 },
 
                                                 JobEvent::DeadLetter {reason} => {
@@ -251,15 +276,6 @@ use super::*;
             worker_pool.get_worker_status(1) == Some(WorkerStatus::Idle)
         })
 
-        
-
-
-        // register a worker
-        // enqueue a job
-        // spawn scheduler.run() as a background task
-        // wait long enough for the job to complete (hint: sleep)
-        // assert in_flight is empty
-        // assert worker is idle again
     }
 
     #[tokio::test]
@@ -282,9 +298,6 @@ use super::*;
 
         scheduler.register_worker(Worker::new(1));
 
-        let in_flight = scheduler.in_flight.clone();
-        let worker_pool = scheduler.worker_pool.clone();
-        
         let cancel_clone = cancel.clone();
 
         let handle = tokio::spawn(async move {
@@ -292,10 +305,19 @@ use super::*;
         });
 
         tokio::time::sleep(Duration::from_millis(50)).await;
-
         cancel.cancel();
+        
+        let dum = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
 
-        handle.await
+        match dum {
+            Ok(dum2) => {
+                match dum2 {
+                    Ok(_) => assert!(true),
+                    Err(_) => assert!(false),
+                }
+            },
+            Err(_) => assert!(false),
+        }
 
 
     }
