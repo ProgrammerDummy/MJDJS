@@ -6,7 +6,7 @@ use crate::{worker};
 use std::collections::HashMap;
 use thiserror::Error;
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Clone)]
 pub enum WorkerStatus {
     Idle,
     Busy,
@@ -28,7 +28,11 @@ pub struct Worker {
     job_id: Option<u64>,
 }
 
-
+impl Worker {
+    pub fn new(worker_id: u64) -> Self {
+        Worker { worker_id, job_id: None }
+    }
+}
 pub trait Runnable {
     fn run(&self) -> Result<(), WorkerPoolError>;
     fn get_worker_id(&self) -> u64;
@@ -120,6 +124,17 @@ impl<T: Runnable> WorkerPool<T> {
                 } 
             },
             None => Err(WorkerPoolError::WorkerNotFound)
+        }
+    }
+
+    pub fn get_worker_status(&self, worker_id: u64) -> Option<WorkerStatus> {
+        match self.pool.get(&worker_id) {
+            Some(pool_entry) => {
+                return Some(pool_entry.status.clone())
+            },
+            None => {
+                return None
+            }
         }
     }
 }
