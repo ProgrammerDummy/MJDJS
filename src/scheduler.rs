@@ -30,7 +30,8 @@ pub struct Scheduler<T> {
     pub sender: Sender<JobResult>,
     pub in_flight: Arc<Mutex<HashMap<u64, Job>>>, //represents jobs currently managed by scheduler
     pub notify: Arc<Notify>,
-    pub waiting_retry: Arc<Mutex<HashMap<u64, Job>>>
+    pub waiting_retry: Arc<Mutex<HashMap<u64, Job>>>, //represents jobs which are on timeout after failing
+    pub dead_lettered: Arc<Mutex<HashMap<u64, Job>>>, //minimal deadletter queue for testing purposes currently, will replace later with more info-storing data structure
 }
 
 impl <T: Runnable> Scheduler<T> {
@@ -45,6 +46,7 @@ impl <T: Runnable> Scheduler<T> {
             in_flight: Arc::new(Mutex::new(HashMap::new())),
             notify: Arc::new(Notify::new()),
             waiting_retry: Arc::new(Mutex::new(HashMap::new())),
+            dead_lettered: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -124,6 +126,10 @@ impl <T: Runnable> Scheduler<T> {
 
                                                 JobEvent::DeadLetter {reason} => {
                                                     let _ = transition(job, JobEvent::DeadLetter { reason });
+                                                    {
+                                                        let mut dead_lettered = self.dead_lettered.lock().unwrap();
+                                                        dead_lettered.insert(msg.job_id, job.clone());
+                                                    }
                                                     in_flight.remove(&msg.job_id);
                                                 },
 
@@ -224,11 +230,17 @@ impl <T: Runnable> Scheduler<T> {
 async fn simulate_job_execution(job: Job, worker_id: u64, sender: Sender<JobResult>) { //just a simulator for executing jobs
     let exec_time: u64 = 350;
     tokio::time::sleep(std::time::Duration::from_millis(exec_time)).await;
-    let _ = sender.send(JobResult {
+
+    if job.retry_count == 0 {
+        let _ = sender.send(JobResult { job_id: job.id, worker_id, event: JobOutcome::Failure { error: 1 } }).await;
+    } else {
+        let _ = sender.send(JobResult {
         job_id: job.id,
         worker_id,
         event: JobOutcome::Success { result: 1 },
-    }).await;
+        }).await;
+    }
+    
 }
 
 #[cfg(test)]
@@ -319,6 +331,70 @@ use super::*;
             Err(_) => assert!(false),
         }
 
+
+    }
+
+    #[tokio::test]
+    async fn success_after_retry() {
+        let mut scheduler = Scheduler::new();
+
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+
+        scheduler.enqueue_job(Job { 
+            id: 1,
+            job_type: 1, 
+            payload: 1, 
+            priority: 1, 
+            available_retry_attempts: 3, 
+            retry_count: 0, 
+            created_at: 0, 
+            state: JobState::Queued, 
+            retry_policy: RetryPolicy::FixedDelay { delay_ms: 150, max_attempts: 3 } 
+        });
+
+        scheduler.register_worker(Worker::new(1));
+
+        let handle = tokio::spawn(async move {
+            scheduler.run(cancel_clone).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+        
+        let dum = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
+    async fn deadlettered() {
+        let mut scheduler = Scheduler::new();
+
+        let cancel = CancellationToken::new();
+
+        let cancel_clone = cancel.clone();
+
+        scheduler.enqueue_job(Job { 
+            id: 1,
+            job_type: 1, 
+            payload: 1, 
+            priority: 1, 
+            available_retry_attempts: 1, 
+            retry_count: 0, 
+            created_at: 0, 
+            state: JobState::Queued, 
+            retry_policy: RetryPolicy::FixedDelay { delay_ms: 150, max_attempts: 1 } 
+        });
+
+        scheduler.register_worker(Worker::new(1));
+
+        let handle = tokio::spawn(async move {
+            scheduler.run(cancel_clone).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+        
+        let dum = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;        
 
     }
 }
