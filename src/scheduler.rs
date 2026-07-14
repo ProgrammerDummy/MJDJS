@@ -7,6 +7,8 @@ use tokio::sync::{Notify};
 use tokio_util::sync::CancellationToken;
 use std::collections::HashMap;
 
+const SIMULATE_INITIAL_FAILURE: u64 = 9999;
+
 pub enum JobOutcome {
     Success {
         result: u64,
@@ -174,11 +176,10 @@ impl <T: Runnable> Scheduler<T> {
                             }; //lock for jobqueue dropped here
 
                             match dequeued_job {
-                                Ok(job) => {
+                                Ok(mut job) => {
                                     //at this point both an idle worker and a dequeue-able job exists
                                     let tx_clone = self.sender.clone();
                                     let worker_id_clone = worker_id.clone();
-                                    let job_clone = job.clone();
 
                                     {
                                         let mut worker_pool_lock = self.worker_pool.lock().unwrap();
@@ -187,10 +188,16 @@ impl <T: Runnable> Scheduler<T> {
                                         }
                                     }
 
+                                    if let Err(e) = transition(&mut job, JobEvent::Run { worker_id, started_at: 0}) {
+                                        eprintln!("Transition failed for job: {}, due to {:?}", job.id, e);
+                                    }
+
                                     {
                                         let mut in_flight = self.in_flight.lock().unwrap();
                                         in_flight.insert(job.id.clone(), job.clone());
                                     }
+
+                                    let mut job_clone = job.clone();
 
                                     tokio::spawn(async move { //fire job by submitting task to tokio scheduler 
                                         simulate_job_execution(job_clone, worker_id_clone, tx_clone).await;
@@ -231,7 +238,7 @@ async fn simulate_job_execution(job: Job, worker_id: u64, sender: Sender<JobResu
     let exec_time: u64 = 350;
     tokio::time::sleep(std::time::Duration::from_millis(exec_time)).await;
 
-    if job.retry_count == 0 {
+    if job.retry_count == 0 && job.job_type == SIMULATE_INITIAL_FAILURE {
         let _ = sender.send(JobResult { job_id: job.id, worker_id, event: JobOutcome::Failure { error: 1 } }).await;
     } else {
         let _ = sender.send(JobResult {
@@ -336,21 +343,18 @@ use super::*;
 
     #[tokio::test]
     async fn success_after_retry() {
-        let mut scheduler = Scheduler::new();
+        let mut scheduler: Scheduler<Worker> = Scheduler::new();
 
-        let cancel = CancellationToken::new();
-        let cancel_clone = cancel.clone();
-
-        scheduler.enqueue_job(Job { 
+        scheduler.enqueue_job(Job {
             id: 1,
-            job_type: 1, 
-            payload: 1, 
-            priority: 1, 
-            available_retry_attempts: 3, 
-            retry_count: 0, 
-            created_at: 0, 
-            state: JobState::Queued, 
-            retry_policy: RetryPolicy::FixedDelay { delay_ms: 150, max_attempts: 3 } 
+            job_type: SIMULATE_INITIAL_FAILURE,
+            payload: 1,
+            priority: 1,
+            available_retry_attempts: 3,
+            retry_count: 0,
+            created_at: 0,
+            state: JobState::Queued,
+            retry_policy: RetryPolicy::FixedDelay { delay_ms: 150, max_attempts: 3 },
         });
 
         scheduler.register_worker(Worker::new(1));
@@ -358,40 +362,31 @@ use super::*;
         let in_flight = scheduler.in_flight.clone();
         let worker_pool = scheduler.worker_pool.clone();
 
-        let handle = tokio::spawn(async move {
-            scheduler.run(cancel_clone).await;
+        let cancel = CancellationToken::new(); 
+        tokio::spawn(async move {
+            scheduler.run(cancel).await;
         });
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        cancel.cancel();
         
-        let dum = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        tokio::time::sleep(Duration::from_millis(1100)).await;
 
         assert!(in_flight.lock().unwrap().is_empty());
-
         assert_eq!(worker_pool.lock().unwrap().get_worker_status(1), Some(WorkerStatus::Idle));
-
-
     }
 
     #[tokio::test]
     async fn deadlettered() {
-        let mut scheduler = Scheduler::new();
+        let mut scheduler: Scheduler<Worker> = Scheduler::new();
 
-        let cancel = CancellationToken::new();
-
-        let cancel_clone = cancel.clone();
-
-        scheduler.enqueue_job(Job { 
+        scheduler.enqueue_job(Job {
             id: 1,
-            job_type: 1, 
-            payload: 1, 
-            priority: 1, 
-            available_retry_attempts: 1, 
-            retry_count: 0, 
-            created_at: 0, 
-            state: JobState::Queued, 
-            retry_policy: RetryPolicy::FixedDelay { delay_ms: 150, max_attempts: 1 } 
+            job_type: SIMULATE_INITIAL_FAILURE,
+            payload: 1,
+            priority: 1,
+            available_retry_attempts: 1,
+            retry_count: 0,
+            created_at: 0,
+            state: JobState::Queued,
+            retry_policy: RetryPolicy::FixedDelay { delay_ms: 150, max_attempts: 1 },
         });
 
         scheduler.register_worker(Worker::new(1));
@@ -400,31 +395,26 @@ use super::*;
         let worker_pool = scheduler.worker_pool.clone();
         let dead_letter_queue = scheduler.dead_lettered.clone();
 
-        let handle = tokio::spawn(async move {
-            scheduler.run(cancel_clone).await;
+        let cancel = CancellationToken::new();
+        tokio::spawn(async move {
+            scheduler.run(cancel).await;
         });
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        cancel.cancel();
-        
-        let dum = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;        
 
+        tokio::time::sleep(Duration::from_millis(600)).await;
 
         assert!(in_flight.lock().unwrap().is_empty());
-
         assert_eq!(worker_pool.lock().unwrap().get_worker_status(1), Some(WorkerStatus::Idle));
-
-        assert_eq!(dead_letter_queue.lock().unwrap().get(&1), Some(&Job { 
+        assert_eq!(dead_letter_queue.lock().unwrap().get(&1), Some(&Job {
             id: 1,
-            job_type: 1, 
-            payload: 1, 
-            priority: 1, 
-            available_retry_attempts: 0, 
-            retry_count: 1, 
-            created_at: 0, 
-            state: JobState::DeadLettered { reason: "retries exhausted".to_string() }, 
-            retry_policy: RetryPolicy::FixedDelay { delay_ms: 150, max_attempts: 1 }, 
+            job_type: SIMULATE_INITIAL_FAILURE,
+            payload: 1,
+            priority: 1,
+            available_retry_attempts: 0,
+            retry_count: 1,
+            created_at: 0,
+            state: JobState::DeadLettered { reason: "retries exhausted".to_string() },
+            retry_policy: RetryPolicy::FixedDelay { delay_ms: 150, max_attempts: 1 },
         }));
-
     }
 }
