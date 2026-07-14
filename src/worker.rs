@@ -5,6 +5,7 @@ a worker needs a unique id, a status, and a job if it is running one currently
 use crate::{worker};
 use std::collections::HashMap;
 use thiserror::Error;
+use tokio::sync::watch;
 
 #[derive(PartialEq, Debug, Clone)]
 pub enum WorkerStatus {
@@ -66,16 +67,48 @@ pub struct PoolEntry<T> {
 
 pub struct WorkerPool<T> {
     pool: HashMap<u64, PoolEntry<T>>,
+    watch_teller: watch::Sender<bool>,
     //hashmap with KV pair of worker_id and the worker with generic type
 }
 
 impl<T: Runnable> WorkerPool<T> {
     pub fn new() -> Self {
-        WorkerPool { pool: HashMap::new() }
+
+        let (tx, rx) = tokio::sync::watch::channel(false);
+
+        WorkerPool { 
+            pool: HashMap::new(),
+            watch_teller: tx,
+        }
+    }
+
+    pub fn subscribe(&self) -> watch::Receiver<bool> {
+        self.watch_teller.subscribe()
+    }
+
+    pub fn update_availability(&self) { //THIS MUST ALWAYS BE CALLED AFTER WORKER POOL STATUS MUTATION NOT BEFORE
+        if self.find_idle_worker().is_some() {
+            let current_value = self.watch_teller.borrow();
+
+            if *current_value == false {
+                if let Err(e) = self.watch_teller.send(true) {
+                    eprintln!("Watch channel has been closed, tried to send: {}", e);
+                }
+            }
+        } else { //where there is no idle worker currently
+            let current_value = self.watch_teller.borrow();
+
+            if *current_value == true {
+                if let Err(e) = self.watch_teller.send(false) {
+                    eprintln!("Watch channel has been closed, tried to send: {}", e);
+                }
+            }
+        }
     }
 
     pub fn register_worker(&mut self, worker: T) {
         self.pool.insert(worker.get_worker_id(), PoolEntry { worker, status: WorkerStatus::Idle });
+        self.update_availability();
     }
 
     pub fn find_idle_worker(&self) -> Option<u64> {
@@ -101,8 +134,10 @@ impl<T: Runnable> WorkerPool<T> {
                 else {
                     pool_entry.status = WorkerStatus::Busy;
                     pool_entry.worker.change_job_id(Some(job_id));
+                    self.update_availability();
                     Ok(())
                 }
+
             },
             None => Err(WorkerPoolError::WorkerNotFound),
         }
@@ -120,6 +155,7 @@ impl<T: Runnable> WorkerPool<T> {
                 else {
                     pool_entry.status = WorkerStatus::Idle;
                     pool_entry.worker.change_job_id(None);
+                    self.update_availability();
                     Ok(())
                 } 
             },
@@ -136,7 +172,9 @@ impl<T: Runnable> WorkerPool<T> {
                 return None
             }
         }
+        
     }
+
 }
 
 #[cfg(test)]
