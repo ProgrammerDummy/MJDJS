@@ -2,10 +2,13 @@
 a worker needs a unique id, a status, and a job if it is running one currently
 */
 
-use crate::{worker};
+use crate::job_data_structures::{Job, JobOutcome};
 use std::collections::HashMap;
 use thiserror::Error;
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
+
+const SIMULATE_INITIAL_FAILURE: u64 = 9999;
 
 #[derive(PartialEq, Debug, Clone)]
 pub enum WorkerStatus {
@@ -24,40 +27,50 @@ pub enum WorkerPoolError {
     WorkerUnavailable,
 } 
 
+#[derive(Error, Debug, Clone, PartialEq)]
+pub enum JobExecutionError {
+
+    //unreachable for now, serves as a placeholder that i will fill out
+}
+
+#[derive(Clone)]
 pub struct Worker {
     pub worker_id: u64,
-    job_id: Option<u64>,
 }
 
 impl Worker {
     pub fn new(worker_id: u64) -> Self {
-        Worker { worker_id, job_id: None }
+        Worker { worker_id }
     }
 }
-pub trait Runnable {
-    fn run(&self) -> Result<(), WorkerPoolError>;
+pub trait Runnable: Clone + Send + 'static {
+    fn run(&self, job: Job, cancel: CancellationToken) -> impl Future<Output = Result<JobOutcome, JobExecutionError>> + Send;
     fn get_worker_id(&self) -> u64;
-    fn get_job_id(&self) -> Option<u64>;
-    fn change_job_id(&mut self, job_id: Option<u64>);
 }
 
 impl Runnable for Worker {
-    fn run(&self) -> Result<(), WorkerPoolError> {
-        todo!() //this will replace simulate_job_execution in scheduler.rs in the future, for now just a placeholder
+    async fn run(&self, job: Job, cancel: CancellationToken) -> Result<JobOutcome, JobExecutionError> {
+
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                return Ok(JobOutcome::Cancelled)
+            },
+
+            _ = tokio::time::sleep(std::time::Duration::from_millis(job.payload)) => {
+                if job.retry_count == 0 && job.job_type == SIMULATE_INITIAL_FAILURE {
+                    return Ok(JobOutcome::Failure { error: 1 });
+                } else {
+                    return Ok(JobOutcome::Success { result: 1 });
+                }
+            },
+        }
     }
 
     fn get_worker_id(&self) -> u64 {
         self.worker_id
     }
 
-    fn get_job_id(&self) -> Option<u64> {
-        self.job_id
-    }
 
-    fn change_job_id(&mut self, job_id: Option<u64>) {
-    
-        self.job_id = job_id;
-    }
 }
 
 pub struct PoolEntry<T> {
@@ -103,6 +116,10 @@ impl<T: Runnable> WorkerPool<T> {
 
     }
 
+    pub fn get_worker(&self, worker_id: u64) -> Option<T> {
+        self.pool.get(&worker_id).map(|entry| entry.worker.clone())
+    }
+
     pub fn register_worker(&mut self, worker: T) {
         self.pool.insert(worker.get_worker_id(), PoolEntry { worker, status: WorkerStatus::Idle });
         self.update_availability();
@@ -119,7 +136,7 @@ impl<T: Runnable> WorkerPool<T> {
         })
     } 
 
-    pub fn assign_job(&mut self, worker_id: u64, job_id: u64) -> Result<(), WorkerPoolError> {
+    pub fn assign_job(&mut self, worker_id: u64) -> Result<(), WorkerPoolError> {
         let pool_entry = self.pool.get_mut(&worker_id);
 
         match pool_entry {
@@ -130,7 +147,6 @@ impl<T: Runnable> WorkerPool<T> {
 
                 else {
                     pool_entry.status = WorkerStatus::Busy;
-                    pool_entry.worker.change_job_id(Some(job_id));
                     self.update_availability();
                     Ok(())
                 }
@@ -151,7 +167,6 @@ impl<T: Runnable> WorkerPool<T> {
 
                 else {
                     pool_entry.status = WorkerStatus::Idle;
-                    pool_entry.worker.change_job_id(None);
                     self.update_availability();
                     Ok(())
                 } 
@@ -184,7 +199,7 @@ mod tests {
     fn register_worker_check() {
         let mut dum: WorkerPool<Worker> = WorkerPool::new();
 
-        dum.register_worker(Worker { worker_id: 1, job_id: None });
+        dum.register_worker(Worker { worker_id: 1 });
 
         assert_eq!(dum.find_idle_worker(), Some(1));
     }
@@ -193,22 +208,22 @@ mod tests {
     fn assign_job_test() {
         let mut dum: WorkerPool<Worker> = WorkerPool::new();
 
-        dum.register_worker(Worker { worker_id: 1, job_id: None });
+        dum.register_worker(Worker { worker_id: 1 });
 
-        assert_eq!(dum.assign_job(1, 2), Ok(()));
+        assert_eq!(dum.assign_job(1), Ok(()));
 
         assert_eq!(dum.pool[&1].status, WorkerStatus::Busy);
 
-        assert_eq!(dum.assign_job(1, 3), Err(WorkerPoolError::WorkerUnavailable));
+        assert_eq!(dum.assign_job(1), Err(WorkerPoolError::WorkerUnavailable));
 
-        assert_eq!(dum.assign_job(2, 4), Err(WorkerPoolError::WorkerNotFound));
+        assert_eq!(dum.assign_job(2), Err(WorkerPoolError::WorkerNotFound));
     }
 
     #[test]
     fn free_worker_test() {
         let mut dum: WorkerPool<Worker> = WorkerPool::new();
 
-        dum.register_worker(Worker { worker_id: 1, job_id: None });
+        dum.register_worker(Worker { worker_id: 1 });
 
         dum.free_worker(1);
 
