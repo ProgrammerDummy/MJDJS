@@ -43,6 +43,16 @@ impl PartialOrd for Job {
         //calls the custom cmp implementation for ord trait
     }
 }
+#[derive(Debug, Clone, PartialEq)]
+pub enum JobOutcome {
+    Success {
+        result: u64,
+    },
+    Failure {
+        error: u64,
+    },
+    Cancelled,
+}
 
 
 //removed retry_policy struct field from Job to make the retry policy belong to the type of job for simplicity
