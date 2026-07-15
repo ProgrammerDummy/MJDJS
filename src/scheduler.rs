@@ -1,4 +1,4 @@
-use crate::job_data_structures::{Job, JobQueue};
+use crate::job_data_structures::{Job, JobQueue, JobOutcome};
 use crate::worker::{WorkerPool, Runnable, Worker};
 use crate::state_machine::{transition, determine_next_event, JobEvent};
 use std::sync::{Arc, Mutex};
@@ -9,14 +9,6 @@ use std::collections::HashMap;
 
 const SIMULATE_INITIAL_FAILURE: u64 = 9999;
 
-pub enum JobOutcome {
-    Success {
-        result: u64,
-    },
-    Failure {
-        error: u64,
-    }
-}
 pub struct JobResult { 
     //a struct to pass through the mpsc with appropriate data representing the finished job
     pub job_id: u64,
@@ -91,12 +83,21 @@ impl <T: Runnable> Scheduler<T> {
 
                                     match in_flight.get_mut(&msg.job_id) {
                                         Some(job) => {
-                                            let _ = transition(job, JobEvent::Success { completed_at: 0u64, result}); //explicit ignore and placeholder values until i implement real clock
-                                            {
-                                                let mut succeeded = self.succeeded.lock().unwrap();
-                                                succeeded.insert(msg.job_id, job.clone());
+                                            match transition(job, JobEvent::Success { completed_at: 0u64, result}) {
+                                                //placeholder values until i implement real clock
+                                                Ok(_) => {
+                                                    let mut succeeded = self.succeeded.lock().unwrap();
+                                                    succeeded.insert(msg.job_id, job.clone());
+                                                    
+                                                    in_flight.remove(&msg.job_id); //remove the job from the in_flight hashmap
+                                                },
+                                                Err(e) => {
+                                                    eprintln!("Transition to Success failed for job: {}, error: {:?}", msg.job_id, e);
+                                                    in_flight.remove(&msg.job_id);
+                                                },
                                             }
-                                            in_flight.remove(&msg.job_id); //remove the job from the in_flight hashmap
+
+
                                         },
 
                                         None => {
@@ -109,55 +110,90 @@ impl <T: Runnable> Scheduler<T> {
                                     let mut in_flight = self.in_flight.lock().unwrap();
                                     match in_flight.get_mut(&msg.job_id) {
                                         Some(job) => {
-                                            let _ = transition(job, JobEvent::Fail {error}); //another placeholder
 
-                                            match determine_next_event(job) {
-                                                JobEvent::Retry {retry_after} => {
-                                                    let _ = transition(job, JobEvent::Retry { retry_after });
-                                                    {
-                                                        {
-                                                            let mut waiting_retry = self.waiting_retry.lock().unwrap();
 
-                                                            waiting_retry.insert(msg.job_id, job.clone());
-                                                        }
+                                            match transition(job, JobEvent::Fail {error}) {
+                                                //placeholder values until i implement real clock
+                                                Ok(_) => {
+                                                    match determine_next_event(job) {
+                                                        JobEvent::Retry {retry_after} => {
+                                                            match transition(job, JobEvent::Retry { retry_after }) {
+                                                                Ok(_) => {
+                                                                    {
+                                                                        {
+                                                                            let mut waiting_retry = self.waiting_retry.lock().unwrap();
 
-                                                        let notify = self.notify.clone();
-                                                        let waiting_retry_lock = self.waiting_retry.clone();
-                                                        let queue_lock = self.queue.clone();
-                                                        let job_clone = job.clone();
+                                                                            waiting_retry.insert(msg.job_id, job.clone());
+                                                                        }
 
-                                                        tokio::spawn(async move { //make job sleep until its retry_after duration finishes, remove from waiting_retry and re-enqueue
-                                                            tokio::time::sleep(retry_after).await; 
-                                                            let mut waiting_retry = waiting_retry_lock.lock().unwrap();
-                                                            waiting_retry.remove(&job_clone.id);
+                                                                        let notify = self.notify.clone();
+                                                                        let waiting_retry_lock = self.waiting_retry.clone();
+                                                                        let queue_lock = self.queue.clone();
+                                                                        let job_clone = job.clone();
+
+                                                                        tokio::spawn(async move { //make job sleep until its retry_after duration finishes, remove from waiting_retry and re-enqueue
+                                                                            tokio::time::sleep(retry_after).await; 
+                                                                            let mut waiting_retry = waiting_retry_lock.lock().unwrap();
+                                                                            waiting_retry.remove(&job_clone.id);
+                                                                            
+                                                                            let mut queue = queue_lock.lock().unwrap();
+                                                                            queue.enqueue(job_clone);
+
+                                                                            notify.notify_one();
+
+                                                                        });
+                        
+                                                                    }
+                                                                    in_flight.remove(&msg.job_id);
+                                                                },
+
+                                                                Err(e) => {
+                                                                    eprintln!("Transition to Retry failed for job: {}, error: {:?}", msg.job_id, e);
+                                                                    in_flight.remove(&msg.job_id);
+                                                                }
+                                                            }
                                                             
-                                                            let mut queue = queue_lock.lock().unwrap();
-                                                            queue.enqueue(job_clone);
+                                    
+                                                        },
 
-                                                            notify.notify_one();
+                                                        JobEvent::DeadLetter {reason} => {
+                                                            match transition(job, JobEvent::DeadLetter { reason }) {
+                                                                Ok(_) => {
+                                                                    let mut dead_lettered = self.dead_lettered.lock().unwrap();
+                                                                    dead_lettered.insert(msg.job_id, job.clone());
+                                                                    in_flight.remove(&msg.job_id);
+                                                                },
 
-                                                        });
-        
+                                                                Err(e) => {
+                                                                    eprintln!("Transition to Deadletter failed for job: {}, error: {:?}", msg.job_id, e);
+                                                                    in_flight.remove(&msg.job_id);
+                                                                }
+                                                            }
+                                                            
+
+                                                        
+                                                        },
+
+                                                        _ => {}, //since determine_next_event only ever returns deadletter or retry, im ignoring this
                                                     }
+
+                                                },
+                                                Err(e) => {
+                                                    eprintln!("Transition to Fail failed for job: {}, error: {:?}", msg.job_id, e);
                                                     in_flight.remove(&msg.job_id);
                                                 },
-
-                                                JobEvent::DeadLetter {reason} => {
-                                                    let _ = transition(job, JobEvent::DeadLetter { reason });
-                                                    {
-                                                        let mut dead_lettered = self.dead_lettered.lock().unwrap();
-                                                        dead_lettered.insert(msg.job_id, job.clone());
-                                                    }
-                                                    in_flight.remove(&msg.job_id);
-                                                },
-
-                                                _ => {}, //since determine_next_event only ever returns deadletter or retry, im ignoring this
                                             }
+
+                            
                                         }
 
                                         None => {},
                                     }
-                                }
+                                },
+
+                                JobOutcome::Cancelled => {
+
+                                },
 
                             }
 
@@ -199,12 +235,10 @@ impl <T: Runnable> Scheduler<T> {
                                     }
 
                                     //at this point both an idle worker and a dequeue-able job exists
-                                    let tx_clone = self.sender.clone();
-                                    let worker_id_clone = worker_id.clone();
 
                                     {
                                         let mut worker_pool_lock = self.worker_pool.lock().unwrap();
-                                        if worker_pool_lock.assign_job(worker_id, job.id.clone()) != Ok(()) {
+                                        if worker_pool_lock.assign_job(worker_id) != Ok(()) {
                                             return; //currently this is unreachable but returns just in case
                                         }
                                     }
@@ -218,10 +252,36 @@ impl <T: Runnable> Scheduler<T> {
                                         in_flight.insert(job.id.clone(), job.clone());
                                     }
 
-                                    let mut job_clone = job.clone();
+                                    let tx_clone = self.sender.clone();
+                                    let worker_id_clone = worker_id.clone();
+                                    let cancel_clone = cancel.clone();
+
+                                    let job_clone = job.clone();
+
+                                    let worker_pool_lock = self.worker_pool.clone();
+                                
 
                                     tokio::spawn(async move { //fire job by submitting task to tokio scheduler 
-                                        simulate_job_execution(job_clone, worker_id_clone, tx_clone).await;
+                                        let worker_clone = {
+                                            worker_pool_lock.lock().unwrap().get_worker(worker_id_clone)
+                                        };
+
+                                        if let Some(worker) = worker_clone {
+                                            match worker.run(job_clone.clone(), cancel_clone).await {
+                                                Ok(outcome) => {
+                                                    let _ = tx_clone.send(JobResult {
+                                                        job_id: job_clone.id,
+                                                        worker_id: worker_id_clone,
+                                                        event: outcome,
+                                                    }).await;
+                                                },
+
+                                                Err(e) => {
+                                                    eprintln!("Error occured during job execution: {:?}", e);
+                                                },
+                                            }
+                                        }
+                                        //let _ = tx_clone.send();
                                     });
                                 },
                                 Err(_) => {
@@ -280,7 +340,7 @@ async fn simulate_job_execution(job: Job, worker_id: u64, sender: Sender<JobResu
 mod tests {
     use std::time::Duration;
 
-use crate::{job_data_structures::{JobState, RetryPolicy}, scheduler, worker::WorkerStatus};
+use crate::{job_data_structures::{JobState, RetryPolicy}, worker::WorkerStatus};
     
 use super::*;
 
