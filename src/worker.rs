@@ -87,25 +87,20 @@ impl<T: Runnable> WorkerPool<T> {
     }
 
     pub fn update_availability(&self) { //THIS MUST ALWAYS BE CALLED AFTER WORKER POOL STATUS MUTATION NOT BEFORE
-        if self.find_idle_worker().is_some() {
-            let current_value = self.watch_teller.borrow();
+        let has_idle_worker = self.find_idle_worker().is_some();
 
-            if *current_value == false {
-                eprintln!("update_availability: sending {}", true);
-                if let Err(e) = self.watch_teller.send(true) {
-                    eprintln!("Watch channel has been closed, tried to send: {}", e);
-                }
+        self.watch_teller.send_if_modified(|current_value| {
+            if has_idle_worker && *current_value == false {
+                *current_value = true;
+                true
+            } else if !has_idle_worker && *current_value == true {
+                *current_value = false;
+                true
+            } else {
+                false
             }
-        } else { //where there is no idle worker currently
-            let current_value = self.watch_teller.borrow();
+        });
 
-            if *current_value == true {
-                eprintln!("update_availability: sending {}", false);
-                if let Err(e) = self.watch_teller.send(false) {
-                    eprintln!("Watch channel has been closed, tried to send: {}", e);
-                }
-            }
-        }
     }
 
     pub fn register_worker(&mut self, worker: T) {
