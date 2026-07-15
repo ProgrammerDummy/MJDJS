@@ -3,7 +3,7 @@ use crate::worker::{WorkerPool, Runnable, Worker};
 use crate::state_machine::{transition, determine_next_event, JobEvent};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::{Receiver, Sender, channel};
-use tokio::sync::{Notify};
+use tokio::sync::{Notify, watch};
 use tokio_util::sync::CancellationToken;
 use std::collections::HashMap;
 
@@ -34,21 +34,27 @@ pub struct Scheduler<T> {
     pub notify: Arc<Notify>,
     pub waiting_retry: Arc<Mutex<HashMap<u64, Job>>>, //represents jobs which are on timeout after failing
     pub dead_lettered: Arc<Mutex<HashMap<u64, Job>>>, //minimal deadletter queue for testing purposes currently, will replace later with more info-storing data structure
+    pub watcher: watch::Receiver<bool>,
 }
 
 impl <T: Runnable> Scheduler<T> {
     pub fn new() -> Self {
         let (tx, rx) = channel(100);
 
+        let pool = WorkerPool::new();
+
+        let watcher = pool.subscribe();
+
         Scheduler { 
             queue: Arc::new(Mutex::new(JobQueue::new())), 
-            worker_pool: Arc::new(Mutex::new(WorkerPool::new())), 
+            worker_pool: Arc::new(Mutex::new(pool)), 
             job_results: rx,
             sender: tx, 
             in_flight: Arc::new(Mutex::new(HashMap::new())),
             notify: Arc::new(Notify::new()),
             waiting_retry: Arc::new(Mutex::new(HashMap::new())),
             dead_lettered: Arc::new(Mutex::new(HashMap::new())),
+            watcher,
         }
     }
 
@@ -65,6 +71,8 @@ impl <T: Runnable> Scheduler<T> {
     }
 
     pub async fn run(&mut self, cancel: CancellationToken) {
+
+        eprintln!("run() started");
 
         let mut shutting_down = false;
 
@@ -209,7 +217,13 @@ impl <T: Runnable> Scheduler<T> {
                             }
                         },
                         None => {
-                            self.notify.notified().await; //if no idle workers can be found, await
+                            eprintln!("dispatch: no idle worker, awaiting watcher.changed()");
+                            if let Err(_) = self.watcher.changed().await {
+                                eprintln!("Watch channel closed, sender dropped");
+                            }
+
+                            eprintln!("dispatch: watcher.changed() resolved");
+                            //if no idle workers can be found, await
                         },
                     }
                 }, if !shutting_down => {},
@@ -375,6 +389,7 @@ use super::*;
 
     #[tokio::test]
     async fn deadlettered() {
+
         let mut scheduler: Scheduler<Worker> = Scheduler::new();
 
         scheduler.enqueue_job(Job {
@@ -391,14 +406,19 @@ use super::*;
 
         scheduler.register_worker(Worker::new(1));
 
+        eprintln!("aaa");
+
         let in_flight = scheduler.in_flight.clone();
         let worker_pool = scheduler.worker_pool.clone();
         let dead_letter_queue = scheduler.dead_lettered.clone();
 
         let cancel = CancellationToken::new();
+        eprintln!("about to spawn run()");
         tokio::spawn(async move {
             scheduler.run(cancel).await;
         });
+
+        eprintln!("spawn() call returned");
 
 
         tokio::time::sleep(Duration::from_millis(600)).await;
