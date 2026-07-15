@@ -192,7 +192,12 @@ impl <T: Runnable> Scheduler<T> {
                                 },
 
                                 JobOutcome::Cancelled => {
-
+                                    let mut in_flight = self.in_flight.lock().unwrap();
+                                    if in_flight.remove(&msg.job_id).is_some() {
+                                        eprintln!("Job {} was cancelled during shutdown and dropped", msg.job_id);
+                                    } else {
+                                        eprintln!("Job {} reported cancelled but was not found in in_flight", msg.job_id);
+                                    }
                                 },
 
                             }
