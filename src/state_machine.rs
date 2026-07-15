@@ -85,6 +85,11 @@ pub fn transition(job: &mut Job, event: JobEvent) -> Result<(), TransitionError>
             Ok(())
         },
 
+        (JobState::Failed { error: _ }, JobEvent::DeadLetter { reason }) => {
+            job.state = JobState::DeadLettered { reason };
+            Ok(())
+        },
+
         (state, event) => {
             job.state = state.clone();  
             Err(TransitionError::InvalidTransition { previous_state: state, attempted_transition: event })
