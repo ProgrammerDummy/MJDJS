@@ -36,6 +36,7 @@ pub struct Scheduler<T> {
     pub dead_lettered: Arc<Mutex<HashMap<u64, Job>>>, //minimal deadletter queue for testing purposes currently, will replace later with more info-storing data structure
     pub watcher: watch::Receiver<bool>,
     pub succeeded: Arc<Mutex<HashMap<u64, Job>>>,
+    pub dispatch_order: Option<Arc<Mutex<Vec<Job>>>>,
 }
 
 impl <T: Runnable> Scheduler<T> {
@@ -57,6 +58,7 @@ impl <T: Runnable> Scheduler<T> {
             dead_lettered: Arc::new(Mutex::new(HashMap::new())),
             watcher,
             succeeded: Arc::new(Mutex::new(HashMap::new())),
+            dispatch_order: None, //mainly for testing purposes to confirm that priority of jobs dispatched is non-increasing
         }
     }
 
@@ -90,11 +92,11 @@ impl <T: Runnable> Scheduler<T> {
                                     match in_flight.get_mut(&msg.job_id) {
                                         Some(job) => {
                                             let _ = transition(job, JobEvent::Success { completed_at: 0u64, result}); //explicit ignore and placeholder values until i implement real clock
-                                            in_flight.remove(&msg.job_id); //remove the job from the in_flight hashmap
                                             {
                                                 let mut succeeded = self.succeeded.lock().unwrap();
                                                 succeeded.insert(msg.job_id, job.clone());
                                             }
+                                            in_flight.remove(&msg.job_id); //remove the job from the in_flight hashmap
                                         },
 
                                         None => {
@@ -191,6 +193,11 @@ impl <T: Runnable> Scheduler<T> {
 
                             match dequeued_job {
                                 Ok(mut job) => {
+
+                                    if let Some(tracker) = &self.dispatch_order {
+                                        tracker.lock().unwrap().push(job.clone());
+                                    }
+
                                     //at this point both an idle worker and a dequeue-able job exists
                                     let tx_clone = self.sender.clone();
                                     let worker_id_clone = worker_id.clone();
@@ -255,8 +262,7 @@ impl <T: Runnable> Scheduler<T> {
 }
 
 async fn simulate_job_execution(job: Job, worker_id: u64, sender: Sender<JobResult>) { //just a simulator for executing jobs
-    let exec_time: u64 = 350;
-    tokio::time::sleep(std::time::Duration::from_millis(exec_time)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(job.payload)).await;
 
     if job.retry_count == 0 && job.job_type == SIMULATE_INITIAL_FAILURE {
         let _ = sender.send(JobResult { job_id: job.id, worker_id, event: JobOutcome::Failure { error: 1 } }).await;
@@ -287,7 +293,7 @@ use super::*;
         scheduler.enqueue_job(Job { 
             id: 1,
             job_type: 1, 
-            payload: 1, 
+            payload: 350, 
             priority: 1, 
             available_retry_attempts: 3, 
             retry_count: 0, 
@@ -326,7 +332,7 @@ use super::*;
         scheduler.enqueue_job(Job { 
             id: 1,
             job_type: 1, 
-            payload: 1, 
+            payload: 350, 
             priority: 1, 
             available_retry_attempts: 3, 
             retry_count: 0, 
@@ -368,7 +374,7 @@ use super::*;
         scheduler.enqueue_job(Job {
             id: 1,
             job_type: SIMULATE_INITIAL_FAILURE,
-            payload: 1,
+            payload: 350,
             priority: 1,
             available_retry_attempts: 3,
             retry_count: 0,
@@ -401,7 +407,7 @@ use super::*;
         scheduler.enqueue_job(Job {
             id: 1,
             job_type: SIMULATE_INITIAL_FAILURE,
-            payload: 1,
+            payload: 350,
             priority: 1,
             available_retry_attempts: 1,
             retry_count: 0,
@@ -434,7 +440,7 @@ use super::*;
         assert_eq!(dead_letter_queue.lock().unwrap().get(&1), Some(&Job {
             id: 1,
             job_type: SIMULATE_INITIAL_FAILURE,
-            payload: 1,
+            payload: 350,
             priority: 1,
             available_retry_attempts: 0,
             retry_count: 1,
@@ -446,6 +452,76 @@ use super::*;
 
     #[tokio::test]
     async fn stress_test() {
+        let mut scheduler: Scheduler<Worker> = Scheduler::new();
+
+        scheduler.dispatch_order = Some(Arc::new(Mutex::new(Vec::new())));
+
+        for i in 1..=10 {
+            scheduler.register_worker(Worker::new(i));
+        }
+
+        for i in 0..1000 {
+            scheduler.enqueue_job(Job { 
+                id: i,
+                job_type: 1, 
+                payload: rand::random_range(1..=100), 
+                priority: rand::random_range(1..=1000), 
+                available_retry_attempts: 3, 
+                retry_count: 0, 
+                created_at: 0, 
+                state: JobState::Queued, 
+                retry_policy: RetryPolicy::FixedDelay { delay_ms: 100, max_attempts: 3 } 
+            });
+        }
+
+        let cancel = CancellationToken::new();
+
+        let cancel_clone = cancel.clone();
+
+        let succeeded_clone = scheduler.succeeded.clone();
+        let dispatch_order_clone = scheduler.dispatch_order.clone().unwrap();
+        let in_flight_clone = scheduler.in_flight.clone();
+        let worker_pool_clone= scheduler.worker_pool.clone();
+
+        let handle = tokio::spawn(async move {
+            scheduler.run(cancel).await;
+        });
+
+        let mut in_flight_empty = false;
+
+        let poll_result = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                {
+                    in_flight_empty = in_flight_clone.lock().unwrap().is_empty();
+                }
+                if succeeded_clone.lock().unwrap().len() >= 1000 && in_flight_empty {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }).await;
+
+        assert!(poll_result.is_ok(), "stress test did not complete within 60s");
+
+        cancel_clone.cancel();
+
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+
+        
+        let guard = dispatch_order_clone.lock().unwrap();
+
+        for pair in guard.windows(2) {
+            if pair[0].priority < pair[1].priority {
+                panic!("dispatch order was not non-increasing");
+            }
+        } 
+
+        let pool_guard = worker_pool_clone.lock().unwrap();
+
+        for i in 1..=10 {
+            assert_eq!(pool_guard.get_worker_status(i), Some(WorkerStatus::Idle));
+        }
+        
 
     }
 }
