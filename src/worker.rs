@@ -91,6 +91,7 @@ impl<T: Runnable> WorkerPool<T> {
             let current_value = self.watch_teller.borrow();
 
             if *current_value == false {
+                eprintln!("update_availability: sending {}", true);
                 if let Err(e) = self.watch_teller.send(true) {
                     eprintln!("Watch channel has been closed, tried to send: {}", e);
                 }
@@ -99,6 +100,7 @@ impl<T: Runnable> WorkerPool<T> {
             let current_value = self.watch_teller.borrow();
 
             if *current_value == true {
+                eprintln!("update_availability: sending {}", false);
                 if let Err(e) = self.watch_teller.send(false) {
                     eprintln!("Watch channel has been closed, tried to send: {}", e);
                 }
