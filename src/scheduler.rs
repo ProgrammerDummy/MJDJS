@@ -29,6 +29,7 @@ pub struct Scheduler<T> {
     pub watcher: watch::Receiver<bool>,
     pub succeeded: Arc<Mutex<HashMap<u64, Job>>>,
     pub dispatch_order: Option<Arc<Mutex<Vec<Job>>>>,
+    pub shutdown_cap_timer: Option<tokio::time::Instant>,
 }
 
 impl <T: Runnable> Scheduler<T> {
@@ -51,6 +52,7 @@ impl <T: Runnable> Scheduler<T> {
             watcher,
             succeeded: Arc::new(Mutex::new(HashMap::new())),
             dispatch_order: None, //mainly for testing purposes to confirm that priority of jobs dispatched is non-increasing
+            shutdown_cap_timer: None,
         }
     }
 
@@ -180,6 +182,7 @@ impl <T: Runnable> Scheduler<T> {
                                                 },
                                                 Err(e) => {
                                                     eprintln!("Transition to Fail failed for job: {}, error: {:?}", msg.job_id, e);
+                               
                                                     in_flight.remove(&msg.job_id);
                                                 },
                                             }
@@ -308,13 +311,28 @@ impl <T: Runnable> Scheduler<T> {
 
                 _ = async { //cancellation branch
                     cancel.cancelled().await;
-                }, if !shutting_down => {shutting_down = true},
+                }, if !shutting_down => {
+                    shutting_down = true;
+                    self.shutdown_cap_timer = Some(tokio::time::Instant::now()); //timer begins
+                },
+
+                _ = async {
+                    tokio::time::sleep_until(self.shutdown_cap_timer.unwrap_or_else(|| {
+                        eprintln!("shutdown_cap_timer was None while shutting down");
+                        tokio::time::Instant::now()
+                    }) + std::time::Duration::from_secs(30)).await;
+
+                }, if shutting_down => {
+                    eprintln!("Shutdown deadline of 30s exceeded, abandoning remaining in-flight jobs");
+                    break 
+                }, //branch only activates when shutting_down flag is true
+
             } 
 
             {
                 let in_flight = self.in_flight.lock().unwrap();
                 if shutting_down && in_flight.is_empty() {
-                    eprint!("Shutdown requested, jobs abandoned");
+                    eprint!("Shutdown requested, jobs abandoned, draining in flight jobs");
                     break;
                 }
             }
