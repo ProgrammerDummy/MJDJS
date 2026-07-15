@@ -35,6 +35,7 @@ pub struct Scheduler<T> {
     pub waiting_retry: Arc<Mutex<HashMap<u64, Job>>>, //represents jobs which are on timeout after failing
     pub dead_lettered: Arc<Mutex<HashMap<u64, Job>>>, //minimal deadletter queue for testing purposes currently, will replace later with more info-storing data structure
     pub watcher: watch::Receiver<bool>,
+    pub succeeded: Arc<Mutex<HashMap<u64, Job>>>,
 }
 
 impl <T: Runnable> Scheduler<T> {
@@ -55,6 +56,7 @@ impl <T: Runnable> Scheduler<T> {
             waiting_retry: Arc::new(Mutex::new(HashMap::new())),
             dead_lettered: Arc::new(Mutex::new(HashMap::new())),
             watcher,
+            succeeded: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -89,6 +91,10 @@ impl <T: Runnable> Scheduler<T> {
                                         Some(job) => {
                                             let _ = transition(job, JobEvent::Success { completed_at: 0u64, result}); //explicit ignore and placeholder values until i implement real clock
                                             in_flight.remove(&msg.job_id); //remove the job from the in_flight hashmap
+                                            {
+                                                let mut succeeded = self.succeeded.lock().unwrap();
+                                                succeeded.insert(msg.job_id, job.clone());
+                                            }
                                         },
 
                                         None => {
@@ -436,5 +442,10 @@ use super::*;
             state: JobState::DeadLettered { reason: "retries exhausted".to_string() },
             retry_policy: RetryPolicy::FixedDelay { delay_ms: 150, max_attempts: 1 },
         }));
+    }
+
+    #[tokio::test]
+    async fn stress_test() {
+
     }
 }
