@@ -141,6 +141,10 @@ pub enum JobState {
     },
     DeadLettered {
         reason: String,
+    },
+    Abandoned {
+        reason: String,
+        abandoned_at: u64,
     }
 }
 
