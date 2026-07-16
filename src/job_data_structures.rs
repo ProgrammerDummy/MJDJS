@@ -190,6 +190,11 @@ impl JobQueue {
         self.heap.is_empty()
     }
 
+    pub fn drain(&mut self) -> Vec<Job> {
+        self.heap.drain().collect()
+    }
+
+
 }
 
 pub fn now_millis() -> u64 {
