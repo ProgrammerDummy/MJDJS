@@ -1,4 +1,4 @@
-use crate::job_data_structures::{JobState, Job, RetryPolicy};
+use crate::job_data_structures::{Job, JobState, RetryPolicy, now_millis};
 use thiserror::Error;
 
 #[derive(PartialEq, Debug)]
@@ -18,6 +18,9 @@ pub enum JobEvent {
         error: u64,
     },
     DeadLetter {
+        reason: String,
+    },
+    Abandon {
         reason: String,
     },
 }
@@ -89,6 +92,21 @@ pub fn transition(job: &mut Job, event: JobEvent) -> Result<(), TransitionError>
             job.state = JobState::DeadLettered { reason };
             Ok(())
         },
+
+        (JobState::Queued, JobEvent::Abandon { reason }) => {
+            job.state = JobState::Abandoned { reason, abandoned_at: now_millis() };
+            Ok(())
+        }
+
+        (JobState::Running { worker_id: _, started_at: _ }, JobEvent::Abandon { reason }) => {
+            job.state = JobState::Abandoned { reason, abandoned_at: now_millis() };
+            Ok(())
+        }
+
+        (JobState::Retrying { retry_after: _ }, JobEvent::Abandon { reason }) => {
+            job.state = JobState::Abandoned { reason, abandoned_at: now_millis() };
+            Ok(())
+        }
 
         (state, event) => {
             job.state = state.clone();  
