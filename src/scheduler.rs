@@ -1,6 +1,7 @@
 use crate::job_data_structures::{Job, JobQueue, JobOutcome, now_millis};
 use crate::worker::{WorkerPool, Runnable, Worker};
 use crate::state_machine::{transition, determine_next_event, JobEvent};
+use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::sync::{Notify, watch};
@@ -30,6 +31,7 @@ pub struct Scheduler<T> {
     pub succeeded: Arc<Mutex<HashMap<u64, Job>>>,
     pub dispatch_order: Option<Arc<Mutex<Vec<Job>>>>,
     pub shutdown_cap_timer: Option<tokio::time::Instant>,
+    pub abandoned: Arc<Mutex<HashMap<u64, Job>>>, //for storing abandoned jobs
 }
 
 impl <T: Runnable> Scheduler<T> {
@@ -53,6 +55,7 @@ impl <T: Runnable> Scheduler<T> {
             succeeded: Arc::new(Mutex::new(HashMap::new())),
             dispatch_order: None, //mainly for testing purposes to confirm that priority of jobs dispatched is non-increasing
             shutdown_cap_timer: None,
+            abandoned: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -109,17 +112,16 @@ impl <T: Runnable> Scheduler<T> {
                                 },
 
                                 JobOutcome::Failure {error} => {
-                                    let mut in_flight = self.in_flight.lock().unwrap();
-                                    match in_flight.get_mut(&msg.job_id) {
-                                        Some(job) => {
+                                    let returned_job = self.in_flight.lock().unwrap().remove(&msg.job_id);
 
-
-                                            match transition(job, JobEvent::Fail {error}) {
+                                    match returned_job {
+                                        Some(mut job) => {
+                                            match transition(&mut job, JobEvent::Fail {error}) {
                                                 //placeholder values until i implement real clock
                                                 Ok(_) => {
-                                                    match determine_next_event(job) {
+                                                    match determine_next_event(&job) {
                                                         JobEvent::Retry {retry_after} => {
-                                                            match transition(job, JobEvent::Retry { retry_after }) {
+                                                            match transition(&mut job, JobEvent::Retry { retry_after }) {
                                                                 Ok(_) => {
                                                                     {
                                                                         {
@@ -132,26 +134,47 @@ impl <T: Runnable> Scheduler<T> {
                                                                         let waiting_retry_lock = self.waiting_retry.clone();
                                                                         let queue_lock = self.queue.clone();
                                                                         let job_clone = job.clone();
+                                                                        let mut job_second_clone = job.clone();
+                                                                        let cancel_clone = cancel.clone();
 
-                                                                        tokio::spawn(async move { //make job sleep until its retry_after duration finishes, remove from waiting_retry and re-enqueue
-                                                                            tokio::time::sleep(retry_after).await; 
-                                                                            let mut waiting_retry = waiting_retry_lock.lock().unwrap();
-                                                                            waiting_retry.remove(&job_clone.id);
+                                                                        tokio::select! { //race the retry delay against cancellation token as well
+                                                                            _ = tokio::spawn(async move { //make job sleep until its retry_after duration finishes, remove from waiting_retry and re-enqueue
+                                                                                tokio::time::sleep(retry_after).await; 
+                                                                                let mut waiting_retry = waiting_retry_lock.lock().unwrap();
+                                                                                waiting_retry.remove(&job_clone.id);
+                                                                                
+                                                                                let mut queue = queue_lock.lock().unwrap();
+                                                                                queue.enqueue(job_clone);
+
+                                                                                notify.notify_one();
+
+                                                                            }) => {},
+
+                                                                            _ = async move {
+                                                                                cancel_clone.cancelled().await;
+                                                                            } => {
+                                                                                let mut waiting_retry = self.waiting_retry.lock().unwrap();
+                                                                                waiting_retry.remove(&job_second_clone.id);
                                                                             
-                                                                            let mut queue = queue_lock.lock().unwrap();
-                                                                            queue.enqueue(job_clone);
+                                                                                match transition(&mut job_second_clone, JobEvent::Abandon { reason: "cancellation token called".to_string() }) {
+                                                                                    Ok(_) => {
+                                                                                        let mut abandoned = self.abandoned.lock().unwrap();
+                                                                                        abandoned.insert(job_second_clone.id, job_second_clone);
+                                                                                    },
 
-                                                                            notify.notify_one();
-
-                                                                        });
+                                                                                    Err(e) => {
+                                                                                        eprintln!("Transition to Abandon failed for job {}, error: {:?}", job_second_clone.id, e);
+                                                                                    }
+                                                                                }
+                                                                            },
+                                                                        }
                         
                                                                     }
-                                                                    in_flight.remove(&msg.job_id);
+
                                                                 },
 
                                                                 Err(e) => {
                                                                     eprintln!("Transition to Retry failed for job: {}, error: {:?}", msg.job_id, e);
-                                                                    in_flight.remove(&msg.job_id);
                                                                 }
                                                             }
                                                             
@@ -159,16 +182,14 @@ impl <T: Runnable> Scheduler<T> {
                                                         },
 
                                                         JobEvent::DeadLetter {reason} => {
-                                                            match transition(job, JobEvent::DeadLetter { reason }) {
+                                                            match transition(&mut job, JobEvent::DeadLetter { reason }) {
                                                                 Ok(_) => {
                                                                     let mut dead_lettered = self.dead_lettered.lock().unwrap();
                                                                     dead_lettered.insert(msg.job_id, job.clone());
-                                                                    in_flight.remove(&msg.job_id);
                                                                 },
 
                                                                 Err(e) => {
                                                                     eprintln!("Transition to Deadletter failed for job: {}, error: {:?}", msg.job_id, e);
-                                                                    in_flight.remove(&msg.job_id);
                                                                 }
                                                             }
                                                             
@@ -182,8 +203,6 @@ impl <T: Runnable> Scheduler<T> {
                                                 },
                                                 Err(e) => {
                                                     eprintln!("Transition to Fail failed for job: {}, error: {:?}", msg.job_id, e);
-                               
-                                                    in_flight.remove(&msg.job_id);
                                                 },
                                             }
 
@@ -196,8 +215,17 @@ impl <T: Runnable> Scheduler<T> {
 
                                 JobOutcome::Cancelled => {
                                     let mut in_flight = self.in_flight.lock().unwrap();
-                                    if in_flight.remove(&msg.job_id).is_some() {
-                                        eprintln!("Job {} was cancelled during shutdown and dropped", msg.job_id);
+                                    if let Some(mut job) = in_flight.remove(&msg.job_id) {
+                                        match transition(&mut job, JobEvent::Abandon { reason: "cancellation token called".to_string() }) {
+                                            Ok(_) => {
+                                                self.abandoned.lock().unwrap().insert(job.id, job);
+                                            },
+                                            Err(e) => {
+                                                eprintln!("Transition to Abandon failed for job {}, error {:?}", msg.job_id, e);
+                                            },
+                                        }
+                                        
+
                                     } else {
                                         eprintln!("Job {} reported cancelled but was not found in in_flight", msg.job_id);
                                     }
@@ -332,7 +360,20 @@ impl <T: Runnable> Scheduler<T> {
             {
                 let in_flight = self.in_flight.lock().unwrap();
                 if shutting_down && in_flight.is_empty() {
-                    eprint!("Shutdown requested, jobs abandoned, draining in flight jobs");
+                    eprint!("Shutdown requested, jobs abandoned, draining in flight and queued jobs");
+                    let jobs = self.queue.lock().unwrap().drain();
+
+                    for mut job in jobs {
+                        match transition(&mut job, JobEvent::Abandon { reason: "cancel token called".to_string() }) {
+                            Ok(_) => {
+                                self.abandoned.lock().unwrap().insert(job.id, job);
+                            },
+                            Err(e) => {
+                                eprintln!("Transition to Abandon failed for job {}, error {:?}", job.id, e);
+                            },
+                        }
+                    }
+
                     break;
                 }
             }
@@ -606,6 +647,68 @@ use super::*;
             assert_eq!(pool_guard.get_worker_status(i), Some(WorkerStatus::Idle));
         }
         
+
+    }
+
+    #[tokio::test]
+    async fn waiting_retry_to_abandoned() {
+        let mut scheduler: Scheduler<Worker> = Scheduler::new();
+
+        let waiting_retry = scheduler.waiting_retry.clone();
+        let abandoned = scheduler.abandoned.clone();
+
+
+        scheduler.enqueue_job(Job {
+            id: 1,
+            job_type: SIMULATE_INITIAL_FAILURE,
+            payload: 350,
+            priority: 1,
+            available_retry_attempts: 1,
+            retry_count: 0,
+            created_at: 0,
+            state: JobState::Queued,
+            retry_policy: RetryPolicy::FixedDelay { delay_ms: 1500, max_attempts: 1 },
+        });
+
+        scheduler.register_worker(Worker::new(1));
+
+        let cancel = CancellationToken::new();
+
+        let cancel_clone = cancel.clone();
+
+        let handle = tokio::spawn(async move {
+            scheduler.run(cancel_clone).await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        cancel.cancel();
+
+        {
+            assert!(waiting_retry.lock().unwrap().is_empty());
+
+            let job = abandoned.lock().unwrap().remove(&1);
+
+            if let Some(dum) = job {
+                assert_eq!(dum, Job {
+                    id: 1,
+                    job_type: SIMULATE_INITIAL_FAILURE,
+                    payload: 350,
+                    priority: 1,
+                    available_retry_attempts: 0,
+                    retry_count: 1,
+                    created_at: 0,
+                    state: JobState::Queued,
+                    retry_policy: RetryPolicy::FixedDelay { delay_ms: 1500, max_attempts: 1 },
+                });
+            }
+        }
+
+
+    }
+
+    #[tokio::test]
+    async fn queue_to_abandoned() {
 
     }
 }
