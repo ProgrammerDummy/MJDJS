@@ -106,7 +106,7 @@ impl RetryPolicy {
                         return None
                     }
 
-                    let computed_delay = (((*base_ms as f64) * multiplier.powf(retry_count as f64) * rand::random_range(0.75..1.25)) as u64);
+                    let computed_delay = ((*base_ms as f64) * multiplier.powf(retry_count as f64) * rand::random_range(0.75..1.25)) as u64;
                     //jitter added between a range of 0.75 and 1.25
 
                     if computed_delay >= *max_delay_ms { //clamp to max_delay_ms
