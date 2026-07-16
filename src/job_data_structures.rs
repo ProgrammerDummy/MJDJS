@@ -1,4 +1,5 @@
-use std::cmp::Ordering;
+use std::time::UNIX_EPOCH;
+use std::{cmp::Ordering, time::SystemTime};
 
 use std::collections::BinaryHeap;
 
@@ -185,4 +186,11 @@ impl JobQueue {
         self.heap.is_empty()
     }
 
+}
+
+pub fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .expect("system clock was set before UNIX_EPOCH, so a timestamp cannot be generated")
 }

@@ -1,4 +1,4 @@
-use crate::job_data_structures::{Job, JobQueue, JobOutcome};
+use crate::job_data_structures::{Job, JobQueue, JobOutcome, now_millis};
 use crate::worker::{WorkerPool, Runnable, Worker};
 use crate::state_machine::{transition, determine_next_event, JobEvent};
 use std::sync::{Arc, Mutex};
@@ -85,7 +85,7 @@ impl <T: Runnable> Scheduler<T> {
 
                                     match in_flight.get_mut(&msg.job_id) {
                                         Some(job) => {
-                                            match transition(job, JobEvent::Success { completed_at: 0u64, result}) {
+                                            match transition(job, JobEvent::Success { completed_at: now_millis(), result}) {
                                                 //placeholder values until i implement real clock
                                                 Ok(_) => {
                                                     let mut succeeded = self.succeeded.lock().unwrap();
@@ -251,8 +251,8 @@ impl <T: Runnable> Scheduler<T> {
                                         }
                                     }
 
-                                    if let Err(e) = transition(&mut job, JobEvent::Run { worker_id, started_at: 0}) {
-                                        eprintln!("Transition failed for job: {}, due to {:?}", job.id, e);
+                                    if let Err(e) = transition(&mut job, JobEvent::Run { worker_id, started_at: now_millis()}) {
+                                        eprintln!("Transition to Run failed for job: {}, due to {:?}", job.id, e);
                                     }
 
                                     {
@@ -358,6 +358,7 @@ async fn simulate_job_execution(job: Job, worker_id: u64, sender: Sender<JobResu
     }
     
 }
+
 
 #[cfg(test)]
 mod tests {
