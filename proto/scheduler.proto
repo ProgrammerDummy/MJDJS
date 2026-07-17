@@ -1,0 +1,126 @@
+syntax = "proto3";
+
+package scheduler;
+
+import "google/protobuf/duration.proto";
+
+service SchedulerService {
+    rpc SubmitJob (Job) returns (RequestResponse);
+    rpc GetJobStatus (JobIDRequest) returns (JobStatus);
+    rpc CancelJob (JobIDRequest) returns (RequestResponse);
+    rpc RequeueFromDLQ (JobIDRequest) returns (RequestResponse);
+    rpc ListJobs(ListRequest) returns (stream Job);
+    rpc ListDeadLettered(ListRequest) returns (stream Job);
+}
+
+service WorkerService {
+    rpc Register(Worker) returns (RequestResponse);
+    rpc ReportResult(JobOutcome) returns (RequestResponse);
+    rpc RequestWork() returns (Job)
+    rpc Heartbeat(stream HeartbeatPing) returns (stream HeartbeatControl)
+}
+
+message RequestResponse {
+    bool success = 1;
+}
+
+message JobIDRequest {
+    uint64 id = 1;
+}
+
+message Job {
+    uint64 id = 1;
+    uint64 job_type = 2;
+    uint64 payload = 3;
+    uint64 priority = 4;
+    uint64 retry_count = 5;
+    uint64 created_at = 6;
+    JobStatus state = 7;
+    RetryPolicy retry_policy = 8;
+
+}
+
+message JobStatus {
+    message Running {
+        uint64 worker_id = 1;
+        uint64 started_at = 2;
+    }
+
+    message Succeeded {
+        uint64 completed_at = 1;
+        uint64 result = 2;
+    }
+
+    message Failed {
+        uint64 error = 1;
+    }
+
+    message Retrying {
+        google.protobuf.Duration retry_after = 1;
+    }
+
+    message DeadLettered {
+        string reason = 1;
+    }
+
+    message Abandoned {
+        string reason = 1;
+        uint64 abandoned_at = 2;
+    }
+
+    oneof state {
+        Queued queued = 1; 
+        Running running = 2;
+        Succeeded succeeded = 3;
+        Failed failed = 4;
+        Retrying retrying = 5;
+        DeadLettered deadlettered = 6;
+        Abandoned abandoned = 7;
+    }
+}
+
+message Queued {}
+
+message JobOutcome {
+
+}
+
+message RetryPolicy {
+    message FixedDelay {
+        uint64 delay_ms = 1;
+        uint32 max_attempts = 2;
+    }   
+
+    message ExponentialBackoff {
+        uint64 base_ms = 1;
+        float multiplier = 2;
+        uint32 max_attempts = 3;
+        uint64 max_delay_ms = 4;
+    }
+
+    oneof policy {
+        NoRetry no_retry = 1;
+        FixedDelay fixed_delay = 2;
+        ExponentialBackoff exponential_backoff = 3;
+    }
+}
+
+message NoRetry {}
+
+message ListRequest {}
+
+message Worker {}
+
+message HeartbeatPing {
+    uint64 worker_id = 1;
+    uint64 sent_at = 2;
+}
+
+message HeartbeatControl {
+    oneof directive {
+        Ack ack = 1;
+        StopAcceptingWork stop_accepting_work = 2;
+    }
+}
+message Ack {}
+message StopAcceptingWork {}
