@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 use std::collections::HashMap;
 
 const SIMULATE_INITIAL_FAILURE: u64 = 9999;
+const ABANDON_CANCELLED_REASON: &str = "cancellation token called";
 
 pub struct JobResult { 
     //a struct to pass through the mpsc with appropriate data representing the finished job
@@ -156,7 +157,7 @@ impl <T: Runnable> Scheduler<T> {
                                                                                 let mut waiting_retry = self.waiting_retry.lock().unwrap();
                                                                                 waiting_retry.remove(&job_second_clone.id);
                                                                             
-                                                                                match transition(&mut job_second_clone, JobEvent::Abandon { reason: "cancellation token called".to_string() }) {
+                                                                                match transition(&mut job_second_clone, JobEvent::Abandon { reason: ABANDON_CANCELLED_REASON.to_string() }) {
                                                                                     Ok(_) => {
                                                                                         let mut abandoned = self.abandoned.lock().unwrap();
                                                                                         abandoned.insert(job_second_clone.id, job_second_clone);
@@ -216,7 +217,7 @@ impl <T: Runnable> Scheduler<T> {
                                 JobOutcome::Cancelled => {
                                     let mut in_flight = self.in_flight.lock().unwrap();
                                     if let Some(mut job) = in_flight.remove(&msg.job_id) {
-                                        match transition(&mut job, JobEvent::Abandon { reason: "cancellation token called".to_string() }) {
+                                        match transition(&mut job, JobEvent::Abandon { reason: ABANDON_CANCELLED_REASON.to_string() }) {
                                             Ok(_) => {
                                                 self.abandoned.lock().unwrap().insert(job.id, job);
                                             },
@@ -364,7 +365,7 @@ impl <T: Runnable> Scheduler<T> {
                     let jobs = self.queue.lock().unwrap().drain();
 
                     for mut job in jobs {
-                        match transition(&mut job, JobEvent::Abandon { reason: "cancel token called".to_string() }) {
+                        match transition(&mut job, JobEvent::Abandon { reason: ABANDON_CANCELLED_REASON.to_string() }) {
                             Ok(_) => {
                                 self.abandoned.lock().unwrap().insert(job.id, job);
                             },
@@ -663,11 +664,11 @@ use super::*;
             job_type: SIMULATE_INITIAL_FAILURE,
             payload: 350,
             priority: 1,
-            available_retry_attempts: 1,
+            available_retry_attempts: 2,
             retry_count: 0,
             created_at: 0,
             state: JobState::Queued,
-            retry_policy: RetryPolicy::FixedDelay { delay_ms: 1500, max_attempts: 1 },
+            retry_policy: RetryPolicy::FixedDelay { delay_ms: 1500, max_attempts: 2 },
         });
 
         scheduler.register_worker(Worker::new(1));
@@ -676,31 +677,46 @@ use super::*;
 
         let cancel_clone = cancel.clone();
 
+        let before = now_millis();
+
         let handle = tokio::spawn(async move {
             scheduler.run(cancel_clone).await;
         });
 
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(550)).await;
 
         cancel.cancel();
 
+        let dum = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        
+        let after = now_millis();
+    
         {
             assert!(waiting_retry.lock().unwrap().is_empty());
 
             let job = abandoned.lock().unwrap().remove(&1);
 
-            if let Some(dum) = job {
-                assert_eq!(dum, Job {
-                    id: 1,
-                    job_type: SIMULATE_INITIAL_FAILURE,
-                    payload: 350,
-                    priority: 1,
-                    available_retry_attempts: 0,
-                    retry_count: 1,
-                    created_at: 0,
-                    state: JobState::Queued,
-                    retry_policy: RetryPolicy::FixedDelay { delay_ms: 1500, max_attempts: 1 },
-                });
+            match job {
+                Some(job) => {
+                    assert_eq!(job.id, 1);
+                    assert_eq!(job.job_type, SIMULATE_INITIAL_FAILURE);
+                    assert_eq!(job.payload, 350);
+                    assert_eq!(job.priority, 1);
+                    assert_eq!(job.available_retry_attempts, 1);
+                    assert_eq!(job.retry_count, 1);
+                    assert_eq!(job.created_at, 0);
+                    match job.state {
+                        JobState::Abandoned { reason, abandoned_at } => {
+                            assert_eq!(reason, ABANDON_CANCELLED_REASON.to_string());
+                            assert!(abandoned_at >= before && abandoned_at <= after);
+                        },
+                        other => panic!("expected Abandoned, got {:?}", other),
+                    }
+                    assert_eq!(job.retry_policy, RetryPolicy::FixedDelay { delay_ms: 1500, max_attempts: 2 });
+                },
+                None => {
+                    panic!("No job found within abandoned");
+                }
             }
         }
 
@@ -709,6 +725,68 @@ use super::*;
 
     #[tokio::test]
     async fn queue_to_abandoned() {
+        let mut scheduler: Scheduler<Worker> = Scheduler::new();
+
+        let queue = scheduler.queue.clone();
+        let abandoned = scheduler.abandoned.clone();
+
+
+        scheduler.enqueue_job(Job {
+            id: 1,
+            job_type: SIMULATE_INITIAL_FAILURE,
+            payload: 350,
+            priority: 1,
+            available_retry_attempts: 1,
+            retry_count: 0,
+            created_at: 0,
+            state: JobState::Queued,
+            retry_policy: RetryPolicy::FixedDelay { delay_ms: 1500, max_attempts: 1 },
+        });
+
+        //scheduler.register_worker(Worker::new(1));
+
+        let cancel = CancellationToken::new();
+
+        let cancel_clone = cancel.clone();
+
+        let before = now_millis();
+
+        let handle = tokio::spawn(async move {
+            scheduler.run(cancel_clone).await;
+        });
+
+        cancel.cancel();
+
+        let dum = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+
+        let after = now_millis();
+
+        let job = abandoned.lock().unwrap().remove(&1);
+
+        match job {
+            Some(job) => {
+                assert_eq!(job.id, 1);
+                assert_eq!(job.job_type, SIMULATE_INITIAL_FAILURE);
+                assert_eq!(job.payload, 350);
+                assert_eq!(job.priority, 1);
+                assert_eq!(job.available_retry_attempts, 1);
+                assert_eq!(job.retry_count, 0);
+                assert_eq!(job.created_at, 0);
+                match job.state {
+                    JobState::Abandoned { reason, abandoned_at } => {
+                        assert_eq!(reason, ABANDON_CANCELLED_REASON.to_string());
+                        assert!(abandoned_at >= before && abandoned_at <= after);
+                    },
+                    other => panic!("expected Abandoned, got {:?}", other),
+                }
+                assert_eq!(job.retry_policy, RetryPolicy::FixedDelay { delay_ms: 1500, max_attempts: 1 });
+            },
+            None => {
+                panic!("No job found within abandoned");
+            }
+        }
+
+
 
     }
 }
