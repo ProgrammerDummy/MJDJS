@@ -8,7 +8,6 @@ use tokio::sync::{Notify, watch};
 use tokio_util::sync::CancellationToken;
 use std::collections::HashMap;
 
-const SIMULATE_INITIAL_FAILURE: u64 = 9999;
 const ABANDON_CANCELLED_REASON: &str = "cancellation token called";
 
 pub struct JobResult { 
@@ -386,27 +385,14 @@ impl <T: Runnable> Scheduler<T> {
     
 }
 
-async fn simulate_job_execution(job: Job, worker_id: u64, sender: Sender<JobResult>) { //just a simulator for executing jobs
-    tokio::time::sleep(std::time::Duration::from_millis(job.payload)).await;
-
-    if job.retry_count == 0 && job.job_type == SIMULATE_INITIAL_FAILURE {
-        let _ = sender.send(JobResult { job_id: job.id, worker_id, event: JobOutcome::Failure { error: 1 } }).await;
-    } else {
-        let _ = sender.send(JobResult {
-        job_id: job.id,
-        worker_id,
-        event: JobOutcome::Success { result: 1 },
-        }).await;
-    }
-    
-}
-
 
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
 use crate::{job_data_structures::{JobState, RetryPolicy}, worker::WorkerStatus};
+
+const SIMULATE_INITIAL_FAILURE: u64 = 9999;
     
 use super::*;
 
@@ -421,7 +407,6 @@ use super::*;
             job_type: 1, 
             payload: 350, 
             priority: 1, 
-            available_retry_attempts: 3, 
             retry_count: 0, 
             created_at: 0, 
             state: JobState::Queued, 
@@ -460,7 +445,6 @@ use super::*;
             job_type: 1, 
             payload: 350, 
             priority: 1, 
-            available_retry_attempts: 3, 
             retry_count: 0, 
             created_at: 0, 
             state: JobState::Queued, 
@@ -502,7 +486,6 @@ use super::*;
             job_type: SIMULATE_INITIAL_FAILURE,
             payload: 350,
             priority: 1,
-            available_retry_attempts: 3,
             retry_count: 0,
             created_at: 0,
             state: JobState::Queued,
@@ -535,7 +518,6 @@ use super::*;
             job_type: SIMULATE_INITIAL_FAILURE,
             payload: 350,
             priority: 1,
-            available_retry_attempts: 1,
             retry_count: 0,
             created_at: 0,
             state: JobState::Queued,
@@ -568,7 +550,6 @@ use super::*;
             job_type: SIMULATE_INITIAL_FAILURE,
             payload: 350,
             priority: 1,
-            available_retry_attempts: 0,
             retry_count: 1,
             created_at: 0,
             state: JobState::DeadLettered { reason: "retries exhausted".to_string() },
@@ -592,7 +573,6 @@ use super::*;
                 job_type: 1, 
                 payload: rand::random_range(1..=100), 
                 priority: rand::random_range(1..=1000), 
-                available_retry_attempts: 3, 
                 retry_count: 0, 
                 created_at: 0, 
                 state: JobState::Queued, 
@@ -664,7 +644,6 @@ use super::*;
             job_type: SIMULATE_INITIAL_FAILURE,
             payload: 350,
             priority: 1,
-            available_retry_attempts: 2,
             retry_count: 0,
             created_at: 0,
             state: JobState::Queued,
@@ -702,7 +681,6 @@ use super::*;
                     assert_eq!(job.job_type, SIMULATE_INITIAL_FAILURE);
                     assert_eq!(job.payload, 350);
                     assert_eq!(job.priority, 1);
-                    assert_eq!(job.available_retry_attempts, 1);
                     assert_eq!(job.retry_count, 1);
                     assert_eq!(job.created_at, 0);
                     match job.state {
@@ -736,7 +714,6 @@ use super::*;
             job_type: SIMULATE_INITIAL_FAILURE,
             payload: 350,
             priority: 1,
-            available_retry_attempts: 1,
             retry_count: 0,
             created_at: 0,
             state: JobState::Queued,
@@ -769,7 +746,6 @@ use super::*;
                 assert_eq!(job.job_type, SIMULATE_INITIAL_FAILURE);
                 assert_eq!(job.payload, 350);
                 assert_eq!(job.priority, 1);
-                assert_eq!(job.available_retry_attempts, 1);
                 assert_eq!(job.retry_count, 0);
                 assert_eq!(job.created_at, 0);
                 match job.state {

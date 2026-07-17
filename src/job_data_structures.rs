@@ -15,7 +15,6 @@ pub struct Job {
     pub job_type: u64,
     pub payload: u64,
     pub priority: u64,
-    pub available_retry_attempts: u64,
     pub retry_count: u64,
     pub created_at: u64,
     pub state: JobState,

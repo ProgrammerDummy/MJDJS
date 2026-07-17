@@ -225,12 +225,11 @@ mod tests {
 
         dum.register_worker(Worker { worker_id: 1 });
 
-        dum.free_worker(1);
+        assert_eq!(dum.free_worker(1), Ok(()));
 
         assert_eq!(dum.pool[&1].status, WorkerStatus::Idle);
 
         assert_eq!(dum.free_worker(2), Err(WorkerPoolError::WorkerNotFound));
-
     }
 
     #[test]

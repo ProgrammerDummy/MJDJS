@@ -68,7 +68,6 @@ pub fn transition(job: &mut Job, event: JobEvent) -> Result<(), TransitionError>
 
         (JobState::Running { worker_id: _, started_at: _ }, JobEvent::Fail { error }) => {
             job.state = JobState::Failed { error };
-            job.available_retry_attempts -= 1;
             job.retry_count += 1;
             Ok(()) 
         },
@@ -127,7 +126,6 @@ mod tests {
             job_type: 1,
             payload: 1,
             priority: 1,
-            available_retry_attempts: 3,
             retry_count: 0,
             created_at: 0,
             state,
@@ -153,7 +151,6 @@ mod tests {
         assert_eq!(result, Ok(()));
         assert_eq!(job.state, JobState::Failed { error: 1 });
         assert_eq!(job.retry_count, 1);
-        assert_eq!(job.available_retry_attempts, 2);
     }
     #[test]
     fn failed_plus_retry_to_retrying() {
@@ -271,7 +268,6 @@ mod tests {
             job_type: 1,
             payload: 1,
             priority: 1,
-            available_retry_attempts: 3,
             retry_count: 0,
             created_at: 0,
             state: JobState::Failed { error: 1 },
@@ -294,7 +290,6 @@ mod tests {
             job_type: 1,
             payload: 1,
             priority: 1,
-            available_retry_attempts: 0,
             retry_count: 0,
             created_at: 0,
             state: JobState::Failed { error: 1 },
@@ -309,7 +304,6 @@ mod tests {
             job_type: 1,
             payload: 1,
             priority: 1,
-            available_retry_attempts: 0,
             retry_count: 4,
             created_at: 0,
             state: JobState::Failed { error: 1 },
@@ -330,7 +324,6 @@ mod tests {
             job_type: 1, 
             payload: 2, 
             priority: 1, 
-            available_retry_attempts: 3, 
             retry_count: 0, 
             created_at: 12, 
             state: JobState::Queued,
@@ -342,7 +335,6 @@ mod tests {
             job_type: 1, 
             payload: 2, 
             priority: 2, 
-            available_retry_attempts: 3, 
             retry_count: 0, 
             created_at: 12, 
             state: JobState::Queued,
@@ -354,7 +346,6 @@ mod tests {
             job_type: 1, 
             payload: 2, 
             priority: 2, 
-            available_retry_attempts: 3, 
             retry_count: 0, 
             created_at: 12, 
             state: JobState::Queued,
@@ -366,7 +357,6 @@ mod tests {
             job_type: 1, 
             payload: 2, 
             priority: 1, 
-            available_retry_attempts: 3, 
             retry_count: 0, 
             created_at: 12, 
             state: JobState::Queued,
@@ -383,7 +373,6 @@ mod tests {
             job_type: 1, 
             payload: 2, 
             priority: 1, 
-            available_retry_attempts: 3, 
             retry_count: 0, 
             created_at: 12, 
             state: JobState::Queued,
@@ -395,7 +384,6 @@ mod tests {
             job_type: 1, 
             payload: 2, 
             priority: 1, 
-            available_retry_attempts: 3, 
             retry_count: 0, 
             created_at: 10, 
             state: JobState::Queued,
@@ -407,7 +395,6 @@ mod tests {
             job_type: 1, 
             payload: 2, 
             priority: 1, 
-            available_retry_attempts: 3, 
             retry_count: 0, 
             created_at: 10, 
             state: JobState::Queued,
@@ -419,7 +406,6 @@ mod tests {
             job_type: 1, 
             payload: 2, 
             priority: 1, 
-            available_retry_attempts: 3, 
             retry_count: 0, 
             created_at: 12, 
             state: JobState::Queued,
