@@ -113,7 +113,7 @@ pub fn transition(job: &mut Job, event: JobEvent) -> Result<(), TransitionError>
             Err(TransitionError::InvalidTransition { previous_state: state, attempted_transition: event })
         },
 
-    }
+    }//note: there isnt a (Failed, Abandon) arm since there is a Fail to determine_next_event() to Retry or Deadletter sequence in run()
 }
 
 #[cfg(test)]
@@ -212,6 +212,54 @@ mod tests {
         let result = transition(&mut job, event);
         assert_eq!(result, Err(TransitionError::InvalidTransition { previous_state: JobState::Running { worker_id: 1, started_at: 300 }, attempted_transition: JobEvent::Retry { retry_after: std::time::Duration::from_millis(200)}}));
         assert_eq!(job.state, JobState::Running { worker_id: 1, started_at: 300 }); 
+    }
+
+    #[test]
+    fn queued_plus_abandon_to_abandoned() {
+        let mut job = make_job(JobState::Queued);
+        let before = now_millis();
+        let result = transition(&mut job, JobEvent::Abandon { reason: "test".to_string() });
+        let after = now_millis();
+        assert_eq!(result, Ok(()));
+        match job.state {
+            JobState::Abandoned { reason, abandoned_at } => {
+                assert_eq!(reason, "test");
+                assert!(abandoned_at >= before && abandoned_at <= after);
+            },
+            other => panic!("expected Abandoned, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn running_plus_abandon_to_abandoned() {
+        let mut job = make_job(JobState::Running { worker_id: 1, started_at: 1 });
+        let before = now_millis();
+        let result = transition(&mut job, JobEvent::Abandon { reason: "test".to_string() });
+        let after = now_millis();
+        assert_eq!(result, Ok(()));
+        match job.state {
+            JobState::Abandoned { reason, abandoned_at } => {
+                assert_eq!(reason, "test");
+                assert!(abandoned_at >= before && abandoned_at <= after);
+            },
+            other => panic!("expected Abandoned, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn retrying_plus_abandon_to_abandoned() {
+        let mut job = make_job(JobState::Retrying { retry_after: std::time::Duration::from_millis(100) });
+        let before = now_millis();
+        let result = transition(&mut job, JobEvent::Abandon { reason: "test".to_string() });
+        let after = now_millis();
+        assert_eq!(result, Ok(()));
+        match job.state {
+            JobState::Abandoned { reason, abandoned_at } => {
+                assert_eq!(reason, "test");
+                assert!(abandoned_at >= before && abandoned_at <= after);
+            },
+            other => panic!("expected Abandoned, got {:?}", other),
+        }
     }
 
 
