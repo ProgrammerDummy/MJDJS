@@ -1,5 +1,6 @@
 use crate::job_data_structures::{Job, JobState, RetryPolicy};
 use crate::proto;
+use ordered_float::OrderedFloat;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -14,7 +15,6 @@ pub enum ConversionError {
     NegativeDuration,
     #[error("no duration present to convert")]
     NoDuration,
-    
 }
 
 impl From<Job> for proto::Job {
@@ -32,7 +32,7 @@ impl TryFrom<proto::Job> for Job {
         let state = match p.state {
             Some(job_status) => {
                 match job_status.state {
-                    Some(proto::job_status::State::Queued(_)) => Ok(JobState::Queued),
+                    Some(proto::job_status::State::Queued(_)) => Ok::<JobState, ConversionError>(JobState::Queued),
 
                     Some(proto::job_status::State::Running(proto::job_status::Running { worker_id, started_at })) => {
                         Ok(JobState::Running { worker_id, started_at })
@@ -81,7 +81,46 @@ impl TryFrom<proto::Job> for Job {
             None => return Err(ConversionError::MissingState),
         }?;
 
-        todo!()
+        let retry_policy = match p.retry_policy {
+            Some(policy_option) => {
+                match policy_option.policy {
+                    Some(proto::retry_policy::Policy::FixedDelay(proto::retry_policy::FixedDelay { delay_ms, max_attempts})) => {
+                        Ok::<RetryPolicy, ConversionError>(RetryPolicy::FixedDelay { delay_ms, max_attempts })
+                    },
+
+                    Some(proto::retry_policy::Policy::ExponentialBackoff(proto::retry_policy::ExponentialBackoff { base_ms, multiplier, max_attempts, max_delay_ms})) => {
+                        Ok(RetryPolicy::ExponentialBackoff { base_ms, multiplier: OrderedFloat(multiplier as f64), max_attempts, max_delay_ms })
+                    },
+
+                    Some(proto::retry_policy::Policy::NoRetry(_)) => {
+                        Ok(RetryPolicy::NoRetry)
+                    },
+
+                    None => {
+                        return Err(ConversionError::MissingPolicy);
+                    }
+                }
+            },
+
+            None => {
+                return Err(ConversionError::MissingPolicy);
+            }
+        }?;
+
+        Ok(Job {
+            id,
+            job_type: p.job_type,
+            payload: p.payload,
+            priority: p.priority,
+            retry_count: p.retry_count,
+            created_at: p.created_at,
+            state,
+            retry_policy,
+            requirements: p.requirements,
+            metadata: p.metadata,
+        })
+
+    
     }
 }
 
@@ -160,3 +199,4 @@ pub struct Job {
     pub metadata: std::collections::HashMap<String, String>,
 }
 */
+
