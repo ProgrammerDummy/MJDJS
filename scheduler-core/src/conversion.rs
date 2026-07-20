@@ -1,5 +1,5 @@
 use crate::job_data_structures::{Job, JobState, RetryPolicy};
-use crate::proto;
+use crate::proto::{self};
 use ordered_float::OrderedFloat;
 use thiserror::Error;
 
@@ -19,7 +19,46 @@ pub enum ConversionError {
 
 impl From<Job> for proto::Job {
     fn from(job: Job) -> Self {
-        todo!()
+        proto::Job { 
+            id: job.id.as_bytes().to_vec(), 
+            job_type: job.job_type, 
+            payload: job.payload, 
+            priority: job.priority, 
+            retry_count: job.retry_count, 
+            created_at: job.created_at, 
+            state: Some(match job.state {
+                JobState::Queued => {
+                    
+                },
+
+                JobState::Running { worker_id, started_at } => {
+
+                },
+
+                JobState::Succeeded { completed_at, result } => {
+
+                },
+
+                JobState::Failed { error } => {
+
+                },
+
+                JobState::Retrying { retry_after } => {
+
+                },
+
+                JobState::DeadLettered { reason } => {
+
+                },
+
+                JobState::Abandoned { reason, abandoned_at } => {
+
+                },
+            }), 
+            retry_policy: (), 
+            requirements: job.requirements, 
+            metadata: job.metadata 
+        }
     }
 }
 
