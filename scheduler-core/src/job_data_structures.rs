@@ -11,14 +11,16 @@ use crate::job_data_structures::RetryPolicy::{ExponentialBackoff, FixedDelay, No
 
 #[derive(Debug, PartialEq, Clone, Eq)]
 pub struct Job {
-    pub id: u64,
-    pub job_type: u64,
+    pub id: uuid::Uuid,
+    pub job_type: String,
     pub payload: u64,
     pub priority: u64,
     pub retry_count: u64,
     pub created_at: u64,
     pub state: JobState,
     pub retry_policy: RetryPolicy,
+    pub requirements: std::collections::HashMap<String, String>,
+    pub metadata: std::collections::HashMap<String, String>,
 }
 
 impl Ord for Job {

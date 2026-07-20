@@ -1,0 +1,477 @@
+================================================================
+DISTRIBUTED JOB SCHEDULER IN RUST
+RESOURCES BY WEEK — ALL 16 WEEKS
+================================================================
+
+Priority labels:
+  [MUST]  — Read before starting that week's work. Non-negotiable.
+  [REC]   — Recommended. Worth the time.
+  [OPT]   — Optional. Go deeper if interested.
+
+Format per resource:
+  Type | Priority | Name
+  URL or search instruction
+  Why you need it this week
+
+================================================================
+WEEK 1 — Job state machine, priority queue, Celery architecture
+================================================================
+
+[MUST] BOOK — DDIA Chapter 1: Reliable, Scalable, Maintainable
+  Book: Designing Data-Intensive Applications by Martin Kleppmann
+  Sets vocabulary for every design decision in this project.
+  Read before anything else.
+
+[MUST] BOOK — The Rust Book, Chapters 4, 6, 9
+  URL: doc.rust-lang.org/book
+  Chapter 4: ownership (read TWICE)
+  Chapter 6: enums and pattern matching (your state machine)
+  Chapter 9: error handling (no unwrap() ever)
+
+[MUST] EXERCISES — Rustlings 1–50
+  URL: github.com/rust-lang/rustlings
+  Read every error message fully before changing code.
+
+[MUST] WEB — Celery Architecture Overview
+  URL: docs.celeryq.dev/en/stable/getting-started/introduction.html
+  Broker, worker, task, result backend vocabulary.
+  You are building this — understand the reference first.
+
+[REC] BOOK — Too Many Linked Lists
+  URL: rust-unofficial.github.io/too-many-lists
+  Free online. Best ownership tutorial through pain.
+  Read alongside the BinaryHeap exercise.
+
+================================================================
+WEEK 2 — Traits, generics, retry + jitter, Temporal concepts
+================================================================
+
+[MUST] BOOK — The Rust Book, Chapters 10, 13
+  URL: doc.rust-lang.org/book
+  Chapter 10: generics, traits, lifetimes (read TWICE)
+  Chapter 13: closures and iterators
+
+[MUST] WEB — AWS Builders' Library: Timeouts, Retries, Backoff with Jitter
+  URL: aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter
+  Why jitter is not optional.
+  What thundering herd is and how jitter prevents it.
+  Read before implementing RetryPolicy.
+
+[MUST] WEB — burntsushi: Error Handling in Rust
+  Search: "burntsushi rust error handling 2022"
+  Clarifies thiserror vs anyhow vs custom enums permanently.
+  Read before writing any error types.
+
+[MUST] WEB — Temporal Concepts: Workflows, Activities, Workers
+  URL: docs.temporal.io/concepts
+  Read: "what is a workflow", "what is an activity", "what is a worker"
+  The cleanest model for job scheduling concepts in the industry.
+
+[MUST] EXERCISES — Rustlings 50–90
+  URL: github.com/rust-lang/rustlings
+  Traits and generics sections specifically.
+
+[REC] WEB — Rust API Guidelines
+  URL: rust-lang.github.io/api-guidelines
+  Start reading. These are the standards your code will be judged against.
+
+================================================================
+WEEK 3 — Async Rust, SQS visibility timeout, DDIA Ch. 8 (failure modes)
+================================================================
+
+[MUST] BOOK — Rust Async Book, Chapters 1–4
+  URL: rust-lang.github.io/async-book
+  Chapter 2 (executor model): NON-NEGOTIABLE
+  Chapter 4 (pinning): NON-NEGOTIABLE
+
+[MUST] WEB — tokio Tutorial (full)
+  URL: tokio.rs/tokio/tutorial
+  Every section. "Shared state" and "channels" most important.
+  Read "channels" section twice.
+
+[MUST] VIDEO — Jon Gjengset: Crust of Rust — async/await
+  Search YouTube: "Crust of Rust async await Jon Gjengset"
+  3+ hours. Watch BEFORE writing async code. Full watch.
+
+[MUST] WEB — Amazon SQS Visibility Timeout
+  URL: docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html
+  SQS visibility timeout IS your heartbeat+lease mechanism.
+  Understanding it gives you precise language for interviews.
+
+[MUST] BOOK — DDIA Chapter 8, Sections 8.1 and 8.2
+  Book: Designing Data-Intensive Applications by Martin Kleppmann
+  8.1: Faults and Partial Failures
+  8.2: Unreliable Networks
+  Read before week 6 (heartbeat implementation).
+
+[REC] VIDEO — Jon Gjengset: Building an async executor
+  Search YouTube: "Jon builds async executor"
+  2 hours. Watch if the executor model feels magical.
+
+[REC] TOOL — tokio-console
+  URL: github.com/tokio-rs/console
+  Install now. Use to diagnose deadlocks and task starvation.
+
+================================================================
+WEEK 4 — gRPC, proto schema design, Kafka architecture, DDIA Ch. 4
+================================================================
+
+[MUST] BOOK — DDIA Chapter 4: Encoding and Evolution
+  Book: Designing Data-Intensive Applications by Martin Kleppmann
+  Sections 4.1 and 4.2: why proto field numbers matter.
+  What breaking vs non-breaking schema changes are.
+  Read before designing your proto schema.
+
+[MUST] WEB — tonic documentation and examples
+  URL: docs.rs/tonic
+  URL: github.com/hyperium/tonic/tree/master/examples
+  Read helloworld AND routeguide examples fully.
+  Read the GENERATED code — understand what prost gives you.
+
+[MUST] WEB — Protocol Buffers Language Guide (proto3)
+  URL: protobuf.dev/programming-guides/proto3
+  Field types: use uint64 for all IDs and timestamps.
+  Reserved fields, map fields, backward compatibility rules.
+
+[MUST] WEB — Kafka Architecture: Core Concepts
+  URL: docs.confluent.io/kafka/introduction.html
+  Read through "Core Concepts" section.
+  Producer, broker, consumer group, at-least-once delivery.
+
+[REC] WEB — gRPC Core Concepts
+  URL: grpc.io/docs/what-is-grpc/core-concepts
+  Unary vs streaming RPCs. Deadlines. Error handling.
+
+[REC] TOOL — grpcurl
+  URL: github.com/fullstorydev/grpcurl
+  Install before week 5. Test gRPC handlers manually.
+
+================================================================
+WEEK 5 — Dispatch loop, concurrent data structures, unreliable clocks
+================================================================
+
+[MUST] CODE — tokio mini-redis source code
+  URL: github.com/tokio-rs/mini-redis
+  Read ALL source files before writing your server.
+  Every design decision has a reason — understand them.
+
+[MUST] WEB — DashMap documentation and source
+  URL: docs.rs/dashmap
+  URL: github.com/xacrimon/dashmap
+  Understand sharding. Why DashMap beats Mutex<HashMap>.
+
+[MUST] BOOK — DDIA Chapter 8, Section 8.3: Unreliable Clocks
+  Book: Designing Data-Intensive Applications by Martin Kleppmann
+  Monotonic vs wall clocks.
+  Never compare timestamps from two different machines.
+  Read before storing any timestamps.
+
+[REC] WEB — uuid crate v7 feature
+  URL: docs.rs/uuid
+  Why time-ordered UUIDs (v7) beat random UUIDs (v4) for
+  database-stored IDs and pagination.
+
+================================================================
+WEEK 6 — Failure detection, phi accrual, constant work pattern
+================================================================
+
+[MUST] WEB — AWS Builders' Library: Heartbeat and Constant Work
+  URL: aws.amazon.com/builders-library/reliability-and-constant-work
+  The constant work pattern. Your heartbeat must always fire.
+  Read before implementing the heartbeat loop.
+
+[MUST] WEB — AWS Builders' Library: Leader Election
+  Search: "AWS builders library leader election distributed systems"
+  Covers failure modes of leader transitions.
+  Read before week 9 (leader election implementation).
+
+[MUST] PAPER — Phi Accrual Failure Detector, Intro + Sections 1–3
+  Search: "phi accrual failure detector"
+  Read: Introduction and Sections 1–3 ONLY (skip the math)
+  Why fixed threshold is inferior to adaptive detection.
+  Know the limitations so you can explain them in interviews.
+
+[MUST] WEB — tokio-util CancellationToken docs
+  URL: docs.rs/tokio-util
+  How to implement job cancellation and graceful shutdown.
+
+[REC] WEB — parking_lot crate
+  URL: docs.rs/parking_lot
+  Faster Mutex, no poisoning on panic.
+  Consider for the job queue lock.
+
+================================================================
+WEEK 7 — At-least-once semantics, idempotency, SQLite WAL
+================================================================
+
+[MUST] WEB — "You Cannot Have Exactly-Once Delivery" — Brave New Geek
+  Search that EXACT title
+  Most important conceptual reading of the entire project.
+  Why exactly-once is impossible across distributed system boundaries.
+  Why your executors must be idempotent.
+
+[MUST] WEB — Stripe Engineering Blog: Idempotency Keys
+  URL: stripe.com/blog/idempotency
+  How Stripe makes at-least-once safe.
+  Your job executors need the same pattern.
+
+[MUST] WEB — sqlx documentation: SQLite with WAL mode
+  URL: docs.rs/sqlx
+  WAL mode: PRAGMA journal_mode=WAL
+  Why it enables concurrent reads during writes.
+
+[REC] WEB — AWS Architecture Blog: Exponential Backoff and Jitter
+  Search: "AWS exponential backoff jitter"
+  Why jitter is critical and how to implement it correctly.
+  Your RetryPolicy needs it.
+
+[REC] BOOK — DDIA Chapter 8 (remaining sections)
+  Book: Designing Data-Intensive Applications by Martin Kleppmann
+  Byzantine faults, process pauses, safety vs liveness.
+  Complete the chapter if you haven't.
+
+================================================================
+WEEK 8 — CLI design, benchmarking, SRE queue concepts
+================================================================
+
+[MUST] WEB — clap documentation: derive API
+  URL: docs.rs/clap
+  Read the cookbook section: subcommands, global flags,
+  environment variable overrides, exit codes.
+
+[MUST] WEB — criterion user guide
+  URL: bheisler.github.io/criterion.rs/book
+  Getting started and timing loops sections.
+  Understand black_box() and why it prevents optimization-away.
+
+[REC] WEB — Google SRE Book Chapter 19: Load Balancing Frontend
+  URL: sre.google/sre-book/load-balancing-frontend
+  Queue depth as a load signal. Little's Law.
+  Frames your benchmark analysis in SRE language.
+
+[REC] TOOL — cargo-release
+  URL: github.com/crate-ci/cargo-release
+  Automates: version bump, git tag, GitHub release.
+
+[REC] WEB — makeareadme.com
+  URL: makeareadme.com
+  README structure guide. Product page, not API docs.
+
+================================================================
+WEEK 9 — Leader election, etcd, ZooKeeper, distributed coordination
+================================================================
+
+[MUST] PAPER — ZooKeeper: Introduction and Section 2
+  Search: "ZooKeeper wait-free coordination internet-scale systems"
+  Read: Introduction + Section 2 ONLY
+  Why coordination services exist. What primitives you need.
+
+[MUST] WEB — etcd documentation: Leases and Leader Election
+  URL: etcd.io/docs/v3.5/dev-guide/interacting_v3/#lease
+  Read, then run etcdctl commands manually before writing Rust.
+
+[MUST] WEB — AWS Builders' Library: Leader Election
+  Search: "AWS builders library leader election distributed systems"
+  Tradeoffs, failure modes, transition handling.
+
+[MUST] WEB — etcd-client crate documentation
+  URL: docs.rs/etcd-client
+  Lease operations: grant_lease, keep_alive, put with lease, watch.
+
+[MUST] TOOL — etcd: install locally first
+  URL: etcd.io/docs/v3.5/install
+  Run etcdctl commands manually. Understand data model first.
+
+[REC] TOOL — systemd unit files for deployment
+  URL: systemd.io
+  How to write .service files for scheduler and worker on school servers.
+
+================================================================
+WEEK 10 — Scheduling algorithms, Kubernetes routing, resource scheduling
+================================================================
+
+[MUST] WEB — Kubernetes Scheduler: Filtering and Scoring
+  URL: kubernetes.io/docs/concepts/scheduling-eviction/kube-scheduler
+  Read "Filtering" and "Scoring" sections.
+  Your tag routing = Kubernetes node selectors.
+  Your resource checking = Kubernetes resource requests.
+
+[REC] WEB — MIT OCW: Scheduling Algorithms
+  Search: "MIT operating systems scheduling algorithms"
+  FIFO, priority scheduling, round-robin, weighted fair queuing.
+  Theoretical foundation for what you're building.
+
+================================================================
+WEEK 11 — Rate limiting, overload handling, fan-out jobs
+================================================================
+
+[MUST] WEB — Stripe Engineering Blog: Designing Robust Rate Limiting
+  Search: "stripe rate limiting blog"
+  Token bucket vs sliding window. Jitter in rate limiters.
+  How to extend to distributed rate limiting.
+
+[MUST] WEB — Google SRE Book Chapter 21: Handling Overload
+  URL: sre.google/sre-book/handling-overload
+  Load shedding, per-client quotas, utilization signals.
+
+[REC] WEB — governor crate
+  URL: docs.rs/governor
+  Production-ready Rust rate limiter.
+  Read and decide: use it or roll your own token bucket.
+
+================================================================
+WEEK 12 — Cron, time falsehoods, DST, clock skew, Kubernetes CronJob
+================================================================
+
+[MUST] WEB — "Falsehoods Programmers Believe About Time"
+  Search: "Falsehoods Programmers Believe About Time"
+  Read BEFORE touching any cron or timestamp code.
+  NON-NEGOTIABLE. Timezone and DST bugs are the most common
+  cron implementation mistakes.
+
+[MUST] BOOK — DDIA Chapter 8: Monotonic vs Wall Clocks section
+  Book: Designing Data-Intensive Applications by Martin Kleppmann
+  Which clock for heartbeats (monotonic) vs timestamps (wall).
+
+[MUST] WEB — Kubernetes CronJob: Concurrency Policy
+  URL: kubernetes.io/docs/concepts/workloads/controllers/cron-jobs
+  Read "Concurrency Policy" section specifically.
+  Allow, Forbid, Replace policies. Choose yours.
+
+[MUST] WEB — cron crate documentation
+  URL: docs.rs/cron
+  Schedule::after() method. How next_fire_at is computed.
+
+[REC] WEB — chrono crate documentation
+  URL: docs.rs/chrono
+  UTC vs local time, timezone conversion, Unix timestamp storage.
+
+================================================================
+WEEK 13 — Correctness testing, Jepsen methodology, DDIA Ch. 9
+================================================================
+
+[MUST] WEB — Jepsen analyses (read 2)
+  URL: jepsen.io/analyses
+  Pick any 2. Read fully.
+  What linearizability violation means.
+  What test patterns Jepsen uses.
+
+[MUST] BOOK — DDIA Chapter 9, Sections 9.1 and 9.2
+  Book: Designing Data-Intensive Applications by Martin Kleppmann
+  Consistency guarantees and linearizability.
+  What your scheduler guarantees and what it doesn't.
+
+[REC] TOOL — tc netem (Linux network emulation)
+  Command: sudo tc qdisc add dev lo root netem delay 30ms 10ms loss 1%
+  Adds 30ms ±10ms jitter and 1% packet loss on localhost.
+  Run chaos tests under these conditions.
+
+================================================================
+WEEK 14 — Prometheus, Grafana, docker-compose, observability
+================================================================
+
+[MUST] WEB — Prometheus metric types
+  URL: prometheus.io/docs/concepts/metric_types
+  Counter vs Gauge vs Histogram vs Summary.
+  Use Histogram for latency (aggregatable across nodes).
+
+[MUST] WEB — prometheus crate documentation
+  URL: docs.rs/prometheus
+  Getting started + histogram examples.
+  The observe() method for latency recording.
+
+[MUST] TOOL — docker-compose reference
+  URL: docs.docker.com/compose
+  depends_on with health checks.
+  Named volumes for Prometheus data persistence.
+
+[REC] WEB — Grafana dashboard best practices
+  URL: grafana.com/docs/grafana/latest/best-practices
+  USE method: Utilization, Saturation, Errors.
+
+================================================================
+WEEK 15 — axum, htmx, flamegraph profiling, benchmark analysis
+================================================================
+
+[MUST] WEB — axum documentation
+  URL: docs.rs/axum
+  Routing, state extraction, HTML responses, server-sent events.
+
+[MUST] WEB — htmx documentation
+  URL: htmx.org/docs
+  You need 5 attributes: hx-get, hx-trigger, hx-target, hx-swap, hx-boost.
+
+[MUST] TOOL — cargo flamegraph
+  URL: github.com/flamegraph-rs/flamegraph
+  Install: cargo install flamegraph
+  Run: cargo flamegraph --bin scheduler-server
+  Width = time spent. Fix the widest bar.
+
+[REC] WEB — Brendan Gregg: How to Read a Flamegraph
+  URL: brendangregg.com/flamegraphs.html
+  Read BEFORE generating your first flamegraph.
+  Width = time, not depth.
+
+[REC] WEB — askama template engine
+  URL: docs.rs/askama
+  Type-safe Jinja2-like templates for Rust.
+
+================================================================
+WEEK 16 — README, demo video, interview prep, launch
+================================================================
+
+[MUST] WEB — makeareadme.com
+  URL: makeareadme.com
+  README = product page. Structure:
+  Description → screenshot → architecture → benchmarks →
+  quick start → design decisions → known limitations.
+
+[MUST] TOOL — asciinema
+  URL: asciinema.org
+  Record the terminal portion of your demo.
+  Much higher quality than screen recording for CLI-heavy demos.
+
+[REC] WEB — Hacker News Show HN guidelines
+  URL: news.ycombinator.com/showhn.html
+  Read before posting.
+  Post Tuesday–Thursday 9am–12pm ET.
+  First sentence: what you built.
+
+[REC] WEB — r/rust posting guidelines
+  URL: reddit.com/r/rust
+  Frame around Rust decisions:
+  DashMap vs Mutex, tonic streaming heartbeat, sqlx WAL mode.
+
+================================================================
+BOOKS TO BUY (get these before week 1)
+================================================================
+
+1. Designing Data-Intensive Applications by Martin Kleppmann
+   ~$40. Referenced in weeks 1, 3, 4, 5, 7, 8, 12, 13.
+   The single most important book for this project.
+   Chapters used: 1, 4, 8 (extensively), 9.
+
+================================================================
+FREE ONGOING RESOURCES (read throughout all 4 months)
+================================================================
+
+1. High Scalability blog
+   URL: highscalability.com
+   Search: "job queue", "task scheduler", "worker"
+   Shopify, Pinterest, Airbnb posts on their job systems.
+
+2. Temporal Engineering Blog
+   URL: temporal.io/blog
+   Read anything tagged "architecture" or "internals".
+
+3. MIT 6.824 Distributed Systems lecture notes
+   URL: pdos.csail.mit.edu/6.824/schedule.html
+   Read lecture notes for: Fault Tolerance, Consistency,
+   Distributed Transactions.
+   Do NOT need to do the labs.
+
+4. AWS Builders' Library (full archive)
+   URL: aws.amazon.com/builders-library
+   Any article on: reliability, distributed systems, queues.
+
+================================================================

@@ -6,7 +6,7 @@ import "google/protobuf/duration.proto";
 import "google/protobuf/empty.proto";
 
 service SchedulerService {
-    rpc SubmitJob (Job) returns (google.protobuf.Empty);
+    rpc SubmitJob (Job) returns (SubmitJobResponse);
     rpc GetJobStatus (JobIDRequest) returns (JobStatus);
     rpc CancelJob (JobIDRequest) returns (google.protobuf.Empty);
     rpc RequeueFromDLQ (JobIDRequest) returns (google.protobuf.Empty);
@@ -172,3 +172,7 @@ message HeartbeatControl {
 }
 message Ack {}
 message StopAcceptingWork {}
+
+message SubmitJobResponse {
+    bytes id = 1;
+}

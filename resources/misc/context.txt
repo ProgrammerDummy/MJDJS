@@ -1,0 +1,293 @@
+Here is my progress README and all my source files. Read the README fully before we start. I want to continue from the Immediate Next Steps section — starting with RetryPolicy. i also have the roadmap which you produced as well here too. 
+
+# Distributed Job Scheduler — Progress README
+## Purpose of This Document
+This document summarizes everything built so far on the distributed job scheduler project in Rust (codenamed MJDJS). It is intended to give a new Claude chat full context about what was built, why each decision was made, and exactly where things stand so we can continue from the right place.
+
+Provide this file alongside all source files when starting the new chat.
+
+---
+
+## Project Overview
+A general-purpose distributed job scheduler built in Rust as a resume/learning project targeting systems and infrastructure SWE roles. "General" means the scheduler treats jobs as opaque units of work — it does not care what the payload means, only that jobs get executed, retried on failure, and reported when done. Workers interpret the payload.
+
+**Project name:** MJDJS
+**Crate type:** library (`lib.rs`) + binary (`main.rs`)
+**Language:** Rust (2021 edition)
+
+---
+
+## Roadmap Context
+The project follows a 4-phase, 16-week roadmap:
+
+- **Phase 1 (Weeks 1–4):** Rust foundations + core data structures — NO networking yet
+- **Phase 2 (Weeks 5–8):** Single-node scheduler with real async dispatch
+- **Phase 3 (Weeks 9–13):** Distribution, leader election, fault tolerance
+- **Phase 4 (Weeks 14–16):** Observability, polish, deployment
+
+**Current status:** Between Week 1 (complete) and Week 2 (partially complete). Week 3 async work was started ahead of schedule and needs to be paused until Week 2 is properly finished.
+
+---
+
+## File Structure
+```
+src/
+├── lib.rs                  — module declarations
+├── main.rs                 — scratch testing (not production code)
+├── job_data_structures.rs  — Job, JobState, JobQueue, QueueError
+├── state_machine.rs        — JobEvent, TransitionError, transition(), determine_next_event()
+├── worker.rs               — Worker, WorkerStatus, WorkerPool, WorkerPoolError
+└── scheduler.rs            — Scheduler, JobResult, JobOutcome (INCOMPLETE — Week 3 preview)
+```
+
+---
+
+## What Was Built
+
+### Week 1 — Complete ✅
+
+#### `job_data_structures.rs`
+
+**`Job` struct**
+```rust
+pub struct Job {
+    pub id: u64,
+    pub job_type: u64,
+    pub payload: u64,           // placeholder — will become Vec<u8> or generic
+    pub priority: u64,
+    pub available_retry_attempts: u64,
+    pub retry_count: u64,
+    pub created_at: u64,        // placeholder — will become real timestamp
+    pub state: JobState,
+}
+```
+- `Ord` and `PartialOrd` are implemented **manually** (not derived) so `BinaryHeap` orders by `priority` descending, with `created_at` ascending as a tiebreaker (earlier jobs win ties via `.reverse()`)
+- `Eq`, `PartialEq`, `Debug`, `Clone` are derived
+- **Why manual `Ord`:** Derived `Ord` compares fields in declaration order, meaning `id` would drive ordering instead of `priority`. Manual implementation fixes this.
+- `retry_count` tracks how many attempts have been made. `available_retry_attempts` tracks how many remain. Both are needed — `retry_count` is for logging/history, `available_retry_attempts` is for policy decisions.
+- `retry_policy` was intentionally removed from `Job` — retry policy belongs to the job *type*, not individual job instances. This will be added back as a `RetryPolicy` type in Week 2.
+
+**`JobState` enum**
+```rust
+pub enum JobState {
+    Queued,
+    Running    { worker_id: u64, started_at: u64 },
+    Succeeded  { completed_at: u64, result: u64 },  // result: u64 is placeholder
+    Failed     { error: u64 },                       // error: u64 is placeholder
+    Retrying   { retry_at: u64 },                    // retry_at: u64 is placeholder
+    DeadLettered { reason: String },
+}
+```
+- Variants carry associated data (Rust enum superpower over C enums)
+- `attempts` was deliberately removed from `Failed` and `Retrying` — `retry_count` on `Job` is the single source of truth for attempt history. Storing it in two places would allow them to drift out of sync.
+- Derives: `Debug`, `PartialEq`, `Eq`, `Clone`
+
+**`JobQueue` struct**
+- Wraps `BinaryHeap<Job>` — nothing outside this module touches the heap directly
+- Methods: `new()`, `enqueue()`, `dequeue() -> Result<Job, QueueError>`, `peek() -> Result<&Job, QueueError>`, `len()`, `is_empty()`
+- `peek()` returns `Result<&Job, QueueError>` not `Result<Job, QueueError>` — returning a reference avoids copying and correctly models "look without removing"
+- `QueueError` has two variants: `EmptyQueueDequeue`, `EmptyQueuePeek` — callers may need to distinguish these
+- **Why `BinaryHeap`:** O(log n) insert, O(1) peek, O(log n) pop. Correct for a scheduler where the dominant operations are "add job" and "get highest priority job." Tradeoff: no efficient priority update — will use lazy deletion in Phase 2 when needed.
+
+---
+
+#### `state_machine.rs`
+
+**`JobEvent` enum**
+```rust
+pub enum JobEvent {
+    Run       { worker_id: u64, started_at: u64 },
+    Success   { completed_at: u64, result: u64 },
+    Retry     { retry_at: u64 },
+    Fail      { error: u64 },
+    DeadLetter { reason: String },
+}
+```
+- Each event carries the data needed to construct the next `JobState`
+- `Queue` event was deliberately omitted — a job starts life already `Queued`, so "queue a job" is creation, not a transition event
+
+**`TransitionError` enum**
+```rust
+pub enum TransitionError {
+    InvalidTransition {
+        previous_state: JobState,
+        attempted_transition: JobEvent,
+    },
+    RetryLimitReached,
+}
+```
+
+**`transition(job: &mut Job, event: JobEvent) -> Result<(), TransitionError>`**
+
+Key design decisions:
+- Takes `&mut Job` not `Job` by value — caller retains ownership throughout
+- Uses `std::mem::replace(&mut job.state, JobState::Queued)` to move the state out for matching while keeping the field valid (Rust won't let you move out of a `&mut` reference directly)
+- The placeholder `JobState::Queued` in `mem::replace` is immediately overwritten in every arm
+- **State corruption fix:** The catch-all invalid transition arm restores the original state via `state.clone()` before returning `Err`. Without this, an invalid transition would leave `job.state` as `Queued` (the placeholder), silently corrupting the job.
+- `available_retry_attempts` is decremented and `retry_count` is incremented in the `Fail` arm — this is the correct place because `transition` has `&mut Job`
+
+**`determine_next_event(job: &Job) -> JobEvent`**
+
+Separation of policy from mechanism:
+- `transition()` is the **mechanism** — pure function, enforces valid state changes
+- `determine_next_event()` is the **policy** — decides whether a failed job should retry or be dead-lettered based on `available_retry_attempts`
+- Keeping these separate means retry policy can change without touching transition logic
+- Returns `JobEvent::Retry { retry_at: 100 }` (placeholder timestamp) or `JobEvent::DeadLetter` based on `available_retry_attempts`
+
+**19 unit tests — all passing**
+Covers: all 6 valid transition arms, 3 invalid transitions (with state preservation verification), 2 `determine_next_event` cases, 4 `JobQueue` cases (priority ordering, created_at tiebreaker, empty peek error, empty dequeue error)
+
+---
+
+### Week 2 — Partially Complete ⚠️
+
+#### `worker.rs` ✅
+
+**`WorkerStatus` enum:** `Idle`, `Busy`, `Dead`
+
+**`Worker` struct**
+```rust
+pub struct Worker {
+    pub worker_id: u64,
+    pub status: WorkerStatus,
+    job_id: Option<u64>,   // stores job id not Job — scheduler owns the Job
+}
+```
+- `job_id: Option<u64>` not `Option<Job>` — the worker only needs to know *which* job it's running, not own it. The scheduler's `in_flight` HashMap owns the Job.
+- `worker_id` is kept on the struct even though it duplicates the HashMap key — workers need to know their own ID to report results back
+
+**`WorkerPool` struct**
+```rust
+pub struct WorkerPool {
+    pool: HashMap<u64, Worker>,
+}
+```
+- Methods: `new()`, `register_worker(worker_id)`, `find_idle_worker() -> Option<u64>`, `assign_job(worker_id, job_id) -> Result<(), WorkerPoolError>`, `free_worker(worker_id) -> Result<(), WorkerPoolError>`
+- `find_idle_worker()` uses `iter().find_map()` — idiomatic iterator chain from Rust Book Chapter 13
+- `assign_job` returns `WorkerUnavailable` for both `Busy` and `Dead` workers
+- `free_worker` guards against freeing a `Dead` worker — a dead worker coming back to `Idle` without resurrection logic is a bug
+
+**`WorkerPoolError`:** `InvalidAssignment`, `WorkerNotFound`, `WorkerUnavailable`
+
+**4 unit tests — all passing**
+
+---
+
+#### What Week 2 Is Still Missing ❌
+
+These must be completed before continuing Week 3:
+
+1. **`RetryPolicy` type** — the roadmap specifies:
+   ```rust
+   enum RetryPolicy {
+       NoRetry,
+       FixedDelay { delay_ms: u64, max_attempts: u32 },
+       ExponentialBackoff { base_ms: u64, multiplier: f64, max_attempts: u32, max_delay_ms: u64 },
+   }
+   ```
+   With a `next_delay(attempt: u32) -> Option<Duration>` method. `Option<Duration>`: `Some` = retry after this delay, `None` = give up. This replaces the hardcoded `available_retry_attempts` check in `determine_next_event()` and goes directly on `Job`.
+
+2. **Generic `WorkerPool<T>` with `Runnable` trait** — the roadmap specifies a generic pool where `T: Runnable`. `Runnable` trait: `fn run(&self) -> Result<(), Error>`. This is a Week 2 exercise in generics and traits, not a production requirement yet.
+
+3. **`thiserror` for error handling** — replace manual error enums with `#[derive(Error)]` from the `thiserror` crate. Cleaner, more idiomatic, required reading: burntsushi error handling post.
+
+4. **`Display`, `From`, `Into` impls on `Job` and `JobState`** — standard trait implementations that make types usable throughout the codebase.
+
+5. **Rustlings exercises 50–90** — traits, generics, iterators sections.
+
+6. **Read:** AWS Builders' Library — "Timeouts, Retries, and Backoff with Jitter" (directly relevant to `RetryPolicy`)
+
+---
+
+### Week 3 Preview — Incomplete, Do Not Extend Yet ⚠️
+
+#### `scheduler.rs` (partial)
+
+Built as a preview but needs Week 2 (`RetryPolicy`) to be complete before continuing.
+
+**`Scheduler` struct**
+```rust
+pub struct Scheduler {
+    pub queue: Arc<Mutex<JobQueue>>,
+    pub worker_pool: Arc<Mutex<WorkerPool>>,
+    pub job_results: Receiver<JobResult>,
+    pub sender: Sender<JobResult>,
+    pub in_flight: HashMap<u64, Job>,
+}
+```
+- `Arc<Mutex<T>>` wraps shared resources — multiple async tasks need access
+- `in_flight: HashMap<u64, Job>` — jobs are removed from the queue when dispatched, so the scheduler needs somewhere to track them while executing. Keyed by `job_id`.
+- `Sender<JobResult>` is stored on the scheduler so it can be cloned and given to spawned worker tasks
+
+**`JobResult` / `JobOutcome`**
+```rust
+pub enum JobOutcome { Success { result: u64 }, Failure { error: u64 } }
+pub struct JobResult { pub job_id: u64, pub worker_id: u64, event: JobOutcome }
+```
+
+**`run()` async method** — uses `tokio::select!` with two branches:
+1. Result branch: receives `JobResult` from workers, calls `transition()`, frees worker, handles retry/deadletter logic
+2. Dispatch branch: finds idle worker, dequeues job, calls `assign_job`, inserts into `in_flight`, spawns `simulate_job_execution` task
+
+**Key patterns used:**
+- Lock-extract-drop pattern to avoid holding `MutexGuard` across `.await` points
+- `async move` on `tokio::spawn` closures for `'static` bound satisfaction
+- `sender.send(...).await` — async send
+
+**`simulate_job_execution`** — placeholder async function that sleeps 100ms then sends a `Success` result back
+
+**What's still missing from Week 3:**
+- `CancellationToken` on workers (from `tokio-util`) for graceful job cancellation
+- All 4 tokio channel types studied and used (`mpsc`, `oneshot`, `broadcast`, `watch`)
+- Graceful shutdown via `broadcast` channel
+- Integration test for the full dispatch loop
+- Real timestamps replacing `0u64` placeholders
+- `WorkerPool` `run()` function with cancellation token
+
+---
+
+## Key Design Decisions Made (For Reference)
+
+| Decision | Choice | Reason |
+|---|---|---|
+| Queue data structure | `BinaryHeap` | O(1) peek, O(log n) insert/pop, correct for scheduler access patterns |
+| Priority tiebreaker | Earlier `created_at` wins | Fairness — older jobs shouldn't starve |
+| `Ord` implementation | Manual, not derived | Derived `Ord` uses field order, not priority |
+| `retry_count` location | On `Job` struct only | Single source of truth, prevents drift |
+| `retry_policy` location | Separate from `Job` (TODO) | Policy belongs to job type, not instance |
+| `transition()` signature | `&mut Job` | Caller retains ownership, avoids tuple awkwardness |
+| State corruption fix | `state.clone()` in catch-all | Restores original state on invalid transition |
+| Policy vs mechanism | `determine_next_event()` separate from `transition()` | Retry policy can change without touching state machine |
+| Worker job ownership | `job_id: Option<u64>` not `Option<Job>` | Scheduler owns jobs via `in_flight`, workers just reference IDs |
+| Shared state | `Arc<Mutex<T>>` | Required for safe sharing across async tasks |
+| TOCTOU note | Acknowledged, deferred | Single scheduler = single dispatcher = no race in current design. Will matter in Phase 3 with multiple nodes. |
+
+---
+
+## Immediate Next Steps (Resume Here)
+
+1. **Finish Week 2 first:**
+   - Read AWS Builders' Library — "Timeouts, Retries, and Backoff with Jitter"
+   - Build `RetryPolicy` enum with `next_delay()` method
+   - Wire `RetryPolicy` into `Job` struct
+   - Update `determine_next_event()` to use `RetryPolicy` instead of hardcoded `available_retry_attempts` check
+   - Switch error types to use `thiserror`
+   - Implement `Display` and `From`/`Into` on `Job` and `JobState`
+
+2. **Then complete Week 3:**
+   - Add `CancellationToken` to worker execution
+   - Implement all 4 channel types
+   - Add graceful shutdown
+   - Write integration test for full dispatch loop
+
+---
+
+## Learning Style Note
+
+This is a **learn-while-building** session. The Claude assistant should:
+- Give conceptual and contextual understanding of what is being worked on and how it relates to the project before coding starts
+- Provide guiding hints and guideposts rather than full solutions
+- Let the user discover bugs through the compiler and their own reasoning
+- Only point out errors when reviewing submitted code — don't pre-solve
+- When moving to a new component, state which week/component it is and why it's being built
+- Flag required reading from the roadmap before starting a new component
