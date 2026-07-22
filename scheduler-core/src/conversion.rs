@@ -15,52 +15,69 @@ pub enum ConversionError {
     NegativeDuration,
     #[error("no duration present to convert")]
     NoDuration,
+    #[error("delay duration exceed maximum cap")]
+    MaxDurationExceeded,
 }
 
-impl From<Job> for proto::Job {
-    fn from(job: Job) -> Self {
-        proto::Job { 
+impl TryFrom<Job> for proto::Job {
+    type Error = ConversionError;
+
+    fn try_from(job: Job) -> Result<Self, Self::Error> {
+        Ok(proto::Job { 
             id: job.id.as_bytes().to_vec(), 
             job_type: job.job_type, 
             payload: job.payload, 
             priority: job.priority, 
             retry_count: job.retry_count, 
             created_at: job.created_at, 
-            state: Some(match job.state {
+            state: match job.state {
                 JobState::Queued => {
-                    
+                    Some(proto::JobStatus { state: Some(proto::job_status::State::Queued(proto::job_status::Queued {}))})
                 },
 
                 JobState::Running { worker_id, started_at } => {
-
+                    Some(proto::JobStatus { state: Some(proto::job_status::State::Running(proto::job_status::Running { worker_id, started_at}))})
                 },
 
                 JobState::Succeeded { completed_at, result } => {
-
+                    Some(proto::JobStatus { state: Some(proto::job_status::State::Succeeded(proto::job_status::Succeeded { completed_at, result}))})
                 },
 
                 JobState::Failed { error } => {
-
+                    Some(proto::JobStatus { state: Some(proto::job_status::State::Failed(proto::job_status::Failed { error}))})
                 },
 
                 JobState::Retrying { retry_after } => {
-
-                },
+                    Some(proto::JobStatus { state: Some(proto::job_status::State::Retrying(proto::job_status::Retrying { retry_after: Some(retry_after.try_into().map_err(|_| ConversionError::MaxDurationExceeded)?)}))})
+                },//it is unexpected to get an error during this conversion, given that validate_retry_policy exists to ensrue that it doesnt exceed
 
                 JobState::DeadLettered { reason } => {
-
+                    Some(proto::JobStatus { state: Some(proto::job_status::State::Deadlettered(proto::job_status::DeadLettered { reason}))})
                 },
 
                 JobState::Abandoned { reason, abandoned_at } => {
-
+                    Some(proto::JobStatus { state: Some(proto::job_status::State::Abandoned(proto::job_status::Abandoned { reason, abandoned_at}))})
                 },
-            }), 
-            retry_policy: (), 
+            }, 
+
+            retry_policy: match job.retry_policy {
+                RetryPolicy::FixedDelay { delay_ms, max_attempts } => {
+                    Some(proto::RetryPolicy { policy: Some(proto::retry_policy::Policy::FixedDelay(proto::retry_policy::FixedDelay { delay_ms, max_attempts}))})
+                },
+                RetryPolicy::ExponentialBackoff { base_ms, multiplier, max_attempts, max_delay_ms } => {
+                    Some(proto::RetryPolicy { policy: Some(proto::retry_policy::Policy::ExponentialBackoff(proto::retry_policy::ExponentialBackoff { base_ms, multiplier: multiplier.into_inner() as f32, max_attempts, max_delay_ms}))})
+                },
+                RetryPolicy::NoRetry => {
+                    Some(proto::RetryPolicy{ policy: Some(proto::retry_policy::Policy::NoRetry(proto::NoRetry {}))})
+                }
+            }, 
             requirements: job.requirements, 
             metadata: job.metadata 
-        }
+        })
     }
+
 }
+
 
 impl TryFrom<proto::Job> for Job {
     type Error = ConversionError;
@@ -164,78 +181,32 @@ impl TryFrom<proto::Job> for Job {
 }
 
 
+fn validate_retry_policy(policy: &RetryPolicy) -> Result<(), ConversionError> {
+    const MAX_DELAY_MS: u64 = 10 * 60 * 1000; //set as 10 minutes max delay per job
 
-/*
-pub mod job_status {
-    #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-    pub struct Queued {}
-    #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-    pub struct Running {
-        #[prost(uint64, tag = "1")]
-        pub worker_id: u64,
-        #[prost(uint64, tag = "2")]
-        pub started_at: u64,
-    }
-    #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-    pub struct Succeeded {
-        #[prost(uint64, tag = "1")]
-        pub completed_at: u64,
-        #[prost(uint64, tag = "2")]
-        pub result: u64,
-    }
-    #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-    pub struct Failed {
-        #[prost(uint64, tag = "1")]
-        pub error: u64,
-    }
-    #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-    pub struct Retrying {
-        #[prost(message, optional, tag = "1")]
-        pub retry_after: ::core::option::Option<::prost_types::Duration>,
-    }
-    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-    pub struct DeadLettered {
-        #[prost(string, tag = "1")]
-        pub reason: ::prost::alloc::string::String,
-    }
-    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-    pub struct Abandoned {
-        #[prost(string, tag = "1")]
-        pub reason: ::prost::alloc::string::String,
-        #[prost(uint64, tag = "2")]
-        pub abandoned_at: u64,
-    }
-    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
-    pub enum State {
-        #[prost(message, tag = "1")]
-        Queued(Queued),
-        #[prost(message, tag = "2")]
-        Running(Running),
-        #[prost(message, tag = "3")]
-        Succeeded(Succeeded),
-        #[prost(message, tag = "4")]
-        Failed(Failed),
-        #[prost(message, tag = "5")]
-        Retrying(Retrying),
-        #[prost(message, tag = "6")]
-        Deadlettered(DeadLettered),
-        #[prost(message, tag = "7")]
-        Abandoned(Abandoned),
-    }
+    match policy {
+        RetryPolicy::FixedDelay { delay_ms, max_attempts } => {
+            if *delay_ms < MAX_DELAY_MS {
+                return Ok(())
+            }
+
+            return Err(ConversionError::MaxDurationExceeded)
+        },
+
+        RetryPolicy::ExponentialBackoff { base_ms, multiplier, max_attempts, max_delay_ms } => {
+            if *base_ms < MAX_DELAY_MS && *max_delay_ms < MAX_DELAY_MS {
+                return Ok(())
+            } 
+
+            return Err(ConversionError::MaxDurationExceeded)
 
 
+        },
 
-pub struct Job {
-    pub id: uuid::Uuid,
-    pub job_type: String,
-    pub payload: u64,
-    pub priority: u64,
-    pub retry_count: u64,
-    pub created_at: u64,
-    pub state: JobState,
-    pub retry_policy: RetryPolicy,
-    pub requirements: std::collections::HashMap<String, String>,
-    pub metadata: std::collections::HashMap<String, String>,
-}
-*/
-
+        RetryPolicy::NoRetry => {
+            Ok(())
+        }
+    }
+    // check delay_ms/base_ms/max_delay_ms against MAX_DELAY_MS
+    // wherever the policy variant carries them
+} //move this to the submitjob handler
