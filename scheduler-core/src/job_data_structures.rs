@@ -1,3 +1,5 @@
+use core::time;
+use uuid::timestamp::{context::NoContext, Timestamp};
 use std::time::UNIX_EPOCH;
 use std::{cmp::Ordering, time::SystemTime};
 
@@ -38,6 +40,17 @@ impl Ord for Job {
 
 
 }
+
+impl Job {
+    pub fn new_submitted(self) -> Self {
+        Job {
+            id: uuid::Uuid::now_v7(),
+            state: JobState::Queued,
+            ..self
+        }
+    }
+}
+
 
 impl PartialOrd for Job {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
