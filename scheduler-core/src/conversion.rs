@@ -17,6 +17,8 @@ pub enum ConversionError {
     NoDuration,
     #[error("delay duration exceed maximum cap")]
     MaxDurationExceeded,
+    #[error("invalid created_at time")]
+    InvalidCreatedAt,
 }
 
 impl TryFrom<Job> for proto::Job {
