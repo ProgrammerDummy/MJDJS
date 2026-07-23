@@ -181,32 +181,3 @@ impl TryFrom<proto::Job> for Job {
 }
 
 
-fn validate_retry_policy(policy: &RetryPolicy) -> Result<(), ConversionError> {
-    const MAX_DELAY_MS: u64 = 10 * 60 * 1000; //set as 10 minutes max delay per job
-
-    match policy {
-        RetryPolicy::FixedDelay { delay_ms, max_attempts } => {
-            if *delay_ms < MAX_DELAY_MS {
-                return Ok(())
-            }
-
-            return Err(ConversionError::MaxDurationExceeded)
-        },
-
-        RetryPolicy::ExponentialBackoff { base_ms, multiplier, max_attempts, max_delay_ms } => {
-            if *base_ms < MAX_DELAY_MS && *max_delay_ms < MAX_DELAY_MS {
-                return Ok(())
-            } 
-
-            return Err(ConversionError::MaxDurationExceeded)
-
-
-        },
-
-        RetryPolicy::NoRetry => {
-            Ok(())
-        }
-    }
-    // check delay_ms/base_ms/max_delay_ms against MAX_DELAY_MS
-    // wherever the policy variant carries them
-} //move this to the submitjob handler
