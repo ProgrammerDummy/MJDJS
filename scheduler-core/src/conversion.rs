@@ -180,4 +180,3 @@ impl TryFrom<proto::Job> for Job {
     }
 }
 
-
