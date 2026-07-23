@@ -1,5 +1,3 @@
-use core::time;
-use uuid::timestamp::{context::NoContext, Timestamp};
 use std::time::UNIX_EPOCH;
 use std::{cmp::Ordering, time::SystemTime};
 
@@ -46,6 +44,7 @@ impl Job {
         Job {
             id: uuid::Uuid::now_v7(),
             state: JobState::Queued,
+            created_at: now_millis(),
             ..self
         }
     }
