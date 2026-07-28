@@ -107,4 +107,24 @@ fn validate_retry_policy(policy: &RetryPolicy) -> Result<(), ConversionError> {
     }
     // check delay_ms/base_ms/max_delay_ms against MAX_DELAY_MS
     // wherever the policy variant carries them
-} //move this to the submitjob handler
+}
+
+#[tokio::test]
+async fn job_submission_success() {
+
+    /*
+    testing plan: 
+    look for client type and creation method within the generated file from prost and tonic
+
+    setup the grpc server and bind to port for listening, run it in background using spawn
+    wait until its done, use a oneshot channel to make sure that its ready to accept requests before firing my test request
+    create a proper job and send a request after serializing it with prost into proto::job using try_from methods in conversion.rs
+    submit this job through a grpc request
+    receive this through the server, then inspect the inner jobs hashmap and assert it 
+     */
+}
+
+#[tokio::test]
+async fn job_submission_failure_invalid_retry_policy() {
+
+}
