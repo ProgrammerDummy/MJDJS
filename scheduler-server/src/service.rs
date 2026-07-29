@@ -9,6 +9,9 @@ use futures::stream::BoxStream;
 use uuid;
 use std::sync::{Arc, Mutex};
 
+use scheduler_core::proto::scheduler_service_server::SchedulerServiceServer;
+use scheduler_core::proto::scheduler_service_client;
+
 pub struct MySchedulerService {
     jobs: Arc<Mutex<std::collections::HashMap<uuid::Uuid, Job>>>,
 }
@@ -111,6 +114,77 @@ fn validate_retry_policy(policy: &RetryPolicy) -> Result<(), ConversionError> {
 
 #[tokio::test]
 async fn job_submission_success() {
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let incoming = tonic::transport::server::TcpIncoming::from(listener);
+
+    let service = MySchedulerService::new();
+
+    let clone_check = service.jobs.clone();
+
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(SchedulerServiceServer::new(service))
+            .serve_with_incoming(incoming)
+            .await
+            .unwrap();
+    });
+
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+
+    let mut client = scheduler_service_client::SchedulerServiceClient::new(channel);
+    
+    let job = Job {
+        id: uuid::Uuid::now_v7(),
+        job_type: "test".to_string(),
+        payload: 0,
+        priority: 1,
+        retry_count: 0,
+        created_at: 0,
+        state: JobState::Queued,
+        retry_policy: RetryPolicy::NoRetry,
+        requirements: HashMap::new(),
+        metadata: HashMap::new(),
+    };
+
+    let job = tonic::Request::new(proto::Job::try_from(job).unwrap());
+
+    match client.submit_job(job).await {
+        Ok(dum) => {
+            let dum = dum.into_inner();
+            match uuid::Uuid::from_slice(&dum.id) {
+                Ok(id) => {
+                    {
+                        let jobs_stored = clone_check.lock().unwrap();
+                        match jobs_stored.get(&id) {
+                            Some(_) => {},
+                            None => {
+                                panic!();
+                            }
+                        }
+                    }
+                },
+                Err(e) => {
+                    eprintln!("{e}");
+                    panic!();
+                }
+            }
+            
+        },
+
+        Err(e) => {
+            eprintln!("{e}");
+            panic!();
+        }
+    }
+
+    
+
 
     /*
     testing plan: 
