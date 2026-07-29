@@ -112,9 +112,8 @@ fn validate_retry_policy(policy: &RetryPolicy) -> Result<(), ConversionError> {
     // wherever the policy variant carries them
 }
 
-#[tokio::test]
-async fn job_submission_success() {
 
+async fn bind_spawn_connect_for_tests() -> (scheduler_service_client::SchedulerServiceClient<tonic::transport::Channel>, Arc<Mutex<std::collections::HashMap<uuid::Uuid, Job>>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let incoming = tonic::transport::server::TcpIncoming::from(listener);
@@ -137,7 +136,16 @@ async fn job_submission_success() {
         .await
         .unwrap();
 
-    let mut client = scheduler_service_client::SchedulerServiceClient::new(channel);
+    (scheduler_service_client::SchedulerServiceClient::new(channel), clone_check)
+    
+}
+
+
+
+#[tokio::test]
+async fn job_submission_success() {
+
+    let (mut client, clone_check) = bind_spawn_connect_for_tests().await;
     
     let job = Job {
         id: uuid::Uuid::now_v7(),
@@ -200,5 +208,30 @@ async fn job_submission_success() {
 
 #[tokio::test]
 async fn job_submission_failure_invalid_retry_policy() {
+    let (mut client, _clone_check) = bind_spawn_connect_for_tests().await;
+
+    let job = Job {
+        id: uuid::Uuid::now_v7(),
+        job_type: "test".to_string(),
+        payload: 0,
+        priority: 1,
+        retry_count: 0,
+        created_at: 0,
+        state: JobState::Queued,
+        retry_policy: RetryPolicy::FixedDelay { delay_ms: 600001, max_attempts: 2 }, //set a delay_ms greater than 10 minutes to violate the submit job retry time bound
+        requirements: HashMap::new(),
+        metadata: HashMap::new(),
+    };
+
+    let job = tonic::Request::new(proto::Job::try_from(job).unwrap());
+
+    match client.submit_job(job).await {
+        Ok(dum) => {
+            panic!("this test was expected to fail with InvalidArgument");
+        },
+        Err(status) => {
+            assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        },
+    }
 
 }

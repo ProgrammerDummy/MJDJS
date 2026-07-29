@@ -87,13 +87,6 @@ pub enum RetryPolicy { //a retry policy which has three options, to not retry, a
     },
 }
 
-/*
-job fail s → transition() records the Fail → determine_next_event(job) 
-  → calls job.retry_policy.next_delay(job.retry_count) 
-  → Some(delay) => JobEvent::Retry { retry_at: now + delay }
-  → None        => JobEvent::DeadLetter { reason: "retries exhausted" }
-
-*/
 
 impl RetryPolicy {
     pub fn next_delay(&self, retry_count: u64) -> Option<std::time::Duration> { //returns a duration computed
