@@ -1,4 +1,4 @@
-use crate::job_data_structures::{Job, JobState, RetryPolicy, now_millis};
+use crate::job_data_structures::{Job, JobState, now_millis};
 use thiserror::Error;
 
 #[derive(PartialEq, Debug)]
@@ -117,19 +117,23 @@ pub fn transition(job: &mut Job, event: JobEvent) -> Result<(), TransitionError>
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::job_data_structures::{Job, JobQueue, JobState, QueueError};
+    use std::{collections::HashMap, fs::Metadata};
+
+use super::*;
+    use crate::job_data_structures::{Job, JobQueue, JobState, QueueError, RetryPolicy};
  
-    fn make_job(state: JobState) -> Job {
+    fn make_job(state: JobState, id: uuid::Uuid) -> Job {
         Job {
-            id: 1,
-            job_type: 1,
+            id,
+            job_type: "test_job".to_string(),
             payload: 1,
             priority: 1,
             retry_count: 0,
             created_at: 0,
             state,
             retry_policy: RetryPolicy::NoRetry,
+            requirements: std::collections::HashMap::new(),
+            metadata: std::collections::HashMap::new(),
         }
     }
 
@@ -137,7 +141,8 @@ mod tests {
     #[test]
 
     fn running_plus_success_to_succeeded() {
-        let mut job = make_job(JobState::Running { worker_id: 1, started_at: 1 });
+        let id = uuid::Uuid::now_v7();
+        let mut job = make_job(JobState::Running { worker_id: 1, started_at: 1 }, id);
         let event = JobEvent::Success { completed_at: 1, result: 1 };
         let result = transition(&mut job, event);
         assert_eq!(result, Ok(()));
@@ -145,7 +150,8 @@ mod tests {
     }
     #[test]
     fn running_plus_fail_to_failed() {
-        let mut job = make_job(JobState::Running { worker_id: 1, started_at: 1 });
+        let id = uuid::Uuid::now_v7();
+        let mut job = make_job(JobState::Running { worker_id: 1, started_at: 1 }, id);
         let event = JobEvent::Fail { error: 1 };
         let result = transition(&mut job, event);
         assert_eq!(result, Ok(()));
@@ -154,7 +160,8 @@ mod tests {
     }
     #[test]
     fn failed_plus_retry_to_retrying() {
-        let mut job = make_job(JobState::Failed { error: 1 });
+        let id = uuid::Uuid::now_v7();
+        let mut job = make_job(JobState::Failed { error: 1 }, id);
         let event = JobEvent::Retry { retry_after: std::time::Duration::from_millis(200) };
         let result = transition(&mut job, event);
         assert_eq!(result, Ok(()));
@@ -162,7 +169,8 @@ mod tests {
     }
     #[test]
     fn retrying_plus_run_to_running() {
-        let mut job = make_job(JobState::Retrying { retry_after: std::time::Duration::from_millis(200) });
+        let id = uuid::Uuid::now_v7();
+        let mut job = make_job(JobState::Retrying { retry_after: std::time::Duration::from_millis(200) }, id);
         let event = JobEvent::Run { worker_id: 1, started_at: 1 };
         let result = transition(&mut job, event);
         assert_eq!(result, Ok(()));
@@ -170,7 +178,8 @@ mod tests {
     }
     #[test]
     fn retrying_plus_deadletter_to_deadlettered() {
-        let mut job = make_job(JobState::Retrying { retry_after: std::time::Duration::from_millis(200) });
+        let id = uuid::Uuid::now_v7();
+        let mut job = make_job(JobState::Retrying { retry_after: std::time::Duration::from_millis(200) }, id);
         let event = JobEvent::DeadLetter { reason: "unknown for now".to_string() };
         let result = transition(&mut job, event);
         assert_eq!(result, Ok(()));
@@ -178,7 +187,8 @@ mod tests {
     }
     #[test]
     fn queued_plus_run_transitions_to_running() {
-        let mut job = make_job(JobState::Queued);
+        let id = uuid::Uuid::now_v7();
+        let mut job = make_job(JobState::Queued, id);
         let event = JobEvent::Run { worker_id: 42, started_at: 100 };
         let result = transition(&mut job, event);
         assert_eq!(result, Ok(()));
@@ -188,7 +198,8 @@ mod tests {
     #[test]
     //invalid transition tests
     fn queued_plus_success_to_queued() {
-        let mut job = make_job(JobState::Queued);
+        let id = uuid::Uuid::now_v7();
+        let mut job = make_job(JobState::Queued, id);
         let event = JobEvent::Success { completed_at: 1, result: 1 };
         let result = transition(&mut job, event);
         assert_eq!(result, Err(TransitionError::InvalidTransition { previous_state: JobState::Queued, attempted_transition: JobEvent::Success { completed_at: 1, result: 1 }}));
@@ -196,7 +207,8 @@ mod tests {
     }
     #[test]
     fn succeeded_plus_run_to_succeeded() {
-        let mut job = make_job(JobState::Succeeded { completed_at: 1, result: 2 });
+        let id = uuid::Uuid::now_v7();
+        let mut job = make_job(JobState::Succeeded { completed_at: 1, result: 2 }, id);
         let event = JobEvent::Run { worker_id: 1, started_at: 3 };
         let result = transition(&mut job, event);
         assert_eq!(result, Err(TransitionError::InvalidTransition { previous_state: JobState::Succeeded { completed_at: 1, result: 2 }, attempted_transition: JobEvent::Run { worker_id: 1, started_at: 3 }}));
@@ -204,7 +216,8 @@ mod tests {
     }
     #[test]
     fn running_plus_retry_to_running() {
-        let mut job = make_job(JobState::Running { worker_id: 1, started_at: 300 });
+        let id = uuid::Uuid::now_v7();
+        let mut job = make_job(JobState::Running { worker_id: 1, started_at: 300 }, id);
         let event = JobEvent::Retry { retry_after: std::time::Duration::from_millis(200) };
         let result = transition(&mut job, event);
         assert_eq!(result, Err(TransitionError::InvalidTransition { previous_state: JobState::Running { worker_id: 1, started_at: 300 }, attempted_transition: JobEvent::Retry { retry_after: std::time::Duration::from_millis(200)}}));
@@ -213,7 +226,8 @@ mod tests {
 
     #[test]
     fn queued_plus_abandon_to_abandoned() {
-        let mut job = make_job(JobState::Queued);
+        let id = uuid::Uuid::now_v7();
+        let mut job = make_job(JobState::Queued, id);
         let before = now_millis();
         let result = transition(&mut job, JobEvent::Abandon { reason: "test".to_string() });
         let after = now_millis();
@@ -229,7 +243,8 @@ mod tests {
 
     #[test]
     fn running_plus_abandon_to_abandoned() {
-        let mut job = make_job(JobState::Running { worker_id: 1, started_at: 1 });
+        let id = uuid::Uuid::now_v7();
+        let mut job = make_job(JobState::Running { worker_id: 1, started_at: 1 }, id);
         let before = now_millis();
         let result = transition(&mut job, JobEvent::Abandon { reason: "test".to_string() });
         let after = now_millis();
@@ -245,7 +260,8 @@ mod tests {
 
     #[test]
     fn retrying_plus_abandon_to_abandoned() {
-        let mut job = make_job(JobState::Retrying { retry_after: std::time::Duration::from_millis(100) });
+        let id = uuid::Uuid::now_v7();
+        let mut job = make_job(JobState::Retrying { retry_after: std::time::Duration::from_millis(100) }, id);
         let before = now_millis();
         let result = transition(&mut job, JobEvent::Abandon { reason: "test".to_string() });
         let after = now_millis();
@@ -263,15 +279,18 @@ mod tests {
     //tests for determine_next_event to see if decision making for if a job should retry or not is correct
     #[test]
     fn expected_return_retry() {
+        let id = uuid::Uuid::now_v7();
         let mut job = Job {
-            id: 1,
-            job_type: 1,
+            id,
+            job_type: "test_job".to_string(),
             payload: 1,
             priority: 1,
             retry_count: 0,
             created_at: 0,
             state: JobState::Failed { error: 1 },
             retry_policy: RetryPolicy::FixedDelay { delay_ms: 300, max_attempts: 3 },
+            requirements: std::collections::HashMap::new(),
+            metadata: std::collections::HashMap::new(),
         };
         let result = determine_next_event(&mut job);
 
@@ -285,29 +304,35 @@ mod tests {
     }
     #[test]
     fn expected_return_deadletter() {
+        let id = uuid::Uuid::now_v7();
         let mut job = Job {
-            id: 1,
-            job_type: 1,
+            id,
+            job_type: "test_job".to_string(),
             payload: 1,
             priority: 1,
             retry_count: 0,
             created_at: 0,
             state: JobState::Failed { error: 1 },
             retry_policy: RetryPolicy::NoRetry,
+            requirements: std::collections::HashMap::new(),
+            metadata: std::collections::HashMap::new(),
         };
         let result = determine_next_event(&mut job);
 
         assert_eq!(result, JobEvent::DeadLetter { reason: "retries exhausted".to_string() });
 
+        let id = uuid::Uuid::now_v7();
         let mut job = Job {
-            id: 1,
-            job_type: 1,
+            id,
+            job_type: "test_job".to_string(),
             payload: 1,
             priority: 1,
             retry_count: 4,
             created_at: 0,
             state: JobState::Failed { error: 1 },
             retry_policy: RetryPolicy::ExponentialBackoff { base_ms: 200, multiplier: ordered_float::OrderedFloat(1.5), max_attempts: 3, max_delay_ms: 1000 },
+            requirements: std::collections::HashMap::new(),
+            metadata: std::collections::HashMap::new(),
         };
 
         let result = determine_next_event(&mut job);
@@ -319,97 +344,123 @@ mod tests {
     //JobQueue tests for ordering and errors
     fn jobqueue_priority_test() {
         let mut queue = JobQueue::new();
+
+        let id1 = uuid::Uuid::now_v7();
+
+        let id2 = uuid::Uuid::now_v7();
         queue.enqueue(Job { 
-            id: 1, 
-            job_type: 1, 
+            id: id1.clone(), 
+            job_type: "test_job".to_string(), 
             payload: 2, 
             priority: 1, 
             retry_count: 0, 
             created_at: 12, 
             state: JobState::Queued,
             retry_policy: RetryPolicy::NoRetry,
+            requirements: std::collections::HashMap::new(),
+            metadata: std::collections::HashMap::new(),
         });
 
         queue.enqueue(Job { 
-            id: 1, 
-            job_type: 1, 
+            id: id2.clone(), 
+            job_type: "test_job".to_string(), 
             payload: 2, 
             priority: 2, 
             retry_count: 0, 
             created_at: 12, 
             state: JobState::Queued,
             retry_policy: RetryPolicy::NoRetry, 
+            requirements: std::collections::HashMap::new(),
+            metadata: std::collections::HashMap::new(),
         });
 
         assert_eq!(queue.dequeue(), Ok(Job { 
-            id: 1, 
-            job_type: 1, 
+            id: id2, 
+            job_type: "test_job".to_string(), 
             payload: 2, 
             priority: 2, 
             retry_count: 0, 
             created_at: 12, 
             state: JobState::Queued,
             retry_policy: RetryPolicy::NoRetry, 
+            requirements: std::collections::HashMap::new(),
+            metadata: std::collections::HashMap::new(),
+
         }));
 
         assert_eq!(queue.dequeue(), Ok(Job { 
-            id: 1, 
-            job_type: 1, 
+            id: id1, 
+            job_type: "test_job".to_string(), 
             payload: 2, 
             priority: 1, 
             retry_count: 0, 
             created_at: 12, 
             state: JobState::Queued,
             retry_policy: RetryPolicy::NoRetry,
+            requirements: std::collections::HashMap::new(),
+            metadata: std::collections::HashMap::new(),
         }));        
         
         
     }
     #[test]
     fn jobqueue_created_at_test() {
+
+        let id1 = uuid::Uuid::now_v7();
+
+        let id2 = uuid::Uuid::now_v7();
+
         let mut queue = JobQueue::new();
         queue.enqueue(Job { 
-            id: 1, 
-            job_type: 1, 
+            id: id1.clone(), 
+            job_type: "test_job".to_string(), 
             payload: 2, 
             priority: 1, 
             retry_count: 0, 
             created_at: 12, 
             state: JobState::Queued,
             retry_policy: RetryPolicy::NoRetry, 
+            requirements: std::collections::HashMap::new(),
+            metadata: std::collections::HashMap::new(),
         });
 
         queue.enqueue(Job { 
-            id: 1, 
-            job_type: 1, 
+            id: id2.clone(), 
+            job_type: "test_job".to_string(), 
             payload: 2, 
             priority: 1, 
             retry_count: 0, 
             created_at: 10, 
             state: JobState::Queued,
             retry_policy: RetryPolicy::NoRetry, 
+            requirements: std::collections::HashMap::new(),
+            metadata: std::collections::HashMap::new(),
         });
 
         assert_eq!(queue.dequeue(), Ok(Job { 
-            id: 1, 
-            job_type: 1, 
+            id: id2, 
+            job_type: "test_job".to_string(), 
             payload: 2, 
             priority: 1, 
             retry_count: 0, 
             created_at: 10, 
             state: JobState::Queued,
             retry_policy: RetryPolicy::NoRetry, 
+            requirements: std::collections::HashMap::new(),
+            metadata: std::collections::HashMap::new(),
         }));
 
         assert_eq!(queue.dequeue(), Ok(Job { 
-            id: 1, 
-            job_type: 1, 
+            id: id1, 
+            job_type: "test_job".to_string(), 
             payload: 2, 
             priority: 1, 
             retry_count: 0, 
             created_at: 12, 
             state: JobState::Queued,
             retry_policy: RetryPolicy::NoRetry, 
+            requirements: std::collections::HashMap::new(),
+            metadata: std::collections::HashMap::new(),
         }));        
     }
     #[test]

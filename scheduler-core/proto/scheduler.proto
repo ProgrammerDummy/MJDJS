@@ -1,0 +1,178 @@
+syntax = "proto3";
+
+package scheduler;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/empty.proto";
+
+service SchedulerService {
+    rpc SubmitJob (Job) returns (SubmitJobResponse);
+    rpc GetJobStatus (JobIDRequest) returns (JobStatus);
+    rpc CancelJob (JobIDRequest) returns (google.protobuf.Empty);
+    rpc RequeueFromDLQ (JobIDRequest) returns (google.protobuf.Empty);
+    rpc CreateTemplate(Template) returns (TemplateResponse);
+    rpc ListJobs(ListRequest) returns (stream Job);
+    rpc ListDeadLettered(ListRequest) returns (stream Job);
+}
+
+service WorkerService {
+    rpc Register(Worker) returns (AssignedWorkerID);
+    rpc ReportResult(JobResult) returns (google.protobuf.Empty);
+    rpc RequestWork(AssignedWorkerID) returns (RequestWorkResponse);
+    rpc Heartbeat(stream HeartbeatPing) returns (stream HeartbeatControl);
+}
+
+message JobIDRequest {
+    bytes id = 1;
+}
+
+message RequestWorkResponse {
+    oneof result {
+        Job job = 1;
+        NoWorkAvailable none = 2;
+    }
+}
+
+message NoWorkAvailable {}
+
+message Job {
+    bytes id = 1;
+    string job_type = 2;
+    uint64 payload = 3;
+    uint64 priority = 4;
+    uint64 retry_count = 5;
+    uint64 created_at = 6;
+    JobStatus state = 7;
+    RetryPolicy retry_policy = 8;
+    map<string, string> requirements = 9;
+    map<string, string> metadata = 10;
+}
+
+message JobStatus {
+    
+    message Queued {}
+
+    message Running {
+        uint64 worker_id = 1;
+        uint64 started_at = 2;
+    }
+
+    message Succeeded {
+        uint64 completed_at = 1;
+        uint64 result = 2;
+    }
+
+    message Failed {
+        uint64 error = 1;
+    }
+
+    message Retrying {
+        google.protobuf.Duration retry_after = 1;
+    }
+
+    message DeadLettered {
+        string reason = 1;
+    }
+
+    message Abandoned {
+        string reason = 1;
+        uint64 abandoned_at = 2;
+    }
+
+    oneof state {
+        Queued queued = 1; 
+        Running running = 2;
+        Succeeded succeeded = 3;
+        Failed failed = 4;
+        Retrying retrying = 5;
+        DeadLettered deadlettered = 6;
+        Abandoned abandoned = 7;
+    }
+}
+
+message JobResult {
+    bytes job_id = 1;
+    uint64 worker_id = 2;
+    JobOutcome job_outcome = 3;
+}
+
+message JobOutcome {
+
+    message Success {
+        uint64 result = 1;
+    }
+
+    message Failure {
+        uint64 error = 1;
+    }
+
+    message Cancelled {}
+
+    oneof outcome {
+        Success success = 1;
+        Failure failure = 2;
+        Cancelled cancelled = 3;
+    }
+
+}
+
+
+message RetryPolicy {
+    message FixedDelay {
+        uint64 delay_ms = 1;
+        uint32 max_attempts = 2;
+    }   
+
+    message ExponentialBackoff {
+        uint64 base_ms = 1;
+        float multiplier = 2;
+        uint32 max_attempts = 3;
+        uint64 max_delay_ms = 4;
+    }
+
+    oneof policy {
+        NoRetry no_retry = 1;
+        FixedDelay fixed_delay = 2;
+        ExponentialBackoff exponential_backoff = 3;
+    }
+}
+
+message Template {
+
+}
+
+message TemplateResponse {
+
+}
+
+message NoRetry {}
+
+message ListRequest {}
+
+//capabilities will be matched against job requirements while tags is for description only
+message Worker {
+    map<string, string> tags = 1;
+    map<string, string> capabilities = 2;
+}
+
+message AssignedWorkerID {
+    uint64 worker_id = 1;
+}
+
+message HeartbeatPing {
+    uint64 worker_id = 1;
+    uint64 sent_at = 2;
+}
+
+message HeartbeatControl {
+    oneof directive {
+        Ack ack = 1;
+        StopAcceptingWork stop_accepting_work = 2;
+    }
+}
+message Ack {}
+message StopAcceptingWork {}
+
+message SubmitJobResponse {
+    bytes id = 1;
+}

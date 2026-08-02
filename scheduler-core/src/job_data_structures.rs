@@ -11,14 +11,16 @@ use crate::job_data_structures::RetryPolicy::{ExponentialBackoff, FixedDelay, No
 
 #[derive(Debug, PartialEq, Clone, Eq)]
 pub struct Job {
-    pub id: u64,
-    pub job_type: u64,
+    pub id: uuid::Uuid,
+    pub job_type: String,
     pub payload: u64,
     pub priority: u64,
     pub retry_count: u64,
     pub created_at: u64,
     pub state: JobState,
     pub retry_policy: RetryPolicy,
+    pub requirements: std::collections::HashMap<String, String>,
+    pub metadata: std::collections::HashMap<String, String>,
 }
 
 impl Ord for Job {
@@ -36,6 +38,18 @@ impl Ord for Job {
 
 
 }
+
+impl Job {
+    pub fn new_submitted(self) -> Self {
+        Job {
+            id: uuid::Uuid::now_v7(),
+            state: JobState::Queued,
+            created_at: now_millis(),
+            ..self
+        }
+    }
+}
+
 
 impl PartialOrd for Job {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
@@ -73,13 +87,6 @@ pub enum RetryPolicy { //a retry policy which has three options, to not retry, a
     },
 }
 
-/*
-job fail s → transition() records the Fail → determine_next_event(job) 
-  → calls job.retry_policy.next_delay(job.retry_count) 
-  → Some(delay) => JobEvent::Retry { retry_at: now + delay }
-  → None        => JobEvent::DeadLetter { reason: "retries exhausted" }
-
-*/
 
 impl RetryPolicy {
     pub fn next_delay(&self, retry_count: u64) -> Option<std::time::Duration> { //returns a duration computed

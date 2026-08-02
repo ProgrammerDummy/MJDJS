@@ -1,11 +1,10 @@
-[package]
-name = "MJDJS"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+resolver = "2"
+members = [
+    "scheduler-core",
+    "scheduler-client",
+    "scheduler-server",
+    "worker-agent",
+]
 
-[dependencies]
-ordered-float = "5.3.0"
-rand = "0.10.1"
-thiserror = "2.0.18"
-tokio = { version = "1.52", features = ["full"] }
-tokio-util = "0.7.18"
+[workspace.dependencies]
