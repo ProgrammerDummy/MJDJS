@@ -23,6 +23,9 @@ pub enum JobEvent {
     Abandon {
         reason: String,
     },
+    WorkerLost {
+        reason: String,
+    }
 }
 
 #[derive(Error, PartialEq, Debug)]
@@ -48,6 +51,17 @@ pub fn determine_next_event(job: &Job) -> JobEvent { //this is for determining i
             return JobEvent::DeadLetter { reason: "retries exhausted".to_string() }
         }
     }
+}
+
+const MAX_INFRA_INTERRUPTIONS: u64 = 5;
+
+
+pub fn determine_reclaim_event(job: &Job) -> JobEvent {
+    if job.infra_interruptions == MAX_INFRA_INTERRUPTIONS {
+        return JobEvent::DeadLetter { reason: "exceeded infrastructure interruption cap, treated as a poison pill".to_string() }
+    }
+
+    return JobEvent::WorkerLost { reason: "worker was lost".to_string() }
 }
 
 //transition should be a pure function 
@@ -107,6 +121,12 @@ pub fn transition(job: &mut Job, event: JobEvent) -> Result<(), TransitionError>
             Ok(())
         }
 
+        (JobState::Running { worker_id: _, started_at: _ }, JobEvent::WorkerLost { reason: _ }) => {
+            job.state = JobState::Queued;
+            job.infra_interruptions += 1;
+            Ok(())
+        }
+
         (state, event) => {
             job.state = state.clone();  
             Err(TransitionError::InvalidTransition { previous_state: state, attempted_transition: event })
@@ -129,6 +149,7 @@ use super::*;
             payload: 1,
             priority: 1,
             retry_count: 0,
+            infra_interruptions: 0,
             created_at: 0,
             state,
             retry_policy: RetryPolicy::NoRetry,
@@ -287,6 +308,7 @@ use super::*;
             priority: 1,
             retry_count: 0,
             created_at: 0,
+            infra_interruptions: 0,
             state: JobState::Failed { error: 1 },
             retry_policy: RetryPolicy::FixedDelay { delay_ms: 300, max_attempts: 3 },
             requirements: std::collections::HashMap::new(),
@@ -311,6 +333,7 @@ use super::*;
             payload: 1,
             priority: 1,
             retry_count: 0,
+            infra_interruptions: 0,
             created_at: 0,
             state: JobState::Failed { error: 1 },
             retry_policy: RetryPolicy::NoRetry,
@@ -328,6 +351,7 @@ use super::*;
             payload: 1,
             priority: 1,
             retry_count: 4,
+            infra_interruptions: 0,
             created_at: 0,
             state: JobState::Failed { error: 1 },
             retry_policy: RetryPolicy::ExponentialBackoff { base_ms: 200, multiplier: ordered_float::OrderedFloat(1.5), max_attempts: 3, max_delay_ms: 1000 },
@@ -354,6 +378,7 @@ use super::*;
             payload: 2, 
             priority: 1, 
             retry_count: 0, 
+            infra_interruptions: 0,
             created_at: 12, 
             state: JobState::Queued,
             retry_policy: RetryPolicy::NoRetry,
@@ -367,6 +392,7 @@ use super::*;
             payload: 2, 
             priority: 2, 
             retry_count: 0, 
+            infra_interruptions: 0,
             created_at: 12, 
             state: JobState::Queued,
             retry_policy: RetryPolicy::NoRetry, 
@@ -380,6 +406,7 @@ use super::*;
             payload: 2, 
             priority: 2, 
             retry_count: 0, 
+            infra_interruptions: 0,
             created_at: 12, 
             state: JobState::Queued,
             retry_policy: RetryPolicy::NoRetry, 
@@ -394,6 +421,7 @@ use super::*;
             payload: 2, 
             priority: 1, 
             retry_count: 0, 
+            infra_interruptions: 0,
             created_at: 12, 
             state: JobState::Queued,
             retry_policy: RetryPolicy::NoRetry,
@@ -417,6 +445,7 @@ use super::*;
             payload: 2, 
             priority: 1, 
             retry_count: 0, 
+            infra_interruptions: 0,
             created_at: 12, 
             state: JobState::Queued,
             retry_policy: RetryPolicy::NoRetry, 
@@ -430,6 +459,7 @@ use super::*;
             payload: 2, 
             priority: 1, 
             retry_count: 0, 
+            infra_interruptions: 0,
             created_at: 10, 
             state: JobState::Queued,
             retry_policy: RetryPolicy::NoRetry, 
@@ -443,6 +473,7 @@ use super::*;
             payload: 2, 
             priority: 1, 
             retry_count: 0, 
+            infra_interruptions: 0,
             created_at: 10, 
             state: JobState::Queued,
             retry_policy: RetryPolicy::NoRetry, 
@@ -456,6 +487,7 @@ use super::*;
             payload: 2, 
             priority: 1, 
             retry_count: 0, 
+            infra_interruptions: 0,
             created_at: 12, 
             state: JobState::Queued,
             retry_policy: RetryPolicy::NoRetry, 
@@ -474,8 +506,45 @@ use super::*;
         assert_eq!(queue.dequeue(), Err(QueueError::EmptyQueueDequeue));
     }
 
-    
+    #[test]
+    fn determine_reclaim_event_to_worker_lost() {
+        let mut job = Job {
+            id: uuid::Uuid::now_v7(),
+            job_type: "test_job".to_string(),
+            payload: 1,
+            priority: 1,
+            retry_count: 0,
+            created_at: 0,
+            infra_interruptions: 0,
+            state: JobState::Failed { error: 1 },
+            retry_policy: RetryPolicy::FixedDelay { delay_ms: 300, max_attempts: 3 },
+            requirements: std::collections::HashMap::new(),
+            metadata: std::collections::HashMap::new(),
+        };
+        let result = determine_reclaim_event(&job);
 
+        assert_eq!(result, JobEvent::WorkerLost { reason: "worker was lost".to_string() })
+    }
+
+    #[test]
+    fn determine_reclaim_event_to_deadlettered() {
+        let mut job = Job {
+            id: uuid::Uuid::now_v7(),
+            job_type: "test_job".to_string(),
+            payload: 1,
+            priority: 1,
+            retry_count: 0,
+            created_at: 0,
+            infra_interruptions: 5,
+            state: JobState::Failed { error: 1 },
+            retry_policy: RetryPolicy::FixedDelay { delay_ms: 300, max_attempts: 3 },
+            requirements: std::collections::HashMap::new(),
+            metadata: std::collections::HashMap::new(),
+        };
+        let result = determine_reclaim_event(&job);
+
+        assert_eq!(result, JobEvent::DeadLetter { reason: "exceeded infrastructure interruption cap, treated as a poison pill".to_string() });
+    }
 
 
 }
