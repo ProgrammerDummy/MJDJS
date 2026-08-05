@@ -1,5 +1,5 @@
-use scheduler_core::proto::SubmitJobResponse;
-use scheduler_core::{conversion::ConversionError};
+use scheduler_core::proto::{JobStatus, SubmitJobResponse};
+use scheduler_core::{conversion::{ConversionError, job_state_to_proto, proto_to_job_status}};
 use scheduler_core::job_data_structures::{Job, JobState, RetryPolicy};
 use scheduler_core::proto::{self, scheduler_service_server::SchedulerService};
 use tonic::{Request, Response, Status};
@@ -52,7 +52,40 @@ impl SchedulerService for MySchedulerService {
     }
 
     async fn get_job_status(&self, request: Request<proto::JobIdRequest>) -> Result<Response<proto::JobStatus>, Status> {
-        Err(Status::unimplemented("get_job_status not yet implemented"))
+        let job_id_request = request.into_inner();
+
+        let job_id_request = uuid::Uuid::from_slice(job_id_request.id.as_slice());
+
+        match job_id_request {
+            Ok(job_uuid) => {
+                let jobs_lock = self.jobs.lock().unwrap();
+                let job = jobs_lock.get(&job_uuid);
+                
+                match job {
+                    Some(job) => {
+                        match job_state_to_proto(job.state.clone()) {
+                            Ok(proto_job_status) => {
+                                return Ok(tonic::Response::new(proto_job_status))
+                            },
+
+                            Err(e) => {
+                                return Err(tonic::Status::internal("invalid job entered the system")) //this shouldn't occur due to the entrypoint having bounds, if this happens something has gone very wrong
+                            }
+                        }
+
+                    },
+
+                    None => {
+                        return Err::<Response<proto::JobStatus>, Status>(tonic::Status::not_found("job was not found in MySchedulerService"));
+                    },
+                }
+            },
+            Err(e) => {
+                return Err(tonic::Status::invalid_argument(format!("invalid job id: {e}"))) 
+            },
+        }
+
+
     }
 
     async fn cancel_job(&self, request: Request<proto::JobIdRequest>) -> Result<Response<()>, Status> {
@@ -153,6 +186,7 @@ async fn job_submission_success() {
         payload: 0,
         priority: 1,
         retry_count: 0,
+        infra_interruptions: 0,
         created_at: 0,
         state: JobState::Queued,
         retry_policy: RetryPolicy::NoRetry,
@@ -216,6 +250,7 @@ async fn job_submission_failure_invalid_retry_policy() {
         payload: 0,
         priority: 1,
         retry_count: 0,
+        infra_interruptions: 0,
         created_at: 0,
         state: JobState::Queued,
         retry_policy: RetryPolicy::FixedDelay { delay_ms: 600001, max_attempts: 2 }, //set a delay_ms greater than 10 minutes to violate the submit job retry time bound
@@ -233,5 +268,101 @@ async fn job_submission_failure_invalid_retry_policy() {
             assert_eq!(status.code(), tonic::Code::InvalidArgument);
         },
     }
+
+}
+
+#[tokio::test]
+async fn get_job_status_success() {
+    let (mut client, _clone_check) = bind_spawn_connect_for_tests().await;
+    
+    let job = Job {
+        id: uuid::Uuid::now_v7(),
+        job_type: "test".to_string(),
+        payload: 0,
+        priority: 1,
+        retry_count: 0,
+        infra_interruptions: 0,
+        created_at: 0,
+        state: JobState::Queued,
+        retry_policy: RetryPolicy::NoRetry,
+        requirements: HashMap::new(),
+        metadata: HashMap::new(),
+    };
+    
+    let job = tonic::Request::new(proto::Job::try_from(job).unwrap());
+
+    match client.submit_job(job).await {
+        Ok(dum) => {
+            let dum = dum.into_inner();
+            let response = client.get_job_status(tonic::Request::new(proto::JobIdRequest { id: dum.id})).await;
+            match response {
+                Ok(job_status_response) => {
+                    let job_status = job_status_response.into_inner();
+                    let job_status = proto_to_job_status(job_status.state).unwrap();
+                    assert_eq!(job_status, JobState::Queued);
+                    
+                },
+
+                Err(_) => {
+                    eprintln!("uuid retrieval failed unexpectedly");
+                    panic!();
+                },
+            }
+        },
+
+        Err(e) => {
+            eprintln!("{e}");
+            panic!();
+        }
+    }
+
+}
+
+#[tokio::test]
+async fn get_job_status_not_found() {
+    let (mut client, clone_check) = bind_spawn_connect_for_tests().await;
+
+    let nonexistent_id = uuid::Uuid::now_v7();
+    let nonexistent_id = nonexistent_id.as_bytes();
+
+    let job_status_request = tonic::Request::new(proto::JobIdRequest { id: nonexistent_id.to_vec() });
+
+    let response = client.get_job_status(job_status_request).await;
+
+    match response {
+        Ok(_) => {
+            eprintln!("get_job_status should have failed due to nonexistent job lookup");
+            panic!();
+        },
+
+        Err(e) => {
+            assert_eq!(e.code(), tonic::Code::NotFound);
+        }
+    }
+
+    
+}
+
+#[tokio::test]
+async fn get_job_status_invalid_id() {
+    let (mut client, clone_check) = bind_spawn_connect_for_tests().await;
+
+    let invalid_uuid = vec![1, 2, 3];
+
+    let job_status_request = tonic::Request::new(proto::JobIdRequest { id: invalid_uuid });
+
+    let response = client.get_job_status(job_status_request).await;
+
+    match response {
+        Ok(_) => {
+            eprintln!("get_job_status should have failed due to invalid uuid submitted");
+            panic!();
+        },
+
+        Err(e) => {
+            assert_eq!(e.code(), tonic::Code::InvalidArgument);
+        }
+    }
+
 
 }
