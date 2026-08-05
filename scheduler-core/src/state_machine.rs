@@ -127,6 +127,11 @@ pub fn transition(job: &mut Job, event: JobEvent) -> Result<(), TransitionError>
             Ok(())
         }
 
+        (JobState::Running { worker_id: _, started_at: _ }, JobEvent::DeadLetter { reason }) => {
+            job.state = JobState::DeadLettered { reason };
+            Ok(())
+        }
+
         (state, event) => {
             job.state = state.clone();  
             Err(TransitionError::InvalidTransition { previous_state: state, attempted_transition: event })
