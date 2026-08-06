@@ -31,6 +31,7 @@ impl TryFrom<Job> for proto::Job {
             payload: job.payload, 
             priority: job.priority, 
             retry_count: job.retry_count, 
+            infra_interruptions: job.infra_interruptions,
             created_at: job.created_at, 
             state: Some(job_state_to_proto(job.state)?), 
 
@@ -97,6 +98,7 @@ impl TryFrom<proto::Job> for Job {
             priority: p.priority,
             retry_count: p.retry_count,
             created_at: p.created_at,
+            infra_interruptions: p.infra_interruptions,
             state,
             retry_policy,
             requirements: p.requirements,
