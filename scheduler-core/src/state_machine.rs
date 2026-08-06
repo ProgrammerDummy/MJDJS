@@ -57,7 +57,7 @@ const MAX_INFRA_INTERRUPTIONS: u64 = 5;
 
 
 pub fn determine_reclaim_event(job: &Job) -> JobEvent {
-    if job.infra_interruptions == MAX_INFRA_INTERRUPTIONS {
+    if job.infra_interruptions >= MAX_INFRA_INTERRUPTIONS {
         return JobEvent::DeadLetter { reason: "exceeded infrastructure interruption cap, treated as a poison pill".to_string() }
     }
 
@@ -540,8 +540,8 @@ use super::*;
             priority: 1,
             retry_count: 0,
             created_at: 0,
-            infra_interruptions: 5,
-            state: JobState::Failed { error: 1 },
+            infra_interruptions: MAX_INFRA_INTERRUPTIONS,
+            state: JobState::Running { worker_id: 1, started_at: 1 },
             retry_policy: RetryPolicy::FixedDelay { delay_ms: 300, max_attempts: 3 },
             requirements: std::collections::HashMap::new(),
             metadata: std::collections::HashMap::new(),
@@ -549,6 +549,13 @@ use super::*;
         let result = determine_reclaim_event(&job);
 
         assert_eq!(result, JobEvent::DeadLetter { reason: "exceeded infrastructure interruption cap, treated as a poison pill".to_string() });
+
+        let transition_result = transition(&mut job, result);
+        
+        assert_eq!(transition_result, Ok(()));
+
+        assert_eq!(job.state, JobState::DeadLettered { reason: "exceeded infrastructure interruption cap, treated as a poison pill".to_string() });
+          
     }
 
 
