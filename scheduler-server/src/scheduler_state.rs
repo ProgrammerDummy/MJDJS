@@ -72,12 +72,19 @@ pub struct RunningJob {
     pub created_at: u64,
     pub started_at: u64,
     pub retry_count: u64,
+    pub running_phase: RunningPhase,
     pub infra_interruptions: u64,
     pub requirements: HashMap<String, String>,
     pub metadata: HashMap<String, String>,
     pub retry_policy: RetryPolicy,
 } //every job outside of queued and completed (fail or success or cancelled) jobs live here
 //this includes jobs that are retrying
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum RunningPhase {
+    Executing { worker_id: WorkerId, started_at: u64 },
+    Retrying,
+}
 
 #[derive(Debug, PartialEq, Clone, Eq)]
 pub struct CompletedJob {
@@ -98,15 +105,33 @@ pub struct CompletedJob {
 
 #[derive(Debug)]
 pub struct SchedulerState {
-    job_queue: Arc<Mutex<BinaryHeap<QueuedJob>>>, //binary heap ordered by priority and then created_at for retrieving first value for one at a time access
-    running_jobs: Arc<DashMap<uuid::Uuid, RunningJob>>, //dashmap for sharding since this will have many concurrent callers, avoids contention
-    completed_jobs: Arc<DashMap<uuid::Uuid, CompletedJob>>, //same as running_jobs
-    workers: Arc<DashMap<WorkerId, WorkerInfo>>, //same as above
-    retry_queue: Arc<Mutex<BTreeMap<Instant, uuid::Uuid>>>, //BTreeMap for allowing cancellation and keyed removal of individual elements
-    total_submitted: Arc<AtomicU64>, //atomic counter
-    total_completed: Arc<AtomicU64>,
-    total_failed: Arc<AtomicU64>,
-    total_dead_lettered: Arc<AtomicU64>,
+    pub job_queue: Arc<Mutex<BinaryHeap<QueuedJob>>>, //binary heap ordered by priority and then created_at for retrieving first value for one at a time access
+    pub running_jobs: Arc<DashMap<uuid::Uuid, RunningJob>>, //dashmap for sharding since this will have many concurrent callers, avoids contention
+    pub completed_jobs: Arc<DashMap<uuid::Uuid, CompletedJob>>, //same as running_jobs
+    pub workers: Arc<DashMap<WorkerId, WorkerInfo>>, //same as above
+    pub retry_queue: Arc<Mutex<BTreeMap<Instant, uuid::Uuid>>>, //BTreeMap for allowing cancellation and keyed removal of individual elements
+    pub total_submitted: Arc<AtomicU64>, //atomic counter
+    pub total_completed: Arc<AtomicU64>,
+    pub total_failed: Arc<AtomicU64>,
+    pub total_dead_lettered: Arc<AtomicU64>,
 
     //chose to wrap each field with Arc and mutex/dashmap so that only necessary components can clone the arc handle rather than having access to entire struct
+}
+
+impl SchedulerState {
+
+    pub fn new() -> Self {
+        SchedulerState {
+            job_queue: Arc::new(Mutex::new(BinaryHeap::new())), 
+            running_jobs: Arc::new(DashMap::new()), 
+            completed_jobs: Arc::new(DashMap::new()), 
+            workers: Arc::new(DashMap::new()), 
+            retry_queue: Arc::new(Mutex::new(BTreeMap::new())), 
+            total_submitted: Arc::new(0.into()), 
+            total_completed: Arc::new(0.into()),
+            total_failed: Arc::new(0.into()),
+            total_dead_lettered: Arc::new(0.into()),
+        }
+
+    }
 }
