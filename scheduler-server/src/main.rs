@@ -1,5 +1,7 @@
 mod service;
 mod scheduler_state;
+mod worker;
+
 use scheduler_core::proto::scheduler_service_server::SchedulerServiceServer;
 
 use crate::service::MySchedulerService;
