@@ -1,5 +1,7 @@
 use scheduler_core::job_data_structures::{JobState, RetryPolicy};
 use scheduler_core::worker::{WorkerId};
+use crate::worker::WorkerInfo;
+
 use uuid;
 
 use std::sync::{Arc, Mutex};
@@ -99,8 +101,7 @@ pub struct SchedulerState {
     job_queue: Arc<Mutex<BinaryHeap<QueuedJob>>>, //binary heap ordered by priority and then created_at for retrieving first value for one at a time access
     running_jobs: Arc<DashMap<uuid::Uuid, RunningJob>>, //dashmap for sharding since this will have many concurrent callers, avoids contention
     completed_jobs: Arc<DashMap<uuid::Uuid, CompletedJob>>, //same as running_jobs
-    //workers: Arc<DashMap<u64, WorkerInfo>>, //same as above
-    worker_index: DashMap<WorkerId, std::collections::HashSet<uuid::Uuid>>,
+    workers: Arc<DashMap<WorkerId, WorkerInfo>>, //same as above
     retry_queue: Arc<Mutex<BTreeMap<Instant, uuid::Uuid>>>, //BTreeMap for allowing cancellation and keyed removal of individual elements
     total_submitted: Arc<AtomicU64>, //atomic counter
     total_completed: Arc<AtomicU64>,
