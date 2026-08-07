@@ -16,6 +16,7 @@ pub struct Job {
     pub payload: u64,
     pub priority: u64,
     pub retry_count: u64,
+    pub infra_interruptions: u64,
     pub created_at: u64,
     pub state: JobState,
     pub retry_policy: RetryPolicy,
@@ -45,6 +46,8 @@ impl Job {
             id: uuid::Uuid::now_v7(),
             state: JobState::Queued,
             created_at: now_millis(),
+            retry_count: 0,
+            infra_interruptions: 0,
             ..self
         }
     }

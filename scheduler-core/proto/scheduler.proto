@@ -46,6 +46,7 @@ message Job {
     RetryPolicy retry_policy = 8;
     map<string, string> requirements = 9;
     map<string, string> metadata = 10;
+    uint64 infra_interruptions = 11;
 }
 
 message JobStatus {
