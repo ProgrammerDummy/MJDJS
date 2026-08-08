@@ -65,12 +65,10 @@ impl PartialOrd for QueuedJob {
 #[derive(Debug, PartialEq, Clone, Eq)]
 pub struct RunningJob {
     pub id: uuid::Uuid,
-    pub worker_id: u64,
     pub job_type: String,
     pub payload: u64,
     pub priority: u64,
     pub created_at: u64,
-    pub started_at: u64,
     pub retry_count: u64,
     pub running_phase: RunningPhase,
     pub infra_interruptions: u64,
