@@ -5,6 +5,7 @@ use scheduler_core::proto::{self, scheduler_service_server::SchedulerService};
 use tonic::{Request, Response, Status};
 use std::collections::HashMap;
 use std::convert::TryFrom;
+use std::sync::atomic::Ordering;
 use futures::stream::BoxStream;
 use uuid;
 use std::sync::{Arc, Mutex};
@@ -12,15 +13,76 @@ use std::sync::{Arc, Mutex};
 use scheduler_core::proto::scheduler_service_server::SchedulerServiceServer;
 use scheduler_core::proto::scheduler_service_client;
 
+use crate::scheduler_state::{QueuedJob, SchedulerState, RunningPhase, CompletedJobOutcome};
+
 pub struct MySchedulerService {
-    jobs: Arc<Mutex<std::collections::HashMap<uuid::Uuid, Job>>>,
+    scheduler_state: SchedulerState,
 }
 
 impl MySchedulerService {
     pub fn new() -> Self {
-        MySchedulerService { jobs: Arc::new(Mutex::new(HashMap::new())) }
+        MySchedulerService { scheduler_state: SchedulerState::new() }
     }
 }
+
+impl MySchedulerService {
+    fn scan_lists_for_job_status(&self, requested_id: uuid::Uuid) -> Result<JobState, Status> {
+
+        //look for running_jobs first
+
+        
+        if let Some(running_job) = self.scheduler_state.running_jobs.get(&requested_id) {
+            if let RunningPhase::Executing { worker_id, started_at} = running_job.running_phase {
+                return Ok(JobState::Running { worker_id, started_at })
+            } 
+        
+            if let Ok(retry_queue_guard) = self.scheduler_state.retry_queue.lock() {
+                if let Some(timeout_until) = retry_queue_guard
+                    .iter()
+                    .find(| (_, id) | **id == requested_id)
+                    .map(| (&timeout_until, _) | timeout_until) { //O(n) time, could speed up with BiBiTreeMap?
+                    
+                    return Ok(JobState::Retrying { retry_after: timeout_until.saturating_duration_since(std::time::Instant::now()) })
+                }
+            } else { //in case of mutex poisoning
+                return Err(Status::internal("scheduler state's retry_queue lock was poisoned"));
+            }
+        }
+
+
+
+        //look for completed_jobs next
+
+        if let Some(completed_job) = self.scheduler_state.completed_jobs.get(&requested_id) {
+            if let CompletedJobOutcome::Abandoned { reason } = &completed_job.outcome {
+                return Ok(JobState::Abandoned { reason: reason.to_string(), abandoned_at: completed_job.completed_at })
+            }
+
+            if let CompletedJobOutcome::DeadLettered { reason } = &completed_job.outcome {
+                return Ok(JobState::DeadLettered { reason: reason.to_string() })
+            }
+
+            if let CompletedJobOutcome::Succeeded { result } = &completed_job.outcome {
+                return Ok(JobState::Succeeded { completed_at: completed_job.completed_at, result: *result })
+            }
+        }
+
+        //finally, look at job_queue 
+
+        {
+            if let Ok(job_queue_guard) = self.scheduler_state.job_queue.lock() {
+                if job_queue_guard.iter().any(|job| job.id == requested_id) {
+                    return Ok(JobState::Queued);
+                }
+
+                return Err(tonic::Status::not_found("job was not found in MySchedulerService"));
+            } else { //in case of mutex poisoning
+                return Err(Status::internal("scheduler state's job_queue lock was poisoned"));
+            }
+        }
+    }
+}
+
 
 #[tonic::async_trait]
 impl SchedulerService for MySchedulerService {
@@ -38,8 +100,25 @@ impl SchedulerService for MySchedulerService {
         let job = Job::new_submitted(job);
         
         {
-            let mut jobs = self.jobs.lock().unwrap();
-            jobs.insert(job.id, job.clone());
+
+            let queued_job = QueuedJob {
+                id: job.id,
+                job_type: job.job_type,
+                payload: job.payload,
+                priority: job.priority,
+                created_at: job.created_at,
+                retry_policy: job.retry_policy,
+                requirements: job.requirements,
+                metadata: job.metadata,
+            };
+
+            {
+                let mut jobs = self.scheduler_state.job_queue.lock().unwrap();
+
+                jobs.push(queued_job);
+            }
+
+            self.scheduler_state.total_submitted.fetch_add(1, Ordering::SeqCst); //increment total_submitted in SchedulerState
 
         }
 
@@ -51,6 +130,7 @@ impl SchedulerService for MySchedulerService {
        
     }
 
+
     async fn get_job_status(&self, request: Request<proto::JobIdRequest>) -> Result<Response<proto::JobStatus>, Status> {
         let job_id_request = request.into_inner();
 
@@ -58,26 +138,24 @@ impl SchedulerService for MySchedulerService {
 
         match job_id_request {
             Ok(job_uuid) => {
-                let jobs_lock = self.jobs.lock().unwrap();
-                let job = jobs_lock.get(&job_uuid);
+
+                //this is assuming that no duplicates will exist between job_queue, running_jobs, and completed_jobs at a time
+                //should be ensured during migrations between data structures
+
+                let mut job_state = self.scan_lists_for_job_status(job_uuid);
+
+                if let Err(e) = job_state {
+                    return Err(e);
+                } //return early here if job couldn't be found
                 
-                match job {
-                    Some(job) => {
-                        match job_state_to_proto(job.state.clone()) {
-                            Ok(proto_job_status) => {
-                                return Ok(tonic::Response::new(proto_job_status))
-                            },
-
-                            Err(e) => {
-                                return Err(tonic::Status::internal("invalid job entered the system")) //this shouldn't occur due to the entrypoint having bounds, if this happens something has gone very wrong
-                            }
-                        }
-
+                match job_state_to_proto(job_state.unwrap()) { //safe to unwrap here
+                    Ok(proto_job_status) => {
+                        return Ok(tonic::Response::new(proto_job_status))
                     },
 
-                    None => {
-                        return Err::<Response<proto::JobStatus>, Status>(tonic::Status::not_found("job was not found in MySchedulerService"));
-                    },
+                    Err(e) => {
+                        return Err(tonic::Status::internal("invalid job entered the system")) //this shouldn't occur due to the entrypoint having bounds, if this happens something has gone very wrong
+                    }
                 }
             },
             Err(e) => {
