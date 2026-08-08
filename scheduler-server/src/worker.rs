@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
-use std::sync::atomic::AtomicU32;
 
 use scheduler_core::worker::WorkerId;
 
