@@ -11,6 +11,7 @@ pub struct WorkerInfo {
     max_concurrent_jobs: u32,
     assigned_jobs: HashSet<uuid::Uuid>,
     last_heartbeat_at: Instant,
+    capabilities: HashMap<String, String>,
     tags: HashMap<String, String>,
     state: WorkerState,
 }
