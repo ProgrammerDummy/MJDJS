@@ -120,7 +120,7 @@ impl SchedulerService for MySchedulerService {
             {
                 let mut jobs = self.scheduler_state.job_queue.lock().unwrap();
 
-                jobs.push(queued_job);
+                jobs.insert(queued_job);
             }
 
             self.scheduler_state.total_submitted.fetch_add(1, Ordering::SeqCst); //increment total_submitted in SchedulerState
@@ -229,7 +229,7 @@ fn validate_retry_policy(policy: &RetryPolicy) -> Result<(), ConversionError> {
 }
 
 
-async fn bind_spawn_connect_for_tests() -> (scheduler_service_client::SchedulerServiceClient<tonic::transport::Channel>, Arc<Mutex<std::collections::BinaryHeap<QueuedJob>>>) { //return back the job_queue clone instead
+async fn bind_spawn_connect_for_tests() -> (scheduler_service_client::SchedulerServiceClient<tonic::transport::Channel>, Arc<Mutex<std::collections::BTreeSet<QueuedJob>>>) { //return back the job_queue clone instead
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let incoming = tonic::transport::server::TcpIncoming::from(listener);

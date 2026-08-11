@@ -6,7 +6,7 @@ use uuid;
 
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicU64;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::collections::{BTreeMap, BTreeSet};
 use dashmap::DashMap;
 use std::collections::HashMap;
 
@@ -39,8 +39,6 @@ pub struct QueuedJob {
     pub requirements: HashMap<String, String>,
     pub metadata: HashMap<String, String>,
 
-    //to get a binaryheap ordering based off of priority, and a fallback sort of created_at, these need to be included
-    //also id is always included to keep track of which Job it is exactly
 }
 
 impl Ord for QueuedJob {
@@ -108,7 +106,7 @@ pub struct CompletedJob {
 
 #[derive(Debug)]
 pub struct SchedulerState {
-    pub job_queue: Arc<Mutex<BTreeSet<QueuedJob>>>, //binary heap ordered by priority and then created_at for retrieving first value for one at a time access
+    pub job_queue: Arc<Mutex<BTreeSet<QueuedJob>>>, //BTreeSet ordered by priority and then created_at for retrieving first value for one at a time access
     pub running_jobs: Arc<DashMap<uuid::Uuid, RunningJob>>, //dashmap for sharding since this will have many concurrent callers, avoids contention
     pub completed_jobs: Arc<DashMap<uuid::Uuid, CompletedJob>>, //same as running_jobs
     pub workers: Arc<DashMap<WorkerId, WorkerInfo>>, //same as above
