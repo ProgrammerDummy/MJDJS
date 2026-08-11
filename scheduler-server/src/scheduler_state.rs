@@ -33,6 +33,8 @@ pub struct QueuedJob {
     pub payload: u64,
     pub priority: u64,
     pub created_at: u64,
+    pub retry_count: u64,
+    pub infra_interruptions: u64,
     pub retry_policy: RetryPolicy,
     pub requirements: HashMap<String, String>,
     pub metadata: HashMap<String, String>,
