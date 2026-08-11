@@ -6,7 +6,7 @@ use uuid;
 
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicU64;
-use std::collections::{BinaryHeap, BTreeMap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use dashmap::DashMap;
 use std::collections::HashMap;
 
@@ -105,7 +105,7 @@ pub struct CompletedJob {
 
 #[derive(Debug)]
 pub struct SchedulerState {
-    pub job_queue: Arc<Mutex<BinaryHeap<QueuedJob>>>, //binary heap ordered by priority and then created_at for retrieving first value for one at a time access
+    pub job_queue: Arc<Mutex<BTreeSet<QueuedJob>>>, //binary heap ordered by priority and then created_at for retrieving first value for one at a time access
     pub running_jobs: Arc<DashMap<uuid::Uuid, RunningJob>>, //dashmap for sharding since this will have many concurrent callers, avoids contention
     pub completed_jobs: Arc<DashMap<uuid::Uuid, CompletedJob>>, //same as running_jobs
     pub workers: Arc<DashMap<WorkerId, WorkerInfo>>, //same as above
@@ -122,7 +122,7 @@ impl SchedulerState {
 
     pub fn new() -> Self {
         SchedulerState {
-            job_queue: Arc::new(Mutex::new(BinaryHeap::new())), 
+            job_queue: Arc::new(Mutex::new(BTreeSet::new())), 
             running_jobs: Arc::new(DashMap::new()), 
             completed_jobs: Arc::new(DashMap::new()), 
             workers: Arc::new(DashMap::new()), 
