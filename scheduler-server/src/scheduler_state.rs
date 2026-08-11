@@ -104,7 +104,7 @@ pub struct CompletedJob {
     //a completed job is something that has ended, so it will include both success and failure
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SchedulerState {
     pub job_queue: Arc<Mutex<BTreeSet<QueuedJob>>>, //BTreeSet ordered by priority and then created_at for retrieving first value for one at a time access
     pub running_jobs: Arc<DashMap<uuid::Uuid, RunningJob>>, //dashmap for sharding since this will have many concurrent callers, avoids contention
