@@ -49,7 +49,10 @@ impl Ord for QueuedJob {
         match self.priority.cmp(&other.priority) {
             Ordering::Equal => {
                 //if priorities are equal, compare the created_at time to decide which one is ordered first
-                self.created_at.cmp(&other.created_at).reverse() 
+                match self.created_at.cmp(&other.created_at).reverse()  {
+                    Ordering::Equal => self.id.cmp(&other.id),
+                    other => other,
+                }
                 //use .reverse() so that earlier jobs come first if priorities are same
             }
             other => other, //if different priorites, give the ordering as is
