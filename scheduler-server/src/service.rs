@@ -36,6 +36,9 @@ impl MySchedulerService {
                 return Ok(JobState::Running { worker_id, started_at })
             } 
         
+            //if RunningPhase::Retrying
+            //warning for the future: if a RunningJob is within running_job but somehow not within retry_queue for some reason, the returned value of this function will be tonic::Status::not_found because it'll fall all the way through
+            
             if let Ok(retry_queue_guard) = self.scheduler_state.retry_queue.lock() {
                 if let Some(timeout_until) = retry_queue_guard
                     .iter()
@@ -106,6 +109,8 @@ impl SchedulerService for MySchedulerService {
                 job_type: job.job_type,
                 payload: job.payload,
                 priority: job.priority,
+                retry_count: job.retry_count,
+                infra_interruptions: job.infra_interruptions,
                 created_at: job.created_at,
                 retry_policy: job.retry_policy,
                 requirements: job.requirements,
@@ -224,14 +229,14 @@ fn validate_retry_policy(policy: &RetryPolicy) -> Result<(), ConversionError> {
 }
 
 
-async fn bind_spawn_connect_for_tests() -> (scheduler_service_client::SchedulerServiceClient<tonic::transport::Channel>, Arc<Mutex<std::collections::HashMap<uuid::Uuid, Job>>>) {
+async fn bind_spawn_connect_for_tests() -> (scheduler_service_client::SchedulerServiceClient<tonic::transport::Channel>, Arc<Mutex<std::collections::BinaryHeap<QueuedJob>>>) { //return back the job_queue clone instead
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let incoming = tonic::transport::server::TcpIncoming::from(listener);
 
     let service = MySchedulerService::new();
 
-    let clone_check = service.jobs.clone();
+    let clone_check = service.scheduler_state.job_queue.clone();
 
     tokio::spawn(async move {
         tonic::transport::Server::builder()
@@ -281,11 +286,8 @@ async fn job_submission_success() {
                 Ok(id) => {
                     {
                         let jobs_stored = clone_check.lock().unwrap();
-                        match jobs_stored.get(&id) {
-                            Some(_) => {},
-                            None => {
-                                panic!();
-                            }
+                        if !jobs_stored.iter().any(|job| job.id == id) {
+                            panic!();
                         }
                     }
                 },
@@ -398,7 +400,7 @@ async fn get_job_status_success() {
 
 #[tokio::test]
 async fn get_job_status_not_found() {
-    let (mut client, clone_check) = bind_spawn_connect_for_tests().await;
+    let (mut client, _clone_check) = bind_spawn_connect_for_tests().await;
 
     let nonexistent_id = uuid::Uuid::now_v7();
     let nonexistent_id = nonexistent_id.as_bytes();
@@ -423,7 +425,7 @@ async fn get_job_status_not_found() {
 
 #[tokio::test]
 async fn get_job_status_invalid_id() {
-    let (mut client, clone_check) = bind_spawn_connect_for_tests().await;
+    let (mut client, _clone_check) = bind_spawn_connect_for_tests().await;
 
     let invalid_uuid = vec![1, 2, 3];
 
