@@ -5,15 +5,15 @@ use scheduler_core::worker::WorkerId;
 
 #[derive(Debug)]
 pub struct WorkerInfo {
-    id: WorkerId,
-    hostname: String,
-    job_types_supported: Vec<String>,
-    max_concurrent_jobs: u32,
-    assigned_jobs: HashSet<uuid::Uuid>,
-    last_heartbeat_at: Instant,
-    capabilities: HashMap<String, String>,
-    tags: HashMap<String, String>,
-    state: WorkerState,
+    pub id: WorkerId,
+    pub hostname: String,
+    pub job_types_supported: Vec<String>,
+    pub max_concurrent_jobs: u32,
+    pub assigned_jobs: HashSet<uuid::Uuid>,
+    pub last_heartbeat_at: Instant,
+    pub capabilities: HashMap<String, String>,
+    pub tags: HashMap<String, String>,
+    pub state: WorkerState,
 }
 
 #[derive(Debug)]
