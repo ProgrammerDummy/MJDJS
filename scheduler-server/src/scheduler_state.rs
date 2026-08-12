@@ -44,10 +44,10 @@ pub struct QueuedJob {
 impl Ord for QueuedJob {
     fn cmp(&self, other: &Self) -> Ordering {
         // compare by priority first (highest goes first)
-        match self.priority.cmp(&other.priority) {
+        match self.priority.cmp(&other.priority).reverse() {
             Ordering::Equal => {
                 //if priorities are equal, compare the created_at time to decide which one is ordered first
-                match self.created_at.cmp(&other.created_at).reverse()  {
+                match self.created_at.cmp(&other.created_at)  {
                     Ordering::Equal => self.id.cmp(&other.id),
                     other => other,
                 }
