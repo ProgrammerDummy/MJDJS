@@ -100,7 +100,7 @@ impl WorkerService for MyWorkerService {
                             result: Some(proto::request_work_response::Result::Job(proto_job))
                         }))
                     } else {
-                        return Err(Status::aborted("job was invalid"));
+                        return Err(Status::internal("job was invalid"));
                     }
 
 
