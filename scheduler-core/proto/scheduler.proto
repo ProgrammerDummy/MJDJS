@@ -154,6 +154,7 @@ message ListRequest {}
 message Worker {
     map<string, string> tags = 1;
     map<string, string> capabilities = 2;
+    string hostname = 3;
 }
 
 message AssignedWorkerID {
