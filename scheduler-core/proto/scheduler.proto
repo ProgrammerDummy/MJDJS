@@ -155,6 +155,7 @@ message Worker {
     map<string, string> tags = 1;
     map<string, string> capabilities = 2;
     string hostname = 3;
+    repeated string job_types_supported = 4;
 }
 
 message AssignedWorkerID {
