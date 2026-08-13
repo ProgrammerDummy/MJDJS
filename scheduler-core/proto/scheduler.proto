@@ -156,6 +156,7 @@ message Worker {
     map<string, string> capabilities = 2;
     string hostname = 3;
     repeated string job_types_supported = 4;
+    uint32 max_concurrent_jobs = 5;
 }
 
 message AssignedWorkerID {
