@@ -93,7 +93,7 @@ message JobStatus {
 
 message JobResult {
     bytes job_id = 1;
-    uint64 worker_id = 2;
+    bytes worker_id = 2;
     JobOutcome job_outcome = 3;
 }
 
@@ -159,11 +159,11 @@ message Worker {
 }
 
 message AssignedWorkerID {
-    uint64 worker_id = 1;
+    bytes worker_id = 1;
 }
 
 message HeartbeatPing {
-    uint64 worker_id = 1;
+    bytes worker_id = 1;
     uint64 sent_at = 2;
 }
 
