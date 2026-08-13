@@ -1,1 +1,1 @@
-pub type WorkerId = u64;
+pub type WorkerId = uuid::Uuid;
