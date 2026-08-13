@@ -1,13 +1,14 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use scheduler_core::{job_data_structures::{Job, JobState, now_millis}, proto::worker_service_server::WorkerService};
-use scheduler_core::conversion;
+use oncelock::OnceLock;
+use scheduler_core::{job_data_structures::{Job, JobState, now_millis}, proto::worker_service_server::WorkerService, worker::WorkerId};
 
 use tonic::{Request, Response, Status};
 use scheduler_core::proto;
 use futures::stream::BoxStream;
+use uuid::Uuid;
 
-use crate::scheduler_state::{RunningJob, RunningPhase, SchedulerState};
+use crate::{scheduler_state::{RunningJob, RunningPhase, SchedulerState}, worker::{WorkerInfo, WorkerState}};
 
 pub struct MyWorkerService {
     scheduler_state: SchedulerState, //copy SchedulerState over from MySchedulerService during initialization
@@ -15,13 +16,59 @@ pub struct MyWorkerService {
 }
 
 impl MyWorkerService {
+    
+}
 
+pub fn cached_hostname() -> &'static str {
+    static HOSTNAME: OnceLock<String> = OnceLock::new();
+
+    HOSTNAME.get_or_init(|| {
+        gethostname::gethostname().to_string_lossy().into_owned()
+    })
 }
 
 #[tonic::async_trait]
 impl WorkerService for MyWorkerService {
     async fn register(&self, request: Request<proto::Worker>) -> Result<Response<proto::AssignedWorkerId>, Status> {
-        Err(Status::unimplemented("register not yet implemented"))
+        
+        //receive Request<proto::Worker> which holds capabilities and tags (extra metadata)
+        /*
+        take inner() and create new WorkerInfo struct 
+
+        generate the unique id of the worker
+
+        new entry within self.workers
+
+
+        currnetly, there are no checks to establish that the capabilities of a worker are valid, is it even possible without 
+        a bank of "valid" capabilities for a worker?
+
+        actually, this is impossible since this always changes per machine and for each machine, the capabilities can change
+         */
+
+        
+
+        
+        let new_worker_id: WorkerId = uuid::Uuid::now_v7(); //for now a placeholder until i figure out how to generate unique 64 bit ids
+
+        let registered_worker = request.into_inner();
+
+        let new_worker = WorkerInfo {
+            id: new_worker_id,
+            hostname: registered_worker.hostname,
+            job_types_supported: registered_worker.job_types_supported,
+            max_concurrent_jobs: registered_worker.max_concurrent_jobs,
+            assigned_jobs: HashSet::new(),
+            last_heartbeat_at: std::time::Instant::now(),
+            capabilities: registered_worker.capabilities,
+            tags: registered_worker.tags,
+            state: WorkerState::Active,
+        };
+         
+        self.scheduler_state.workers.insert(new_worker_id, new_worker);
+
+        return Ok(Response::new(proto::AssignedWorkerId { worker_id: new_worker_id.as_bytes().to_vec() }));
+
     }
 
     async fn report_result(&self, request: Request<proto::JobResult>) -> Result<Response<()>, Status> {
@@ -33,6 +80,15 @@ impl WorkerService for MyWorkerService {
 
         
         let job_requesting_worker_id = request.into_inner().worker_id;
+
+        let job_requesting_worker_id = match Uuid::from_slice(&job_requesting_worker_id) {
+            Ok(uuid) => {
+                uuid
+            },
+            Err(e) => {
+                return Err(Status::invalid_argument("invalid worker uuid used to request job"))
+            }
+        };
 
         let mut worker_capabilities: HashMap<String, String> = HashMap::new();
 
@@ -46,6 +102,7 @@ impl WorkerService for MyWorkerService {
                 if let Ok(mut job_queue_guard) = self.scheduler_state.job_queue.lock() {
 
                 let mut extractor = job_queue_guard.extract_if(.., |job| {
+                    worker.job_types_supported.contains(&job.job_type) &&
                     job.requirements.iter().all(|(requirements_key, requirements_value)| worker_capabilities.get(requirements_key) == Some(requirements_value))
                 }); //iterates over requirements to check that the requirements hashmap is a subset of capabilities hashmap
                 //if it matches, then the QueuedJob is unlinked from the btreeset
