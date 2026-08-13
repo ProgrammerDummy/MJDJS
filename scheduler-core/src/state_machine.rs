@@ -4,7 +4,7 @@ use thiserror::Error;
 #[derive(PartialEq, Debug)]
 pub enum JobEvent {
     Run {
-        worker_id: u64,
+        worker_id: uuid::Uuid,
         started_at: u64,
     },
     Success {
@@ -168,7 +168,7 @@ use super::*;
 
     fn running_plus_success_to_succeeded() {
         let id = uuid::Uuid::now_v7();
-        let mut job = make_job(JobState::Running { worker_id: 1, started_at: 1 }, id);
+        let mut job = make_job(JobState::Running { worker_id: id, started_at: 1 }, id);
         let event = JobEvent::Success { completed_at: 1, result: 1 };
         let result = transition(&mut job, event);
         assert_eq!(result, Ok(()));
@@ -177,7 +177,7 @@ use super::*;
     #[test]
     fn running_plus_fail_to_failed() {
         let id = uuid::Uuid::now_v7();
-        let mut job = make_job(JobState::Running { worker_id: 1, started_at: 1 }, id);
+        let mut job = make_job(JobState::Running { worker_id: id, started_at: 1 }, id);
         let event = JobEvent::Fail { error: 1 };
         let result = transition(&mut job, event);
         assert_eq!(result, Ok(()));
@@ -197,10 +197,10 @@ use super::*;
     fn retrying_plus_run_to_running() {
         let id = uuid::Uuid::now_v7();
         let mut job = make_job(JobState::Retrying { retry_after: std::time::Duration::from_millis(200) }, id);
-        let event = JobEvent::Run { worker_id: 1, started_at: 1 };
+        let event = JobEvent::Run { worker_id: id, started_at: 1 };
         let result = transition(&mut job, event);
         assert_eq!(result, Ok(()));
-        assert_eq!(job.state, JobState::Running { worker_id: 1, started_at: 1 });
+        assert_eq!(job.state, JobState::Running { worker_id: id, started_at: 1 });
     }
     #[test]
     fn retrying_plus_deadletter_to_deadlettered() {
@@ -215,10 +215,10 @@ use super::*;
     fn queued_plus_run_transitions_to_running() {
         let id = uuid::Uuid::now_v7();
         let mut job = make_job(JobState::Queued, id);
-        let event = JobEvent::Run { worker_id: 42, started_at: 100 };
+        let event = JobEvent::Run { worker_id: id, started_at: 100 };
         let result = transition(&mut job, event);
         assert_eq!(result, Ok(()));
-        assert_eq!(job.state, JobState::Running { worker_id: 42, started_at: 100 });
+        assert_eq!(job.state, JobState::Running { worker_id: id, started_at: 100 });
     }
 
     #[test]
@@ -235,19 +235,19 @@ use super::*;
     fn succeeded_plus_run_to_succeeded() {
         let id = uuid::Uuid::now_v7();
         let mut job = make_job(JobState::Succeeded { completed_at: 1, result: 2 }, id);
-        let event = JobEvent::Run { worker_id: 1, started_at: 3 };
+        let event = JobEvent::Run { worker_id: id, started_at: 3 };
         let result = transition(&mut job, event);
-        assert_eq!(result, Err(TransitionError::InvalidTransition { previous_state: JobState::Succeeded { completed_at: 1, result: 2 }, attempted_transition: JobEvent::Run { worker_id: 1, started_at: 3 }}));
+        assert_eq!(result, Err(TransitionError::InvalidTransition { previous_state: JobState::Succeeded { completed_at: 1, result: 2 }, attempted_transition: JobEvent::Run { worker_id: id, started_at: 3 }}));
         assert_eq!(job.state, JobState::Succeeded { completed_at: 1, result: 2 }); 
     }
     #[test]
     fn running_plus_retry_to_running() {
         let id = uuid::Uuid::now_v7();
-        let mut job = make_job(JobState::Running { worker_id: 1, started_at: 300 }, id);
+        let mut job = make_job(JobState::Running { worker_id: id, started_at: 300 }, id);
         let event = JobEvent::Retry { retry_after: std::time::Duration::from_millis(200) };
         let result = transition(&mut job, event);
-        assert_eq!(result, Err(TransitionError::InvalidTransition { previous_state: JobState::Running { worker_id: 1, started_at: 300 }, attempted_transition: JobEvent::Retry { retry_after: std::time::Duration::from_millis(200)}}));
-        assert_eq!(job.state, JobState::Running { worker_id: 1, started_at: 300 }); 
+        assert_eq!(result, Err(TransitionError::InvalidTransition { previous_state: JobState::Running { worker_id: id, started_at: 300 }, attempted_transition: JobEvent::Retry { retry_after: std::time::Duration::from_millis(200)}}));
+        assert_eq!(job.state, JobState::Running { worker_id: id, started_at: 300 }); 
     }
 
     #[test]
@@ -270,7 +270,7 @@ use super::*;
     #[test]
     fn running_plus_abandon_to_abandoned() {
         let id = uuid::Uuid::now_v7();
-        let mut job = make_job(JobState::Running { worker_id: 1, started_at: 1 }, id);
+        let mut job = make_job(JobState::Running { worker_id: id, started_at: 1 }, id);
         let before = now_millis();
         let result = transition(&mut job, JobEvent::Abandon { reason: "test".to_string() });
         let after = now_millis();
@@ -541,7 +541,7 @@ use super::*;
             retry_count: 0,
             created_at: 0,
             infra_interruptions: MAX_INFRA_INTERRUPTIONS,
-            state: JobState::Running { worker_id: 1, started_at: 1 },
+            state: JobState::Running { worker_id: uuid::Uuid::now_v7(), started_at: 1 },
             retry_policy: RetryPolicy::FixedDelay { delay_ms: 300, max_attempts: 3 },
             requirements: std::collections::HashMap::new(),
             metadata: std::collections::HashMap::new(),
