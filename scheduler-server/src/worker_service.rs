@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 
-use oncelock::OnceLock;
 use scheduler_core::{job_data_structures::{Job, JobState, now_millis}, proto::worker_service_server::WorkerService, worker::WorkerId};
 
 use tonic::{Request, Response, Status};
@@ -19,13 +18,7 @@ impl MyWorkerService {
     
 }
 
-pub fn cached_hostname() -> &'static str {
-    static HOSTNAME: OnceLock<String> = OnceLock::new();
 
-    HOSTNAME.get_or_init(|| {
-        gethostname::gethostname().to_string_lossy().into_owned()
-    })
-}
 
 #[tonic::async_trait]
 impl WorkerService for MyWorkerService {
@@ -46,13 +39,16 @@ impl WorkerService for MyWorkerService {
         actually, this is impossible since this always changes per machine and for each machine, the capabilities can change
          */
 
-        
-
+    
         
         let new_worker_id: WorkerId = uuid::Uuid::now_v7(); //for now a placeholder until i figure out how to generate unique 64 bit ids
 
         let registered_worker = request.into_inner();
 
+        if registered_worker.max_concurrent_jobs == 0 {
+            return Err(Status::invalid_argument("worker's max_concurrent_jobs field was set to 0, unusable worker registration rejected"))
+        }
+    
         let new_worker = WorkerInfo {
             id: new_worker_id,
             hostname: registered_worker.hostname,
@@ -91,9 +87,11 @@ impl WorkerService for MyWorkerService {
         };
 
         let mut worker_capabilities: HashMap<String, String> = HashMap::new();
+        let mut worker_job_types: Vec<String>;
 
         if let Some(mut worker) = self.scheduler_state.workers.get_mut(&job_requesting_worker_id) {
             worker_capabilities = worker.capabilities.clone();
+            worker_job_types = worker.job_types_supported.clone();
 
             if worker.max_concurrent_jobs <= worker.assigned_jobs.len() as u32 { //check to see if the job pool is full
                 return Err(Status::resource_exhausted(format!("no space in worker id: {} job pool for more jobs", job_requesting_worker_id)))
@@ -102,7 +100,7 @@ impl WorkerService for MyWorkerService {
                 if let Ok(mut job_queue_guard) = self.scheduler_state.job_queue.lock() {
 
                 let mut extractor = job_queue_guard.extract_if(.., |job| {
-                    worker.job_types_supported.contains(&job.job_type) &&
+                    worker_job_types.contains(&job.job_type) &&
                     job.requirements.iter().all(|(requirements_key, requirements_value)| worker_capabilities.get(requirements_key) == Some(requirements_value))
                 }); //iterates over requirements to check that the requirements hashmap is a subset of capabilities hashmap
                 //if it matches, then the QueuedJob is unlinked from the btreeset
