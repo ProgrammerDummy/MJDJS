@@ -42,8 +42,8 @@ impl MySchedulerService {
             if let Ok(retry_queue_guard) = self.scheduler_state.retry_queue.lock() {
                 if let Some(timeout_until) = retry_queue_guard
                     .iter()
-                    .find(| (_, id) | **id == requested_id)
-                    .map(| (&timeout_until, _) | timeout_until) { //O(n) time, could speed up with BiBiTreeMap?
+                    .find(| (_, id) | *id == requested_id)
+                    .map(| (timeout_until, _) | timeout_until) { //O(n) time, could speed up with BiBiTreeMap?
                     
                     return Ok(JobState::Retrying { retry_after: timeout_until.saturating_duration_since(std::time::Instant::now()) })
                 }
