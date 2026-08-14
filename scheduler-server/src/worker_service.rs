@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use scheduler_core::{job_data_structures::{Job, JobState, now_millis}, proto::worker_service_server::WorkerService, worker::WorkerId};
+use scheduler_core::{job_data_structures::{Job, JobState, now_millis}, proto::{HeartbeatControl, worker_service_server::WorkerService}, worker::WorkerId};
 
 use tonic::{Request, Response, Status};
 use scheduler_core::proto;
@@ -8,6 +8,8 @@ use futures::stream::BoxStream;
 use uuid::Uuid;
 
 use crate::{scheduler_state::{RunningJob, RunningPhase, SchedulerState}, worker::{WorkerInfo, WorkerState}};
+
+const NEXT_HEARTBEAT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
 
 pub struct MyWorkerService {
     scheduler_state: SchedulerState, //copy SchedulerState over from MySchedulerService during initialization
@@ -49,19 +51,29 @@ impl WorkerService for MyWorkerService {
             return Err(Status::invalid_argument("worker's max_concurrent_jobs field was set to 0, unusable worker registration rejected"))
         }
     
+        let now = std::time::Instant::now();
+
+        
+        if let Ok(mut guard) = self.scheduler_state.worker_heartbeat_timer.lock() {
+            guard.insert((now+NEXT_HEARTBEAT_DEADLINE, new_worker_id));
+        } else {
+            return Err(Status::internal("worker_heartbeat_timer mutex lock poisoned"));
+        }
+
         let new_worker = WorkerInfo {
             id: new_worker_id,
             hostname: registered_worker.hostname,
             job_types_supported: registered_worker.job_types_supported,
             max_concurrent_jobs: registered_worker.max_concurrent_jobs,
             assigned_jobs: HashSet::new(),
-            last_heartbeat_at: std::time::Instant::now(),
+            last_heartbeat_at: now,
             capabilities: registered_worker.capabilities,
             tags: registered_worker.tags,
             state: WorkerState::Active,
         };
          
         self.scheduler_state.workers.insert(new_worker_id, new_worker);
+
 
         return Ok(Response::new(proto::AssignedWorkerId { worker_id: new_worker_id.as_bytes().to_vec() }));
 
@@ -202,7 +214,96 @@ impl WorkerService for MyWorkerService {
     type HeartbeatStream = BoxStream<'static, Result<proto::HeartbeatControl, Status>>;
 
     async fn heartbeat(&self, request: Request<tonic::Streaming<proto::HeartbeatPing>>) -> Result<Response<Self::HeartbeatStream>, Status> {
-        Err(Status::unimplemented("heartbeat not yet implemented"))
+        
+        let mut incoming_heartbeat_ping_stream = request.into_inner();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+
+        let workers = self.scheduler_state.workers.clone(); //arc clone
+        let heartbeat_timer_lock = self.scheduler_state.worker_heartbeat_timer.clone();
+
+        //one spawned task that continously loops in the background for heartbeats
+        //poll for the heartbeats, i can tell what is happening on the channel based on the returned values
+        
+        //on main function thread, pass the receiver stream to the caller of the RPC 
+
+        tokio::spawn(async move {
+            loop {
+                match incoming_heartbeat_ping_stream.message().await {
+                    Ok(Some(ping)) => {
+                        //received a ping successfully, so update worker_heartbeat_timer and WorkerInfo.last_heartbeat_at
+                        //acquire worker_heartbeat_timer lock first
+
+                        let worker_uuid = match uuid::Uuid::from_slice(&ping.worker_id) {
+                            Ok(uuid) => uuid,
+                            Err(e) => {
+                                let _ = tx.send(Err(Status::internal(format!("invalid worker uuid: {e}")))).await;
+                                break;
+                            }
+                        };
+
+                        let now = std::time::Instant::now();
+                        
+                        if let Ok(mut guard) = heartbeat_timer_lock.lock() {
+                            let worker_timer = guard
+                                .iter()
+                                .find(|(_, uuid)| *uuid == worker_uuid)
+                                .map(|(instant, _)| *instant);
+
+                            if let Some(old_instant) = worker_timer {
+                                guard.remove(&(old_instant, worker_uuid));
+                            } //find and replace old Instant with new one at now + 15s
+
+                            guard.insert((now + NEXT_HEARTBEAT_DEADLINE, worker_uuid));
+
+                        } else {
+                            let _ = tx.send(Err(Status::internal("worker_heartbeat_timer mutex was poisoned"))).await;
+                            break;
+                        }
+                        
+                        //now modify the workers to update last_heartbeat_at
+                        if let Some(mut workers_mutref) = workers.get_mut(&worker_uuid) {
+                            workers_mutref.last_heartbeat_at = now;
+                        } else {
+                            let _ = tx.send(Err(Status::internal("invalid worker uuid present in workers"))).await;
+                            break;
+                        }
+
+                        
+
+
+                        let ack = HeartbeatControl {
+                            directive: Some(proto::heartbeat_control::Directive::Ack(proto::Ack {}))
+                        }; //construct ack 
+
+                        if tx.send(Ok(ack)).await.is_err() {
+                            //if the client/worker's receiving end is gone
+                            break;
+                        }
+
+                    },
+
+                    Ok(None) => {
+                        //stream closed by worker
+                        break;
+                    },
+
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        break;
+                    }
+                    
+
+                }
+            }
+        });
+
+        let output_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+
+        return Ok(Response::new(Box::pin(output_stream)));
+        
+        //return back stream with HeartbeatStream trait to caller
+
     }
     
 
