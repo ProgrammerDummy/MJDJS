@@ -110,14 +110,20 @@ pub struct SchedulerState {
     pub running_jobs: Arc<DashMap<uuid::Uuid, RunningJob>>, //dashmap for sharding since this will have many concurrent callers, avoids contention
     pub completed_jobs: Arc<DashMap<uuid::Uuid, CompletedJob>>, //same as running_jobs
     pub workers: Arc<DashMap<WorkerId, WorkerInfo>>, //same as above
-    pub retry_queue: Arc<Mutex<BTreeMap<Instant, uuid::Uuid>>>, //BTreeMap for allowing cancellation and keyed removal of individual elements
-    pub worker_heartbeat_timer: Arc<Mutex<BTreeMap<Instant, uuid::Uuid>>>,
+    pub retry_queue: Arc<Mutex<BTreeSet<(Instant, uuid::Uuid)>>>, //BTreeSet for allowing cancellation and keyed removal of individual elements
+    pub worker_heartbeat_timer: Arc<Mutex<BTreeSet<(Instant, WorkerId)>>>,
     pub total_submitted: Arc<AtomicU64>, //atomic counter
     pub total_completed: Arc<AtomicU64>,
     pub total_failed: Arc<AtomicU64>,
     pub total_dead_lettered: Arc<AtomicU64>,
 
     //chose to wrap each field with Arc and mutex/dashmap so that only necessary components can clone the arc handle rather than having access to entire struct
+
+    //the fields that use btreesets could be changed to bibtreemaps to accomplish the goal of preventing collisions AND 
+    //reducign time to O(logn), maybe in the future i can do this
+
+    //actually for only a few hundred workers the O(n) time shouldnt be too performance heavy, only a couple milliseconds 
+    //for a linear scan, its probably likely that if worker count gets real fatty then performance costs incur at heavier scales
 }
 
 impl SchedulerState {
@@ -128,8 +134,8 @@ impl SchedulerState {
             running_jobs: Arc::new(DashMap::new()), 
             completed_jobs: Arc::new(DashMap::new()), 
             workers: Arc::new(DashMap::new()), 
-            retry_queue: Arc::new(Mutex::new(BTreeMap::new())), 
-            worker_heartbeat_timer: Arc::new(Mutex::new(BTreeMap::new())),
+            retry_queue: Arc::new(Mutex::new(BTreeSet::new())), 
+            worker_heartbeat_timer: Arc::new(Mutex::new(BTreeSet::new())),
             total_submitted: Arc::new(0.into()), 
             total_completed: Arc::new(0.into()),
             total_failed: Arc::new(0.into()),
