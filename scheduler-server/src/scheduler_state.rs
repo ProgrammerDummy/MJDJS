@@ -111,6 +111,7 @@ pub struct SchedulerState {
     pub completed_jobs: Arc<DashMap<uuid::Uuid, CompletedJob>>, //same as running_jobs
     pub workers: Arc<DashMap<WorkerId, WorkerInfo>>, //same as above
     pub retry_queue: Arc<Mutex<BTreeMap<Instant, uuid::Uuid>>>, //BTreeMap for allowing cancellation and keyed removal of individual elements
+    pub worker_heartbeat_timer: Arc<Mutex<BTreeMap<Instant, uuid::Uuid>>>,
     pub total_submitted: Arc<AtomicU64>, //atomic counter
     pub total_completed: Arc<AtomicU64>,
     pub total_failed: Arc<AtomicU64>,
@@ -128,6 +129,7 @@ impl SchedulerState {
             completed_jobs: Arc::new(DashMap::new()), 
             workers: Arc::new(DashMap::new()), 
             retry_queue: Arc::new(Mutex::new(BTreeMap::new())), 
+            worker_heartbeat_timer: Arc::new(Mutex::new(BTreeMap::new())),
             total_submitted: Arc::new(0.into()), 
             total_completed: Arc::new(0.into()),
             total_failed: Arc::new(0.into()),
