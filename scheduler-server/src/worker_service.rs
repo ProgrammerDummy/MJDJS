@@ -260,7 +260,7 @@ impl WorkerService for MyWorkerService {
                                     match temp_job.state {
                                         JobState::Retrying { retry_after } => {
 
-                                            running_job.retry_count += 1;
+                                            running_job.retry_count = temp_job.retry_count;
                                             running_job.running_phase = RunningPhase::Retrying;
                                             
                                             if let Ok(mut retry_queue_guard) = self.scheduler_state.retry_queue.lock() {
@@ -321,11 +321,6 @@ impl WorkerService for MyWorkerService {
                             proto::job_outcome::Outcome::Cancelled(proto::job_outcome::Cancelled {}) => {
                                 
                                 //same flow as Outcome::Success variant
-
-
-                                if !self.scheduler_state.running_jobs.contains_key(&job_uuid) {
-                                    return Err(Status::internal("job uuid did not exist within running_jobs"));
-                                }
 
                                 if let Some(running_job) = self.scheduler_state.running_jobs.get(&job_uuid) {
                                     //check to see if sender is actually correct worker
