@@ -1,7 +1,7 @@
 use core::time;
 use std::{collections::{HashMap, HashSet}, sync::atomic::Ordering::SeqCst};
 
-use scheduler_core::{job_data_structures::{Job, JobState, now_millis}, proto::{HeartbeatControl, worker_service_server::WorkerService}, worker::WorkerId};
+use scheduler_core::{job_data_structures::{Job, JobState, now_millis}, proto::{HeartbeatControl, worker_service_server::WorkerService}, state_machine::{JobEvent, determine_next_event, transition}, worker::WorkerId};
 
 use tonic::{Request, Response, Status};
 use scheduler_core::proto;
@@ -108,15 +108,10 @@ impl WorkerService for MyWorkerService {
                             //regardless of outcome, transition the RunningJob into a CompletedJob
                             //pop out the RunningJob and create a new CompletedJob
                             //also pop out of worker's job pool
+
                             proto::job_outcome::Outcome::Success(proto::job_outcome::Success { result }) => {
-
-                                if !self.scheduler_state.running_jobs.contains_key(&job_uuid) {
-                                    return Err(Status::internal("job uuid did not exist within running_jobs"));
-                                }
-
                                 
-                                if let Some((running_job_uuid, running_job)) = self.scheduler_state.running_jobs.remove(&job_uuid) {
-
+                                if let Some(running_job) = self.scheduler_state.running_jobs.get(&job_uuid) {
                                     //check to see if sender is actually correct worker
                                     //and check to see if job is in executing phase or retrying phase
                                     match running_job.running_phase {
@@ -130,6 +125,15 @@ impl WorkerService for MyWorkerService {
                                             return Err(Status::internal("JobResult is stale/inaccurate, worker should not have access to Job currently in retry_queue"));
                                         }
                                     }
+                                } else {
+                                    //doesnt erxist within running_job
+                                    return Err(Status::internal("job uuid did not exist within running_jobs"));
+                                }
+
+                                //now checks have passed for staleness of messages and existence within running_jobs, safe to remove
+                                
+                                if let Some((running_job_uuid, running_job)) = self.scheduler_state.running_jobs.remove(&job_uuid) {
+
                                     //pop out of worker job pool
 
                                     if let Some(mut worker) = self.scheduler_state.workers.get_mut(&worker_uuid) {
@@ -223,66 +227,83 @@ impl WorkerService for MyWorkerService {
                                         return Err(Status::not_found(format!("worker with id: {} was not found in worker pool", worker_uuid)));
                                     }
 
+                                    //for the failure case, create a temporary job instance then use transition() to apply an increment
+                                    //then use determine_next_event on the new retry_count, re-enter into the transition method again and match from there?
 
-                                    if let Some(timeout) = running_job.retry_policy.next_delay(running_job.retry_count) {
-                                        //increment retry_count
-                                        running_job.retry_count += 1;
-                                        running_job.running_phase = RunningPhase::Retrying;
-                                        
-                                        if let Ok(mut retry_queue_guard) = self.scheduler_state.retry_queue.lock() {
-                                            retry_queue_guard.insert((std::time::Instant::now()+timeout, job_uuid));
-                                            //insert job into retry_queue with calculated timeout with jitter
+                                    let mut temp_job = Job {
+                                        id: running_job.id,
+                                        job_type: running_job.job_type.clone(),
+                                        payload: running_job.payload,
+                                        priority: running_job.priority,
+                                        retry_count: running_job.retry_count,
+                                        infra_interruptions: running_job.infra_interruptions,
+                                        created_at: running_job.created_at,
+                                        state: JobState::Failed { error },
+                                        retry_policy: running_job.retry_policy.clone(),
+                                        requirements: running_job.requirements.clone(),
+                                        metadata: running_job.metadata.clone(),
+                                    };
 
-                                            //increment total_failed
+                                    let _ = transition(&mut temp_job, JobEvent::Fail { error }); //increment retry_count by 1
 
-                                            self.scheduler_state.total_failed.fetch_add(1, SeqCst);
-                                        } else {
-                                            return Err(Status::internal("retry_queue mutex lock was poisoned"));
+                                    let next = determine_next_event(&temp_job);
+
+                                    let _ = transition(&mut temp_job, next);
+
+                                    match temp_job.state {
+                                        JobState::Retrying { retry_after } => {
+                                            if let Some(timeout) = running_job.retry_policy.next_delay(running_job.retry_count) {
+                                                //increment retry_count
+                                                running_job.retry_count += 1;
+                                                running_job.running_phase = RunningPhase::Retrying;
+                                                
+                                                if let Ok(mut retry_queue_guard) = self.scheduler_state.retry_queue.lock() {
+                                                    retry_queue_guard.insert((std::time::Instant::now()+timeout, job_uuid));
+                                                    //insert job into retry_queue with calculated timeout with jitter
+
+                                                    //increment total_failed
+
+                                                    self.scheduler_state.total_failed.fetch_add(1, SeqCst);
+                                                } else {
+                                                    return Err(Status::internal("retry_queue mutex lock was poisoned"));
+                                                }
+
+
+                                            }
+                                        },
+
+                                        JobState::DeadLettered { reason } => {
+
+                                            if let Some((_, job_to_be_deadlettered)) = self.scheduler_state.running_jobs.remove(&job_uuid) {
+                                                let deadlettered_job = CompletedJob {
+                                                    id: job_to_be_deadlettered.id,
+                                                    job_type: job_to_be_deadlettered.job_type,
+                                                    payload: job_to_be_deadlettered.payload,
+                                                    priority: job_to_be_deadlettered.priority,
+                                                    created_at: job_to_be_deadlettered.created_at,
+                                                    retry_policy: job_to_be_deadlettered.retry_policy,
+                                                    requirements: job_to_be_deadlettered.requirements,
+                                                    retry_count: job_to_be_deadlettered.retry_count,
+                                                    infra_interruptions: job_to_be_deadlettered.infra_interruptions,
+                                                    completed_at: now_millis(),
+                                                    outcome: CompletedJobOutcome::DeadLettered { reason: "available retries exhausted".to_string() },
+                                                    metadata: job_to_be_deadlettered.metadata,
+                                                };
+
+                                                //store in completed_jobs with deadlettered status
+
+                                                self.scheduler_state.completed_jobs.insert(job_to_be_deadlettered.id, deadlettered_job);
+                                                
+                                                //increment atomic
+                                                self.scheduler_state.total_dead_lettered.fetch_add(1, SeqCst);
+                                            }
+                                        },
+
+                                        _ => {
+                                            return Err(Status::internal("a job transition other than retrying or deadlettered should not be possible"));
+
                                         }
-
-
-                                    } else {
-
-                                        
-                                        //no more retries allowed, send to DLQ
-                                        //this time pop the job out of running_jobs as well
-
-
-                                        //how to do this since i am holding the write lock already?
-
-                                        drop(running_job);
-
-                                        //release wlock on running_jobs dashmap
-
-
-                                        if let Some((_, job_to_be_deadlettered)) = self.scheduler_state.running_jobs.remove(&job_uuid) {
-                                            let deadlettered_job = CompletedJob {
-                                                id: job_to_be_deadlettered.id,
-                                                job_type: job_to_be_deadlettered.job_type,
-                                                payload: job_to_be_deadlettered.payload,
-                                                priority: job_to_be_deadlettered.priority,
-                                                created_at: job_to_be_deadlettered.created_at,
-                                                retry_policy: job_to_be_deadlettered.retry_policy,
-                                                requirements: job_to_be_deadlettered.requirements,
-                                                retry_count: job_to_be_deadlettered.retry_count,
-                                                infra_interruptions: job_to_be_deadlettered.infra_interruptions,
-                                                completed_at: now_millis(),
-                                                outcome: CompletedJobOutcome::DeadLettered { reason: "available retries exhausted".to_string() },
-                                                metadata: job_to_be_deadlettered.metadata,
-                                            };
-
-                                            //store in completed_jobs with deadlettered status
-
-                                            self.scheduler_state.completed_jobs.insert(job_to_be_deadlettered.id, deadlettered_job);
-                                            
-                                            //increment atomic
-                                            self.scheduler_state.total_dead_lettered.fetch_add(1, SeqCst);
-                                        }
-                                    
-                                        
                                     }
-
-
 
                                     return Ok(Response::new(()));
 
@@ -309,10 +330,7 @@ impl WorkerService for MyWorkerService {
                                     return Err(Status::internal("job uuid did not exist within running_jobs"));
                                 }
 
-                                
-                                if let Some((running_job_uuid, running_job)) = self.scheduler_state.running_jobs.remove(&job_uuid) {
-
-
+                                if let Some(running_job) = self.scheduler_state.running_jobs.get(&job_uuid) {
                                     //check to see if sender is actually correct worker
                                     //and check to see if job is in executing phase or retrying phase
                                     match running_job.running_phase {
@@ -326,6 +344,13 @@ impl WorkerService for MyWorkerService {
                                             return Err(Status::internal("JobResult is stale/inaccurate, worker should not have access to Job currently in retry_queue"));
                                         }
                                     }
+                                } else {
+                                    //doesnt erxist within running_job
+                                    return Err(Status::internal("job uuid did not exist within running_jobs"));
+                                }
+
+                                
+                                if let Some((running_job_uuid, running_job)) = self.scheduler_state.running_jobs.remove(&job_uuid) {
 
                                     //pop out of worker job pool
 
