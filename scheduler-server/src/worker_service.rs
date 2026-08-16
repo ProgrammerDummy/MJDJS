@@ -117,17 +117,17 @@ impl WorkerService for MyWorkerService {
                                     match running_job.running_phase {
                                         RunningPhase::Executing { worker_id, started_at } => {
                                             if worker_id != worker_uuid {
-                                                return Err(Status::internal("message is stale or inaccurate, worker id does not match sender"));
+                                                return Err(Status::invalid_argument("message is stale or inaccurate, worker id does not match sender"));
                                             }
                                         },
 
                                         RunningPhase::Retrying => {
-                                            return Err(Status::internal("JobResult is stale/inaccurate, worker should not have access to Job currently in retry_queue"));
+                                            return Err(Status::invalid_argument("JobResult is stale/inaccurate, worker should not have access to Job currently in retry_queue"));
                                         }
                                     }
                                 } else {
                                     //doesnt erxist within running_job
-                                    return Err(Status::internal("job uuid did not exist within running_jobs"));
+                                    return Err(Status::not_found("job uuid did not exist within running_jobs"));
                                 }
 
                                 //now checks have passed for staleness of messages and existence within running_jobs, safe to remove
@@ -187,10 +187,17 @@ impl WorkerService for MyWorkerService {
 
                                 //so i just need to account for the actual job failure here since infrastruture failures wont be reported at all
 
-                                if !self.scheduler_state.running_jobs.contains_key(&job_uuid) {
-                                    return Err(Status::internal("job uuid did not exist within running_jobs"));
-                                }
 
+
+                                //before incrementations, compare against RetryPolicy using next_delay
+                                //if next_delay returns None, then deadletter it, if not then retry it
+
+                                
+                                //timeout calculation using next_delay
+
+                                //insert into retry_queue
+
+                                //change the running_phase to retrying
                                 
                                 if let Some(mut running_job) = self.scheduler_state.running_jobs.get_mut(&job_uuid) {
 
@@ -199,12 +206,12 @@ impl WorkerService for MyWorkerService {
                                     match running_job.running_phase {
                                         RunningPhase::Executing { worker_id, started_at } => {
                                             if worker_id != worker_uuid {
-                                                return Err(Status::internal("message is stale or inaccurate, worker id does not match sender"));
+                                                return Err(Status::invalid_argument("message is stale or inaccurate, worker id does not match sender"));
                                             }
                                         },
 
                                         RunningPhase::Retrying => {
-                                            return Err(Status::internal("JobResult is stale/inaccurate, worker should not have access to Job currently in retry_queue"));
+                                            return Err(Status::invalid_argument("JobResult is stale/inaccurate, worker should not have access to Job currently in retry_queue"));
                                         }
                                     }
 
@@ -252,27 +259,25 @@ impl WorkerService for MyWorkerService {
 
                                     match temp_job.state {
                                         JobState::Retrying { retry_after } => {
-                                            if let Some(timeout) = running_job.retry_policy.next_delay(running_job.retry_count) {
-                                                //increment retry_count
-                                                running_job.retry_count += 1;
-                                                running_job.running_phase = RunningPhase::Retrying;
-                                                
-                                                if let Ok(mut retry_queue_guard) = self.scheduler_state.retry_queue.lock() {
-                                                    retry_queue_guard.insert((std::time::Instant::now()+timeout, job_uuid));
-                                                    //insert job into retry_queue with calculated timeout with jitter
 
-                                                    //increment total_failed
+                                            running_job.retry_count += 1;
+                                            running_job.running_phase = RunningPhase::Retrying;
+                                            
+                                            if let Ok(mut retry_queue_guard) = self.scheduler_state.retry_queue.lock() {
+                                                retry_queue_guard.insert((std::time::Instant::now()+retry_after, job_uuid));
+                                                //insert job into retry_queue with calculated timeout with jitter
 
-                                                    self.scheduler_state.total_failed.fetch_add(1, SeqCst);
-                                                } else {
-                                                    return Err(Status::internal("retry_queue mutex lock was poisoned"));
-                                                }
+                                                //increment total_failed
 
-
+                                                self.scheduler_state.total_failed.fetch_add(1, SeqCst);
+                                            } else {
+                                                return Err(Status::internal("retry_queue mutex lock was poisoned"));
                                             }
+
                                         },
 
                                         JobState::DeadLettered { reason } => {
+                                            drop(running_job); //deadlock prevention
 
                                             if let Some((_, job_to_be_deadlettered)) = self.scheduler_state.running_jobs.remove(&job_uuid) {
                                                 let deadlettered_job = CompletedJob {
@@ -286,7 +291,7 @@ impl WorkerService for MyWorkerService {
                                                     retry_count: job_to_be_deadlettered.retry_count,
                                                     infra_interruptions: job_to_be_deadlettered.infra_interruptions,
                                                     completed_at: now_millis(),
-                                                    outcome: CompletedJobOutcome::DeadLettered { reason: "available retries exhausted".to_string() },
+                                                    outcome: CompletedJobOutcome::DeadLettered { reason },
                                                     metadata: job_to_be_deadlettered.metadata,
                                                 };
 
@@ -307,18 +312,10 @@ impl WorkerService for MyWorkerService {
 
                                     return Ok(Response::new(()));
 
+                                } else {
+                                    return Err(Status::not_found("job uuid did not exist within running_jobs"));
                                 }
 
-
-                                //before incrementations, compare against RetryPolicy using next_delay
-                                //if next_delay returns None, then deadletter it, if not then retry it
-
-                                
-                                //timeout calculation using next_delay
-
-                                //insert into retry_queue
-
-                                //change the running_phase to retrying
                             },
 
                             proto::job_outcome::Outcome::Cancelled(proto::job_outcome::Cancelled {}) => {
