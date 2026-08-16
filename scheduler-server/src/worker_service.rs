@@ -242,13 +242,43 @@ impl WorkerService for MyWorkerService {
 
 
                                     } else {
+
+                                        
                                         //no more retries allowed, send to DLQ
                                         //this time pop the job out of running_jobs as well
 
 
                                         //how to do this since i am holding the write lock already?
 
-                                        self.scheduler_state.total_dead_lettered.fetch_add(1, SeqCst);
+                                        drop(running_job);
+
+                                        //release wlock on running_jobs dashmap
+
+
+                                        if let Some((_, job_to_be_deadlettered)) = self.scheduler_state.running_jobs.remove(&job_uuid) {
+                                            let deadlettered_job = CompletedJob {
+                                                id: job_to_be_deadlettered.id,
+                                                job_type: job_to_be_deadlettered.job_type,
+                                                payload: job_to_be_deadlettered.payload,
+                                                priority: job_to_be_deadlettered.priority,
+                                                created_at: job_to_be_deadlettered.created_at,
+                                                retry_policy: job_to_be_deadlettered.retry_policy,
+                                                requirements: job_to_be_deadlettered.requirements,
+                                                retry_count: job_to_be_deadlettered.retry_count,
+                                                infra_interruptions: job_to_be_deadlettered.infra_interruptions,
+                                                completed_at: now_millis(),
+                                                outcome: CompletedJobOutcome::DeadLettered { reason: "available retries exhausted".to_string() },
+                                                metadata: job_to_be_deadlettered.metadata,
+                                            };
+
+                                            //store in completed_jobs with deadlettered status
+
+                                            self.scheduler_state.completed_jobs.insert(job_to_be_deadlettered.id, deadlettered_job);
+                                            
+                                            //increment atomic
+                                            self.scheduler_state.total_dead_lettered.fetch_add(1, SeqCst);
+                                        }
+                                    
                                         
                                     }
 
@@ -257,35 +287,6 @@ impl WorkerService for MyWorkerService {
                                     return Ok(Response::new(()));
 
                                 }
-
-
-
-                                //at this point, since the checks have been done for existence of the RunningJob, i can deadletter 
-                                
-                                if let Some((running_job_uuid, job_to_be_deadlettered)) = self.scheduler_state.running_jobs.remove(&job_uuid) {
-
-                                    let deadlettered_job = CompletedJob {
-                                        id: running_job_uuid,
-                                        job_type: job_to_be_deadlettered.job_type,
-                                        payload: job_to_be_deadlettered.payload,
-                                        priority: job_to_be_deadlettered.priority,
-                                        created_at: job_to_be_deadlettered.created_at,
-                                        retry_policy: job_to_be_deadlettered.retry_policy,
-                                        requirements: job_to_be_deadlettered.requirements,
-                                        retry_count: job_to_be_deadlettered.retry_count,
-                                        infra_interruptions: job_to_be_deadlettered.infra_interruptions,
-                                        completed_at: now_millis(),
-                                        outcome: CompletedJobOutcome::DeadLettered { reason: "available retries exhausted".to_string() },
-                                        metadata: job_to_be_deadlettered.metadata,
-                                    };
-
-                                    self.scheduler_state.completed_jobs.insert(job_to_be_deadlettered.id, deadlettered_job);
-
-                                    self.scheduler_state.total_dead_lettered.fetch_add(1, SeqCst);
-                                
-                                    return Ok(Response::new(()));
-                                }
-
 
 
                                 //before incrementations, compare against RetryPolicy using next_delay
