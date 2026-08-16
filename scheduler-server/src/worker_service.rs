@@ -1,4 +1,5 @@
-use std::collections::{HashMap, HashSet};
+use core::time;
+use std::{collections::{HashMap, HashSet}, sync::atomic::Ordering::SeqCst};
 
 use scheduler_core::{job_data_structures::{Job, JobState, now_millis}, proto::{HeartbeatControl, worker_service_server::WorkerService}, worker::WorkerId};
 
@@ -7,7 +8,7 @@ use scheduler_core::proto;
 use futures::stream::BoxStream;
 use uuid::Uuid;
 
-use crate::{scheduler_state::{RunningJob, RunningPhase, SchedulerState}, worker::{WorkerInfo, WorkerState}};
+use crate::{scheduler_state::{CompletedJob, CompletedJobOutcome, RunningJob, RunningPhase, SchedulerState}, worker::{WorkerInfo, WorkerState}};
 
 const NEXT_HEARTBEAT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
 
@@ -80,6 +81,325 @@ impl WorkerService for MyWorkerService {
     }
 
     async fn report_result(&self, request: Request<proto::JobResult>) -> Result<Response<()>, Status> {
+
+        //receive a proto::JobResult, we get job_id, worker_id, and job_outcome
+
+        let result = request.into_inner();
+
+        let job_uuid = match uuid::Uuid::from_slice(&result.job_id) {
+            Ok(uuid) => uuid,
+            Err(e) => {
+                return Err(Status::invalid_argument("invalid job uuid was entered when attempting to report_result"));
+            }
+        };
+
+        let worker_uuid = match uuid::Uuid::from_slice(&result.worker_id) {
+            Ok(uuid) => uuid,
+            Err(e) => {
+                return Err(Status::invalid_argument("invalid worker uuid was entered when attempting to report_result"));
+            }
+        };
+
+        match result.job_outcome {
+            Some(job_outcome) => {
+                match job_outcome.outcome {
+                    Some(outcome) => { //unlayering the proto layers
+                        match outcome {
+                            //regardless of outcome, transition the RunningJob into a CompletedJob
+                            //pop out the RunningJob and create a new CompletedJob
+                            //also pop out of worker's job pool
+                            proto::job_outcome::Outcome::Success(proto::job_outcome::Success { result }) => {
+
+                                if !self.scheduler_state.running_jobs.contains_key(&job_uuid) {
+                                    return Err(Status::internal("job uuid did not exist within running_jobs"));
+                                }
+
+                                
+                                if let Some((running_job_uuid, running_job)) = self.scheduler_state.running_jobs.remove(&job_uuid) {
+
+                                    //check to see if sender is actually correct worker
+                                    //and check to see if job is in executing phase or retrying phase
+                                    match running_job.running_phase {
+                                        RunningPhase::Executing { worker_id, started_at } => {
+                                            if worker_id != worker_uuid {
+                                                return Err(Status::internal("message is stale or inaccurate, worker id does not match sender"));
+                                            }
+                                        },
+
+                                        RunningPhase::Retrying => {
+                                            return Err(Status::internal("JobResult is stale/inaccurate, worker should not have access to Job currently in retry_queue"));
+                                        }
+                                    }
+                                    //pop out of worker job pool
+
+                                    if let Some(mut worker) = self.scheduler_state.workers.get_mut(&worker_uuid) {
+
+                                        if !worker.assigned_jobs.contains(&running_job_uuid) {
+                                            tracing::warn!(
+                                                job_id = %running_job_uuid,
+                                                worker_id = %worker_uuid,
+                                                "job present in running_jobs but missing from worker's assigned_jobs"
+                                            );
+                                            return Err(Status::not_found("job was not found within WorkerInfo.assigned_jobs"))
+                                        }
+                                        worker.assigned_jobs.remove(&running_job_uuid);
+                                           
+
+                                    } else {
+                                        return Err(Status::not_found(format!("worker with id: {} was not found in worker pool", worker_uuid)));
+                                    }
+
+
+                                    let completed_job = CompletedJob {
+                                        id: running_job_uuid,
+                                        job_type: running_job.job_type,
+                                        payload: running_job.payload,
+                                        priority: running_job.priority,
+                                        created_at: running_job.created_at,
+                                        retry_policy: running_job.retry_policy,
+                                        requirements: running_job.requirements,
+                                        retry_count: running_job.retry_count,
+                                        infra_interruptions: running_job.infra_interruptions,
+                                        completed_at: now_millis(),
+                                        outcome: CompletedJobOutcome::Succeeded { result },
+                                        metadata: running_job.metadata,
+                                    };
+
+                                    self.scheduler_state.completed_jobs.insert(running_job_uuid, completed_job);
+
+                                    self.scheduler_state.total_completed.fetch_add(1, SeqCst);
+
+                                    return Ok(Response::new(()));
+
+                                }
+                                
+                            },
+
+                            proto::job_outcome::Outcome::Failure(proto::job_outcome::Failure { error}) => {
+
+                                //how do i tell if it failed becasue of infrastructure or because of job itself?
+                                //if the infrastructure breaks, i can automatically detect it because of the loss in heartbeats
+                                //therefore all jobs within that worker will be flagged as an infrastructure interruption once their heartbeat leases expire
+
+                                //so i just need to account for the actual job failure here since infrastruture failures wont be reported at all
+
+                                if !self.scheduler_state.running_jobs.contains_key(&job_uuid) {
+                                    return Err(Status::internal("job uuid did not exist within running_jobs"));
+                                }
+
+                                
+                                if let Some(mut running_job) = self.scheduler_state.running_jobs.get_mut(&job_uuid) {
+
+                                    //check to see if sender is actually correct worker
+                                    //and check to see if job is in executing phase or retrying phase
+                                    match running_job.running_phase {
+                                        RunningPhase::Executing { worker_id, started_at } => {
+                                            if worker_id != worker_uuid {
+                                                return Err(Status::internal("message is stale or inaccurate, worker id does not match sender"));
+                                            }
+                                        },
+
+                                        RunningPhase::Retrying => {
+                                            return Err(Status::internal("JobResult is stale/inaccurate, worker should not have access to Job currently in retry_queue"));
+                                        }
+                                    }
+
+                                    //pop out of worker job pool
+
+                                    if let Some(mut worker) = self.scheduler_state.workers.get_mut(&worker_uuid) {
+
+                                        if !worker.assigned_jobs.contains(&job_uuid) {
+                                            tracing::warn!(
+                                                job_id = %&running_job.id,
+                                                worker_id = %worker_uuid,
+                                                "job present in running_jobs but missing from worker's assigned_jobs"
+                                            );
+                                            return Err(Status::not_found("job was not found within WorkerInfo.assigned_jobs"))
+                                        }
+                                        worker.assigned_jobs.remove(&job_uuid);
+                                           
+
+                                    } else {
+                                        return Err(Status::not_found(format!("worker with id: {} was not found in worker pool", worker_uuid)));
+                                    }
+
+
+                                    if let Some(timeout) = running_job.retry_policy.next_delay(running_job.retry_count) {
+                                        //increment retry_count
+                                        running_job.retry_count += 1;
+                                        running_job.running_phase = RunningPhase::Retrying;
+                                        
+                                        if let Ok(mut retry_queue_guard) = self.scheduler_state.retry_queue.lock() {
+                                            retry_queue_guard.insert((std::time::Instant::now()+timeout, job_uuid));
+                                            //insert job into retry_queue with calculated timeout with jitter
+
+                                            //increment total_failed
+
+                                            self.scheduler_state.total_failed.fetch_add(1, SeqCst);
+                                        } else {
+                                            return Err(Status::internal("retry_queue mutex lock was poisoned"));
+                                        }
+
+
+                                    } else {
+                                        //no more retries allowed, send to DLQ
+                                        //this time pop the job out of running_jobs as well
+
+
+                                        //how to do this since i am holding the write lock already?
+
+                                        self.scheduler_state.total_dead_lettered.fetch_add(1, SeqCst);
+                                        
+                                    }
+
+
+
+                                    return Ok(Response::new(()));
+
+                                }
+
+
+
+                                //at this point, since the checks have been done for existence of the RunningJob, i can deadletter 
+                                
+                                if let Some((running_job_uuid, job_to_be_deadlettered)) = self.scheduler_state.running_jobs.remove(&job_uuid) {
+
+                                    let deadlettered_job = CompletedJob {
+                                        id: running_job_uuid,
+                                        job_type: job_to_be_deadlettered.job_type,
+                                        payload: job_to_be_deadlettered.payload,
+                                        priority: job_to_be_deadlettered.priority,
+                                        created_at: job_to_be_deadlettered.created_at,
+                                        retry_policy: job_to_be_deadlettered.retry_policy,
+                                        requirements: job_to_be_deadlettered.requirements,
+                                        retry_count: job_to_be_deadlettered.retry_count,
+                                        infra_interruptions: job_to_be_deadlettered.infra_interruptions,
+                                        completed_at: now_millis(),
+                                        outcome: CompletedJobOutcome::DeadLettered { reason: "available retries exhausted".to_string() },
+                                        metadata: job_to_be_deadlettered.metadata,
+                                    };
+
+                                    self.scheduler_state.completed_jobs.insert(job_to_be_deadlettered.id, deadlettered_job);
+
+                                    self.scheduler_state.total_dead_lettered.fetch_add(1, SeqCst);
+                                
+                                    return Ok(Response::new(()));
+                                }
+
+
+
+                                //before incrementations, compare against RetryPolicy using next_delay
+                                //if next_delay returns None, then deadletter it, if not then retry it
+
+                                
+                                //timeout calculation using next_delay
+
+                                //insert into retry_queue
+
+                                //change the running_phase to retrying
+                            },
+
+                            proto::job_outcome::Outcome::Cancelled(proto::job_outcome::Cancelled {}) => {
+                                
+                                //same flow as Outcome::Success variant
+
+
+                                if !self.scheduler_state.running_jobs.contains_key(&job_uuid) {
+                                    return Err(Status::internal("job uuid did not exist within running_jobs"));
+                                }
+
+                                
+                                if let Some((running_job_uuid, running_job)) = self.scheduler_state.running_jobs.remove(&job_uuid) {
+
+
+                                    //check to see if sender is actually correct worker
+                                    //and check to see if job is in executing phase or retrying phase
+                                    match running_job.running_phase {
+                                        RunningPhase::Executing { worker_id, started_at } => {
+                                            if worker_id != worker_uuid {
+                                                return Err(Status::internal("message is stale or inaccurate, worker id does not match sender"));
+                                            }
+                                        },
+
+                                        RunningPhase::Retrying => {
+                                            return Err(Status::internal("JobResult is stale/inaccurate, worker should not have access to Job currently in retry_queue"));
+                                        }
+                                    }
+
+                                    //pop out of worker job pool
+
+                                    if let Some(mut worker) = self.scheduler_state.workers.get_mut(&worker_uuid) {
+
+                                        if !worker.assigned_jobs.contains(&running_job_uuid) {
+                                            tracing::warn!(
+                                                job_id = %running_job_uuid,
+                                                worker_id = %worker_uuid,
+                                                "job present in running_jobs but missing from worker's assigned_jobs"
+                                            );
+                                            return Err(Status::not_found("job was not found within WorkerInfo.assigned_jobs"))
+                                        }
+                                        worker.assigned_jobs.remove(&running_job_uuid);
+                                           
+
+                                    } else {
+                                        return Err(Status::not_found(format!("worker with id: {} was not found in worker pool", worker_uuid)));
+                                    }
+
+
+                                    let completed_job = CompletedJob {
+                                        id: running_job_uuid,
+                                        job_type: running_job.job_type,
+                                        payload: running_job.payload,
+                                        priority: running_job.priority,
+                                        created_at: running_job.created_at,
+                                        retry_policy: running_job.retry_policy,
+                                        requirements: running_job.requirements,
+                                        retry_count: running_job.retry_count,
+                                        infra_interruptions: running_job.infra_interruptions,
+                                        completed_at: now_millis(),
+                                        outcome: CompletedJobOutcome::Abandoned { reason: "job was canceled".to_string() },
+                                        metadata: running_job.metadata,
+                                    };
+
+                                    self.scheduler_state.completed_jobs.insert(running_job_uuid, completed_job);
+
+                                    self.scheduler_state.total_failed.fetch_add(1, SeqCst);
+
+                                    return Ok(Response::new(()));
+
+                                }
+
+
+                            }
+                        }
+                    },
+
+                    None => {
+                        return Err(Status::invalid_argument("no variant present within JobOutcome"));
+                    }
+                }
+            },
+
+            None => {
+                return Err(Status::invalid_argument("no JobOutcome was sent"));
+            }
+        }
+
+
+
+        //free job_id from worker with worker_id working job pool
+
+        /*
+        
+        if job_outcome is Success { result }, transition RunningJob to CompletedJob, insert with uuid, CompletedJob kv pair
+        increment total_completed in SchedulerState
+
+        if job_outcome is Failure { error }, increment job's retry_count/infra_interruptions, how do i tell which caused it??
+
+        also check against max_cap as well before i do the incrementation, to possibly drop and increment total_dead_lettered
+        
+         */
+
         Err(Status::unimplemented("report_result not yet implemented"))
     }
 
