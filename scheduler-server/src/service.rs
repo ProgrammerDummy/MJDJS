@@ -16,7 +16,7 @@ use scheduler_core::proto::scheduler_service_client;
 use crate::scheduler_state::{QueuedJob, SchedulerState, RunningPhase, CompletedJobOutcome};
 
 pub struct MySchedulerService {
-    scheduler_state: SchedulerState,
+    pub scheduler_state: SchedulerState,
 }
 
 impl MySchedulerService {
@@ -146,7 +146,7 @@ impl SchedulerService for MySchedulerService {
 
                 //this is assuming that no duplicates will exist between job_queue, running_jobs, and completed_jobs at a time
                 //should be ensured during migrations between data structures
-
+ 
                 let mut job_state = self.scan_lists_for_job_status(job_uuid);
 
                 if let Err(e) = job_state {
@@ -281,7 +281,7 @@ async fn job_submission_success() {
 
     match client.submit_job(job).await {
         Ok(dum) => {
-            let dum = dum.into_inner();
+            let dum = dum.into_inner();  
             match uuid::Uuid::from_slice(&dum.id) {
                 Ok(id) => {
                     {
