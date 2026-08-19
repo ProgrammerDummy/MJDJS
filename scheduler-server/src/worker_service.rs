@@ -8,18 +8,60 @@ use scheduler_core::proto;
 use futures::stream::BoxStream;
 use uuid::Uuid;
 
-use crate::{scheduler_state::{CompletedJob, CompletedJobOutcome, RunningJob, RunningPhase, SchedulerState}, worker::{WorkerInfo, WorkerState}};
+use std::sync::{Arc, Mutex};
+
+
+use crate::{scheduler_state::{QueuedJob, CompletedJob, CompletedJobOutcome, RunningJob, RunningPhase, SchedulerState}, worker::{WorkerInfo, WorkerState}};
 
 const NEXT_HEARTBEAT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
 
 pub struct MyWorkerService {
-    scheduler_state: SchedulerState, //copy SchedulerState over from MySchedulerService during initialization
+    pub scheduler_state: SchedulerState, //copy SchedulerState over from MySchedulerService during initialization
     //safe to copy since all fields are Arc wrapped
 }
 
 impl MyWorkerService {
     
 }
+
+
+async fn fullside_bind_spawn_connect_for_tests() -> (
+        proto::scheduler_service_client::SchedulerServiceClient<tonic::transport::Channel>, 
+        proto::worker_service_client::WorkerServiceClient<tonic::transport::Channel>,
+        SchedulerState
+    ) { //return back the job_queue clone instead
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let incoming = tonic::transport::server::TcpIncoming::from(listener);
+
+    let service = crate::service::MySchedulerService::new();
+
+    let worker_service = MyWorkerService {
+        scheduler_state: service.scheduler_state.clone(),
+    };
+
+    let clone_check = worker_service.scheduler_state.clone();
+
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(proto::scheduler_service_server::SchedulerServiceServer::new(service))
+            .add_service(proto::worker_service_server::WorkerServiceServer::new(worker_service))
+            .serve_with_incoming(incoming)
+            .await
+            .unwrap();
+    });
+
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+
+    (proto::scheduler_service_client::SchedulerServiceClient::new(channel.clone()), proto::worker_service_client::WorkerServiceClient::new(channel), clone_check)
+    
+}
+
 
 
 
@@ -203,8 +245,11 @@ impl WorkerService for MyWorkerService {
 
                                     //check to see if sender is actually correct worker
                                     //and check to see if job is in executing phase or retrying phase
+                                    let started_at_bind;
+
                                     match running_job.running_phase {
                                         RunningPhase::Executing { worker_id, started_at } => {
+                                            started_at_bind = started_at;
                                             if worker_id != worker_uuid {
                                                 return Err(Status::invalid_argument("message is stale or inaccurate, worker id does not match sender"));
                                             }
@@ -245,17 +290,23 @@ impl WorkerService for MyWorkerService {
                                         retry_count: running_job.retry_count,
                                         infra_interruptions: running_job.infra_interruptions,
                                         created_at: running_job.created_at,
-                                        state: JobState::Failed { error },
+                                        state: JobState::Running { worker_id: worker_uuid, started_at: started_at_bind },
                                         retry_policy: running_job.retry_policy.clone(),
                                         requirements: running_job.requirements.clone(),
                                         metadata: running_job.metadata.clone(),
                                     };
 
-                                    let _ = transition(&mut temp_job, JobEvent::Fail { error }); //increment retry_count by 1
+                                    transition(&mut temp_job, JobEvent::Fail { error })
+                                        .map_err(|e| Status::internal(format!("invalid transition: {e:?}")))?; //increment retry_count by 1
 
                                     let next = determine_next_event(&temp_job);
 
-                                    let _ = transition(&mut temp_job, next);
+                                    transition(&mut temp_job, next)
+                                        .map_err(|e| Status::internal(format!("invalid transition: {e:?}")))?;
+
+
+                                    //increment total_failed counter regardless of retry or deadletter
+                                    self.scheduler_state.total_failed.fetch_add(1, SeqCst);
 
                                     match temp_job.state {
                                         JobState::Retrying { retry_after } => {
@@ -269,7 +320,6 @@ impl WorkerService for MyWorkerService {
 
                                                 //increment total_failed
 
-                                                self.scheduler_state.total_failed.fetch_add(1, SeqCst);
                                             } else {
                                                 return Err(Status::internal("retry_queue mutex lock was poisoned"));
                                             }
@@ -301,6 +351,7 @@ impl WorkerService for MyWorkerService {
                                                 
                                                 //increment atomic
                                                 self.scheduler_state.total_dead_lettered.fetch_add(1, SeqCst);
+                                                
                                             }
                                         },
 
@@ -381,7 +432,6 @@ impl WorkerService for MyWorkerService {
 
                                     self.scheduler_state.completed_jobs.insert(running_job_uuid, completed_job);
 
-                                    self.scheduler_state.total_failed.fetch_add(1, SeqCst);
 
                                     return Ok(Response::new(()));
 
@@ -647,3 +697,407 @@ impl WorkerService for MyWorkerService {
 
 }
 
+
+
+
+#[tokio::test]
+async fn report_result_success() {
+
+    //this test should set up the gRPC server, and submit a job into job_queue, register a worker into workers, and then request work
+    //after the worker requests work, the job should be bound to the worker
+    //call report result after, with success, check to see if total_completed is 1, and see if job is in completed_jobs
+
+    //overall this tests the dispatch flow as well as matching, and then the completion result reporting flow and reassignemtn
+
+    let (mut scheduler_client, mut worker_client, clone_check) = fullside_bind_spawn_connect_for_tests().await;
+
+    let job = Job {
+        id: uuid::Uuid::now_v7(),
+        job_type: "test".to_string(),
+        payload: 0,
+        priority: 1,
+        retry_count: 0,
+        infra_interruptions: 0,
+        created_at: 0,
+        state: JobState::Queued,
+        retry_policy: scheduler_core::job_data_structures::RetryPolicy::NoRetry,
+        requirements: HashMap::new(),
+        metadata: HashMap::new(),
+    };
+
+    let job = tonic::Request::new(proto::Job::try_from(job).unwrap());
+
+    //send job into queued_jobs and check for existence
+
+    match scheduler_client.submit_job(job).await {
+        Ok(dum) => {
+            let dum = dum.into_inner();
+            match uuid::Uuid::from_slice(&dum.id) {
+                Ok(id) => {
+                    {
+                        let queued_jobs_stored = clone_check.job_queue.lock().unwrap();
+                        if !queued_jobs_stored.iter().any(|job| job.id == id) {
+                            panic!();
+                        }
+                    }
+                },
+                Err(e) => {
+                    eprintln!("{e}");
+                    panic!();
+                }
+            }
+            
+        },
+
+        Err(e) => {
+            eprintln!("{e}");
+            panic!();
+        }
+    }
+
+    let test_worker = proto::Worker {
+        tags: HashMap::new(),
+        capabilities: HashMap::new(),
+        hostname: "test".to_string(),
+        job_types_supported: vec!["test".to_string()],
+        max_concurrent_jobs: 3,
+    };
+
+    let worker_uuid = match worker_client.register(Request::new(test_worker)).await {
+        Ok(response) => {
+            let worker_uuid = response.into_inner();
+            worker_uuid.worker_id
+            
+        },
+
+        Err(_) => {
+            panic!("registration of test_worker failed")
+        }
+    };
+
+
+    let job = match worker_client.request_work(Request::new(proto::AssignedWorkerId {
+        worker_id: worker_uuid.clone(),
+        })).await {
+
+        Ok(response) => {
+            let a = response.into_inner();
+            if let Some(job) = a.result {
+                if let proto::request_work_response::Result::Job(job) = job {
+                    job
+                } else {
+                    panic!("no work was available somehow")
+                }
+            } else {
+                panic!("None was sent over in response to request work")
+            }
+        },
+
+        Err(_) => {
+            panic!("requesting work failed")
+        }
+    };
+
+
+    //now that we have a job and the worker_uuid,
+
+    match worker_client.report_result(Request::new(proto::JobResult {
+        job_id: job.id.clone(),
+        worker_id: worker_uuid.clone(),
+        job_outcome: Some(proto::JobOutcome {
+            outcome: Some(proto::job_outcome::Outcome::Success(proto::job_outcome::Success { result: 1})),
+        }),
+    })).await {
+
+        Ok(_) => {
+
+        },
+
+        Err(_) => {
+            panic!("report result failed")
+        }
+
+    }
+
+    {
+        let lock = clone_check.job_queue.lock().unwrap();
+        assert!(lock.is_empty()); 
+        //check that queued jobs is empty
+    }
+
+    {
+        if let Ok(job_uuid) = uuid::Uuid::from_slice(&job.id) {
+            let completed_job = clone_check.completed_jobs.get(&job_uuid);
+
+            if let Some(kv_ref) = completed_job {
+                assert_eq!(kv_ref.value().job_type, "test".to_string());
+                assert_eq!(kv_ref.value().outcome, CompletedJobOutcome::Succeeded { result: 1 });
+                assert_eq!(clone_check.total_completed.load(SeqCst), 1);
+                assert!(!clone_check.running_jobs.contains_key(&job_uuid));
+            } else {
+                panic!("id did not exist in completed_jobs")
+            }
+        } else {
+            panic!("uuid failed to form")
+        }
+        
+    }
+
+    if let Some(worker) = clone_check.workers.get(&uuid::Uuid::from_slice(&worker_uuid).unwrap()) {
+        assert!(worker.assigned_jobs.is_empty());
+    }
+
+
+
+}
+
+#[tokio::test]
+async fn report_result_failure_to_retry() {
+    let (mut scheduler_client, mut worker_client, clone_check) = fullside_bind_spawn_connect_for_tests().await;
+
+    let job = Job {
+        id: uuid::Uuid::now_v7(),
+        job_type: "test".to_string(),
+        payload: 0,
+        priority: 1,
+        retry_count: 0,
+        infra_interruptions: 0,
+        created_at: 0,
+        state: JobState::Queued,
+        retry_policy: scheduler_core::job_data_structures::RetryPolicy::FixedDelay { delay_ms: 100, max_attempts: 3 },
+        requirements: HashMap::new(),
+        metadata: HashMap::new(),
+    };
+
+    let job = tonic::Request::new(proto::Job::try_from(job).unwrap());
+
+    //send job into queued_jobs and check for existence
+
+    match scheduler_client.submit_job(job).await {
+        Ok(dum) => {
+            let dum = dum.into_inner();
+            match uuid::Uuid::from_slice(&dum.id) {
+                Ok(id) => {
+                    {
+                        let queued_jobs_stored = clone_check.job_queue.lock().unwrap();
+                        if !queued_jobs_stored.iter().any(|job| job.id == id) {
+                            panic!();
+                        }
+                    }
+                },
+                Err(e) => {
+                    eprintln!("{e}");
+                    panic!();
+                }
+            }
+            
+        },
+
+        Err(e) => {
+            eprintln!("{e}");
+            panic!();
+        }
+    }
+
+    let test_worker = proto::Worker {
+        tags: HashMap::new(),
+        capabilities: HashMap::new(),
+        hostname: "test".to_string(),
+        job_types_supported: vec!["test".to_string()],
+        max_concurrent_jobs: 3,
+    };
+
+    let worker_uuid = match worker_client.register(Request::new(test_worker)).await {
+        Ok(response) => {
+            let worker_uuid = response.into_inner();
+            worker_uuid.worker_id
+            
+        },
+
+        Err(_) => {
+            panic!("registration of test_worker failed")
+        }
+    };
+
+
+    let job = match worker_client.request_work(Request::new(proto::AssignedWorkerId {
+        worker_id: worker_uuid.clone(),
+        })).await {
+
+        Ok(response) => {
+            let a = response.into_inner();
+            if let Some(job) = a.result {
+                if let proto::request_work_response::Result::Job(job) = job {
+                    job
+                } else {
+                    panic!("no work was available somehow")
+                }
+            } else {
+                panic!("None was sent over in response to request work")
+            }
+        },
+
+        Err(_) => {
+            panic!("requesting work failed")
+        }
+    };
+
+
+    let job_result = proto::JobResult {
+        job_id: job.id.clone(),
+        worker_id: worker_uuid.clone(),
+        job_outcome: Some(proto::JobOutcome { outcome: Some(proto::job_outcome::Outcome::Failure(proto::job_outcome::Failure { error: 1})) })
+    };
+
+    match worker_client.report_result(Request::new(job_result)).await {
+        Ok(_) => {},
+        Err(_) => { panic!("report result failed" )},
+    }
+
+    //check fields now
+
+    {
+        if let Ok(job_uuid) = uuid::Uuid::from_slice(&job.id) {
+            let retrying_job = clone_check.running_jobs.get(&job_uuid);
+
+            if let Some(job_ref) = retrying_job {
+         
+                assert_eq!(job_ref.retry_count, 1);
+                assert_eq!(job_ref.running_phase, RunningPhase::Retrying);
+                assert_eq!(job_ref.job_type, "test".to_string());
+                assert_eq!(clone_check.total_failed.load(SeqCst), 1);
+                
+                if let Some(worker) = clone_check.workers.get(&uuid::Uuid::from_slice(&worker_uuid).unwrap()) {
+                    assert!(worker.assigned_jobs.is_empty());
+                }
+            }
+        }
+    }
+
+
+
+}
+
+#[tokio::test]
+async fn report_result_failure_to_dlq() {
+    let (mut scheduler_client, mut worker_client, clone_check) = fullside_bind_spawn_connect_for_tests().await;
+
+    let job = Job {
+        id: uuid::Uuid::now_v7(),
+        job_type: "test".to_string(),
+        payload: 0,
+        priority: 1,
+        retry_count: 0,
+        infra_interruptions: 0,
+        created_at: 0,
+        state: JobState::Queued,
+        retry_policy: scheduler_core::job_data_structures::RetryPolicy::NoRetry,
+        requirements: HashMap::new(),
+        metadata: HashMap::new(),
+    };
+
+    let job = tonic::Request::new(proto::Job::try_from(job).unwrap());
+
+    //send job into queued_jobs and check for existence
+
+    match scheduler_client.submit_job(job).await {
+        Ok(dum) => {
+            let dum = dum.into_inner();
+            match uuid::Uuid::from_slice(&dum.id) {
+                Ok(id) => {
+                    {
+                        let queued_jobs_stored = clone_check.job_queue.lock().unwrap();
+                        if !queued_jobs_stored.iter().any(|job| job.id == id) {
+                            panic!();
+                        }
+                    }
+                },
+                Err(e) => {
+                    eprintln!("{e}");
+                    panic!();
+                }
+            }
+            
+        },
+
+        Err(e) => {
+            eprintln!("{e}");
+            panic!();
+        }
+    }
+
+    let test_worker = proto::Worker {
+        tags: HashMap::new(),
+        capabilities: HashMap::new(),
+        hostname: "test".to_string(),
+        job_types_supported: vec!["test".to_string()],
+        max_concurrent_jobs: 3,
+    };
+
+    let worker_uuid = match worker_client.register(Request::new(test_worker)).await {
+        Ok(response) => {
+            let worker_uuid = response.into_inner();
+            worker_uuid.worker_id
+            
+        },
+
+        Err(_) => {
+            panic!("registration of test_worker failed")
+        }
+    };
+
+
+    let job = match worker_client.request_work(Request::new(proto::AssignedWorkerId {
+        worker_id: worker_uuid.clone(),
+        })).await {
+
+        Ok(response) => {
+            let a = response.into_inner();
+            if let Some(job) = a.result {
+                if let proto::request_work_response::Result::Job(job) = job {
+                    job
+                } else {
+                    panic!("no work was available somehow")
+                }
+            } else {
+                panic!("None was sent over in response to request work")
+            }
+        },
+
+        Err(_) => {
+            panic!("requesting work failed")
+        }
+    };
+
+
+    let job_result = proto::JobResult {
+        job_id: job.id.clone(),
+        worker_id: worker_uuid.clone(),
+        job_outcome: Some(proto::JobOutcome { outcome: Some(proto::job_outcome::Outcome::Failure(proto::job_outcome::Failure { error: 1})) })
+    };
+
+    match worker_client.report_result(Request::new(job_result)).await {
+        Ok(_) => {},
+        Err(_) => { panic!("report result failed" )},
+    }
+
+    //check fields now
+
+    {
+        if let Ok(job_uuid) = uuid::Uuid::from_slice(&job.id) {
+            let deadlettered_job = clone_check.completed_jobs.get(&job_uuid);
+
+            if let Some(job_ref) = deadlettered_job {
+         
+                assert_eq!(job_ref.retry_count, 0);
+                assert_eq!(job_ref.job_type, "test".to_string());
+                assert_eq!(clone_check.total_dead_lettered.load(SeqCst), 1);
+                assert_eq!(job_ref.outcome, CompletedJobOutcome::DeadLettered { reason: "retries exhausted".to_string() });
+                if let Some(worker) = clone_check.workers.get(&uuid::Uuid::from_slice(&worker_uuid).unwrap()) {
+                    assert!(worker.assigned_jobs.is_empty());
+                }
+            }
+        }
+    }
+
+}
