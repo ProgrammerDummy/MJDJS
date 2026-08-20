@@ -2,6 +2,7 @@ mod service;
 mod scheduler_state;
 mod worker;
 mod worker_service;
+mod background;
 
 use scheduler_core::proto::scheduler_service_server::SchedulerServiceServer;
 
