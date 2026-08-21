@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 dashmap = "6.2.1"
 futures = "0.3.33"
+parking_lot = "0.12.5"
 scheduler-core = { path = "../scheduler-core" }
 tokio = { version = "1.53.0", features = ["full"] }
 tokio-stream = "0.1.19"
