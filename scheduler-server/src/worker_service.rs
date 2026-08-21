@@ -8,7 +8,7 @@ use scheduler_core::proto;
 use futures::stream::BoxStream;
 use uuid::Uuid;
 
-use std::sync::{Arc, Mutex};
+
 
 
 use crate::{scheduler_state::{QueuedJob, CompletedJob, CompletedJobOutcome, RunningJob, RunningPhase, SchedulerState}, worker::{WorkerInfo, WorkerState}};
@@ -96,12 +96,11 @@ impl WorkerService for MyWorkerService {
     
         let now = std::time::Instant::now();
 
-        
-        if let Ok(mut guard) = self.scheduler_state.worker_heartbeat_timer.lock() {
+        {
+            let mut guard = self.scheduler_state.worker_heartbeat_timer.lock();
             guard.insert((now+NEXT_HEARTBEAT_DEADLINE, new_worker_id));
-        } else {
-            return Err(Status::internal("worker_heartbeat_timer mutex lock poisoned"));
         }
+
 
         let new_worker = WorkerInfo {
             id: new_worker_id,
@@ -314,14 +313,12 @@ impl WorkerService for MyWorkerService {
                                             running_job.retry_count = temp_job.retry_count;
                                             running_job.running_phase = RunningPhase::Retrying;
                                             
-                                            if let Ok(mut retry_queue_guard) = self.scheduler_state.retry_queue.lock() {
+                                            {
+                                                let mut retry_queue_guard = self.scheduler_state.retry_queue.lock();
                                                 retry_queue_guard.insert((std::time::Instant::now()+retry_after, job_uuid));
                                                 //insert job into retry_queue with calculated timeout with jitter
 
                                                 //increment total_failed
-
-                                            } else {
-                                                return Err(Status::internal("retry_queue mutex lock was poisoned"));
                                             }
 
                                         },
@@ -509,94 +506,94 @@ impl WorkerService for MyWorkerService {
                 return Err(Status::resource_exhausted(format!("no space in worker id: {} job pool for more jobs", job_requesting_worker_id)))
             } else {
 
-                if let Ok(mut job_queue_guard) = self.scheduler_state.job_queue.lock() {
+                {
 
-                let mut extractor = job_queue_guard.extract_if(.., |job| {
-                    worker_job_types.contains(&job.job_type) &&
-                    job.requirements.iter().all(|(requirements_key, requirements_value)| worker_capabilities.get(requirements_key) == Some(requirements_value))
-                }); //iterates over requirements to check that the requirements hashmap is a subset of capabilities hashmap
-                //if it matches, then the QueuedJob is unlinked from the btreeset
+                    let mut job_queue_guard = self.scheduler_state.job_queue.lock();
+
+                    let mut extractor = job_queue_guard.extract_if(.., |job| {
+                        worker_job_types.contains(&job.job_type) &&
+                        job.requirements.iter().all(|(requirements_key, requirements_value)| worker_capabilities.get(requirements_key) == Some(requirements_value))
+                    }); //iterates over requirements to check that the requirements hashmap is a subset of capabilities hashmap
+                    //if it matches, then the QueuedJob is unlinked from the btreeset
 
 
-                if let Some(job) = extractor.next() { //executes the extractor, if there is a job whose requirements match the worker's capabilities
+                    if let Some(job) = extractor.next() { //executes the extractor, if there is a job whose requirements match the worker's capabilities
 
-                    //create a RunningJob and pass the values from the QueuedJob into it
+                        //create a RunningJob and pass the values from the QueuedJob into it
 
-                    let now = now_millis();
+                        let now = now_millis();
 
-                    let new_running_job = RunningJob {
-                        id: job.id,
-                        job_type: job.job_type.clone(),
-                        payload: job.payload,
-                        priority: job.priority,
-                        created_at: job.created_at,
-                        retry_count: job.retry_count,
-                        running_phase: RunningPhase::Executing { 
-                            worker_id: job_requesting_worker_id, 
-                            started_at: now, 
-                        },
-                        infra_interruptions: job.infra_interruptions,
-                        requirements: job.requirements.clone(),
-                        metadata: job.metadata.clone(),
-                        retry_policy: job.retry_policy.clone(),
-                    };
+                        let new_running_job = RunningJob {
+                            id: job.id,
+                            job_type: job.job_type.clone(),
+                            payload: job.payload,
+                            priority: job.priority,
+                            created_at: job.created_at,
+                            retry_count: job.retry_count,
+                            running_phase: RunningPhase::Executing { 
+                                worker_id: job_requesting_worker_id, 
+                                started_at: now, 
+                            },
+                            infra_interruptions: job.infra_interruptions,
+                            requirements: job.requirements.clone(),
+                            metadata: job.metadata.clone(),
+                            retry_policy: job.retry_policy.clone(),
+                        };
 
-                    self.scheduler_state.running_jobs.insert(job.id, new_running_job);
+                        self.scheduler_state.running_jobs.insert(job.id, new_running_job);
+                        
+                        worker.assigned_jobs.insert(job.id);
+
+                        //insert new job into worker's job hashset and incremement max_concurrent_job counter by 1
+                        //check should have been done before the mutex for job_queue was locked
+
+                        let proto_job = Job {
+                            id: job.id, 
+                            job_type: job.job_type,
+                            payload: job.payload,
+                            priority: job.priority,
+                            retry_count: job.retry_count,
+                            infra_interruptions: job.infra_interruptions,
+                            created_at: job.created_at,
+                            state: JobState::Running { worker_id: job_requesting_worker_id, started_at: now },
+                            retry_policy: job.retry_policy,
+                            requirements: job.requirements,
+                            metadata: job.metadata,
+                        };
+
+                        if let Ok(proto_job) = proto::Job::try_from(proto_job) {
+                            return Ok(Response::new(proto::RequestWorkResponse {
+                                result: Some(proto::request_work_response::Result::Job(proto_job))
+                            }))
+                        } else {
+                            return Err(Status::internal("job was invalid"));
+                        }
+
+
+
+                        //insert new RunningJob into running_job dashmap
+
+                        /*
+                        think about when noworkavailable would be sent back --> when there are no jobs in queue at all or when there are no matching jobs?
+
                     
-                    worker.assigned_jobs.insert(job.id);
+                        
+                        now modify SchedulerState.workers to add in new job to WorkerInfo.max_concurrent_jobs
+                        and WorkerInfo.assigned_jobs
 
-                    //insert new job into worker's job hashset and incremement max_concurrent_job counter by 1
-                    //check should have been done before the mutex for job_queue was locked
-
-                    let proto_job = Job {
-                        id: job.id, 
-                        job_type: job.job_type,
-                        payload: job.payload,
-                        priority: job.priority,
-                        retry_count: job.retry_count,
-                        infra_interruptions: job.infra_interruptions,
-                        created_at: job.created_at,
-                        state: JobState::Running { worker_id: job_requesting_worker_id, started_at: now },
-                        retry_policy: job.retry_policy,
-                        requirements: job.requirements,
-                        metadata: job.metadata,
-                    };
-
-                    if let Ok(proto_job) = proto::Job::try_from(proto_job) {
-                        return Ok(Response::new(proto::RequestWorkResponse {
-                            result: Some(proto::request_work_response::Result::Job(proto_job))
-                        }))
+                        create Job, then use try_from to turn into proto::Job in converison.rs
+                        return the proto::Job
+                            */
+                        
                     } else {
-                        return Err(Status::internal("job was invalid"));
+                        return Ok(Response::new(proto::RequestWorkResponse {
+                            result: Some(proto::request_work_response::Result::None(proto::NoWorkAvailable {}))
+                        }))
                     }
 
-
-
-                    //insert new RunningJob into running_job dashmap
-
-                    /*
-                    think about when noworkavailable would be sent back --> when there are no jobs in queue at all or when there are no matching jobs?
-
-                
                     
-                    now modify SchedulerState.workers to add in new job to WorkerInfo.max_concurrent_jobs
-                    and WorkerInfo.assigned_jobs
 
-                    create Job, then use try_from to turn into proto::Job in converison.rs
-                    return the proto::Job
-                        */
-                    
-                } else {
-                    return Ok(Response::new(proto::RequestWorkResponse {
-                        result: Some(proto::request_work_response::Result::None(proto::NoWorkAvailable {}))
-                    }))
-                }
-
-                
-
-            } else {
-                return Err(Status::internal("scheduler state's job_queue lock was poisoned"));
-            }
+                } 
             }
         } else { //worker doesn't exist
             return Err(Status::not_found(format!("worker with id: {} was not found in worker pool", job_requesting_worker_id)))
@@ -644,7 +641,8 @@ impl WorkerService for MyWorkerService {
 
                         let now = std::time::Instant::now();
                         
-                        if let Ok(mut guard) = heartbeat_timer_lock.lock() {
+                        {
+                            let mut guard = heartbeat_timer_lock.lock();
                             let worker_timer = guard
                                 .iter()
                                 .find(|(_, uuid)| *uuid == worker_uuid)
@@ -656,10 +654,7 @@ impl WorkerService for MyWorkerService {
 
                             guard.insert((now + NEXT_HEARTBEAT_DEADLINE, worker_uuid));
 
-                        } else {
-                            let _ = tx.send(Err(Status::internal("worker_heartbeat_timer mutex was poisoned"))).await;
-                            break;
-                        }
+                        } 
                         
                         //now modify the workers to update last_heartbeat_at
                         if let Some(mut workers_mutref) = workers.get_mut(&worker_uuid) {
@@ -747,7 +742,7 @@ async fn report_result_success() {
             match uuid::Uuid::from_slice(&dum.id) {
                 Ok(id) => {
                     {
-                        let queued_jobs_stored = clone_check.job_queue.lock().unwrap();
+                        let queued_jobs_stored = clone_check.job_queue.lock();
                         if !queued_jobs_stored.iter().any(|job| job.id == id) {
                             panic!();
                         }
@@ -832,7 +827,7 @@ async fn report_result_success() {
     }
 
     {
-        let lock = clone_check.job_queue.lock().unwrap();
+        let lock = clone_check.job_queue.lock();
         assert!(lock.is_empty()); 
         //check that queued jobs is empty
     }
@@ -891,7 +886,7 @@ async fn report_result_failure_to_retry() {
             match uuid::Uuid::from_slice(&dum.id) {
                 Ok(id) => {
                     {
-                        let queued_jobs_stored = clone_check.job_queue.lock().unwrap();
+                        let queued_jobs_stored = clone_check.job_queue.lock();
                         if !queued_jobs_stored.iter().any(|job| job.id == id) {
                             panic!();
                         }
@@ -1018,7 +1013,7 @@ async fn report_result_failure_to_dlq() {
             match uuid::Uuid::from_slice(&dum.id) {
                 Ok(id) => {
                     {
-                        let queued_jobs_stored = clone_check.job_queue.lock().unwrap();
+                        let queued_jobs_stored = clone_check.job_queue.lock();
                         if !queued_jobs_stored.iter().any(|job| job.id == id) {
                             panic!();
                         }

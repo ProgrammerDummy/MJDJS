@@ -8,7 +8,9 @@ use std::convert::TryFrom;
 use std::sync::atomic::Ordering;
 use futures::stream::BoxStream;
 use uuid;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc};
+
+use parking_lot::Mutex;
 
 use scheduler_core::proto::scheduler_service_server::SchedulerServiceServer;
 use scheduler_core::proto::scheduler_service_client;
@@ -39,7 +41,8 @@ impl MySchedulerService {
             //if RunningPhase::Retrying
             //warning for the future: if a RunningJob is within running_job but somehow not within retry_queue for some reason, the returned value of this function will be tonic::Status::not_found because it'll fall all the way through
             
-            if let Ok(retry_queue_guard) = self.scheduler_state.retry_queue.lock() {
+            {
+                let retry_queue_guard = self.scheduler_state.retry_queue.lock();
                 if let Some(timeout_until) = retry_queue_guard
                     .iter()
                     .find(| (_, id) | *id == requested_id)
@@ -47,8 +50,6 @@ impl MySchedulerService {
                     
                     return Ok(JobState::Retrying { retry_after: timeout_until.saturating_duration_since(std::time::Instant::now()) })
                 }
-            } else { //in case of mutex poisoning
-                return Err(Status::internal("scheduler state's retry_queue lock was poisoned"));
             }
         }
 
@@ -73,15 +74,14 @@ impl MySchedulerService {
         //finally, look at job_queue 
 
         {
-            if let Ok(job_queue_guard) = self.scheduler_state.job_queue.lock() {
+            {
+                let job_queue_guard = self.scheduler_state.job_queue.lock();
                 if job_queue_guard.iter().any(|job| job.id == requested_id) {
                     return Ok(JobState::Queued);
                 }
 
                 return Err(tonic::Status::not_found("job was not found in MySchedulerService"));
-            } else { //in case of mutex poisoning
-                return Err(Status::internal("scheduler state's job_queue lock was poisoned"));
-            }
+            } 
         }
     }
 }
@@ -118,7 +118,7 @@ impl SchedulerService for MySchedulerService {
             };
 
             {
-                let mut jobs = self.scheduler_state.job_queue.lock().unwrap();
+                let mut jobs = self.scheduler_state.job_queue.lock();
 
                 jobs.insert(queued_job);
             }
@@ -228,7 +228,7 @@ fn validate_retry_policy(policy: &RetryPolicy) -> Result<(), ConversionError> {
     // wherever the policy variant carries them
 }
 
-
+//`Mutex<RawMutex, BTreeSet<QueuedJob>>` and `std::sync::Mutex<BTreeSet<QueuedJob>>`
 async fn bind_spawn_connect_for_tests() -> (scheduler_service_client::SchedulerServiceClient<tonic::transport::Channel>, Arc<Mutex<std::collections::BTreeSet<QueuedJob>>>) { //return back the job_queue clone instead
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -285,7 +285,7 @@ async fn job_submission_success() {
             match uuid::Uuid::from_slice(&dum.id) {
                 Ok(id) => {
                     {
-                        let jobs_stored = clone_check.lock().unwrap();
+                        let jobs_stored = clone_check.lock();
                         if !jobs_stored.iter().any(|job| job.id == id) {
                             panic!();
                         }

@@ -5,7 +5,7 @@ use crate::worker::WorkerInfo;
 
 use uuid;
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc};
 use std::sync::atomic::AtomicU64;
 use std::collections::{BTreeMap, BTreeSet};
 use dashmap::DashMap;
@@ -13,6 +13,8 @@ use std::collections::HashMap;
 
 use std::time::Instant;
 use std::cmp::Ordering;
+
+use parking_lot::Mutex;
 
 #[derive(Debug, PartialEq, Clone, Eq)]
 pub enum CompletedJobOutcome {
