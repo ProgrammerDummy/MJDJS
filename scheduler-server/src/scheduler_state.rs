@@ -1,5 +1,6 @@
 use scheduler_core::job_data_structures::{JobState, RetryPolicy};
 use scheduler_core::worker::{WorkerId};
+use tokio::sync::Notify;
 use crate::worker::WorkerInfo;
 
 use uuid;
@@ -116,6 +117,7 @@ pub struct SchedulerState {
     pub total_completed: Arc<AtomicU64>,
     pub total_failed: Arc<AtomicU64>,
     pub total_dead_lettered: Arc<AtomicU64>,
+    pub retry_notify: Arc<Notify>,
 
     //chose to wrap each field with Arc and mutex/dashmap so that only necessary components can clone the arc handle rather than having access to entire struct
 
@@ -140,6 +142,7 @@ impl SchedulerState {
             total_completed: Arc::new(0.into()),
             total_failed: Arc::new(0.into()),
             total_dead_lettered: Arc::new(0.into()),
+            retry_notify: Arc::new(Notify::new()),
         }
 
     }
