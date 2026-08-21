@@ -493,6 +493,18 @@ impl WorkerService for MyWorkerService {
             worker_capabilities = worker.capabilities.clone();
             worker_job_types = worker.job_types_supported.clone();
 
+            match worker.state {
+                WorkerState::Active => {},
+                WorkerState::Draining => {
+                    return Ok(Response::new(proto::RequestWorkResponse {
+                        result: Some(proto::request_work_response::Result::None(proto::NoWorkAvailable {}))
+                    }));
+                },
+                WorkerState::Dead => {
+                    return Err(Status::failed_precondition("work requesting worker is dead"))
+                }
+            }
+
             if worker.max_concurrent_jobs <= worker.assigned_jobs.len() as u32 { //check to see if the job pool is full
                 return Err(Status::resource_exhausted(format!("no space in worker id: {} job pool for more jobs", job_requesting_worker_id)))
             } else {
