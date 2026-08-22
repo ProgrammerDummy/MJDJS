@@ -5,7 +5,8 @@ edition = "2024"
 
 [dependencies]
 gethostname = "1.1.0"
+prost = "0.14.4"
 scheduler-core = { path = "../scheduler-core" }
 tokio = "1.53.0"
-tokio-utils = "0.1.2"
+tokio-util = "0.7.19"
 tonic = "0.14.6"
