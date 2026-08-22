@@ -5,22 +5,87 @@ use scheduler_core::proto::{self, scheduler_service_server::SchedulerService};
 use tonic::{Request, Response, Status};
 use std::collections::HashMap;
 use std::convert::TryFrom;
+use std::sync::atomic::Ordering;
 use futures::stream::BoxStream;
 use uuid;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc};
+
+use parking_lot::Mutex;
 
 use scheduler_core::proto::scheduler_service_server::SchedulerServiceServer;
 use scheduler_core::proto::scheduler_service_client;
 
+use crate::scheduler_state::{QueuedJob, SchedulerState, RunningPhase, CompletedJobOutcome};
+
 pub struct MySchedulerService {
-    jobs: Arc<Mutex<std::collections::HashMap<uuid::Uuid, Job>>>,
+    pub scheduler_state: SchedulerState,
 }
 
 impl MySchedulerService {
     pub fn new() -> Self {
-        MySchedulerService { jobs: Arc::new(Mutex::new(HashMap::new())) }
+        MySchedulerService { scheduler_state: SchedulerState::new() }
     }
 }
+
+impl MySchedulerService {
+    fn scan_lists_for_job_status(&self, requested_id: uuid::Uuid) -> Result<JobState, Status> {
+
+        //look for running_jobs first
+
+        
+        if let Some(running_job) = self.scheduler_state.running_jobs.get(&requested_id) {
+            if let RunningPhase::Executing { worker_id, started_at} = running_job.running_phase {
+                return Ok(JobState::Running { worker_id, started_at })
+            } 
+        
+            //if RunningPhase::Retrying
+            //warning for the future: if a RunningJob is within running_job but somehow not within retry_queue for some reason, the returned value of this function will be tonic::Status::not_found because it'll fall all the way through
+            
+            {
+                let retry_queue_guard = self.scheduler_state.retry_queue.lock();
+                if let Some(timeout_until) = retry_queue_guard
+                    .iter()
+                    .find(| (_, id) | *id == requested_id)
+                    .map(| (timeout_until, _) | timeout_until) { //O(n) time, could speed up with BiBiTreeMap?
+                    
+                    return Ok(JobState::Retrying { retry_after: timeout_until.saturating_duration_since(std::time::Instant::now()) })
+                }
+            }
+        }
+
+
+
+        //look for completed_jobs next
+
+        if let Some(completed_job) = self.scheduler_state.completed_jobs.get(&requested_id) {
+            if let CompletedJobOutcome::Abandoned { reason } = &completed_job.outcome {
+                return Ok(JobState::Abandoned { reason: reason.to_string(), abandoned_at: completed_job.completed_at })
+            }
+
+            if let CompletedJobOutcome::DeadLettered { reason } = &completed_job.outcome {
+                return Ok(JobState::DeadLettered { reason: reason.to_string() })
+            }
+
+            if let CompletedJobOutcome::Succeeded { result } = &completed_job.outcome {
+                return Ok(JobState::Succeeded { completed_at: completed_job.completed_at, result: *result })
+            }
+        }
+
+        //finally, look at job_queue 
+
+        {
+            {
+                let job_queue_guard = self.scheduler_state.job_queue.lock();
+                if job_queue_guard.iter().any(|job| job.id == requested_id) {
+                    return Ok(JobState::Queued);
+                }
+
+                return Err(tonic::Status::not_found("job was not found in MySchedulerService"));
+            } 
+        }
+    }
+}
+
 
 #[tonic::async_trait]
 impl SchedulerService for MySchedulerService {
@@ -38,8 +103,27 @@ impl SchedulerService for MySchedulerService {
         let job = Job::new_submitted(job);
         
         {
-            let mut jobs = self.jobs.lock().unwrap();
-            jobs.insert(job.id, job.clone());
+
+            let queued_job = QueuedJob {
+                id: job.id,
+                job_type: job.job_type,
+                payload: job.payload,
+                priority: job.priority,
+                retry_count: job.retry_count,
+                infra_interruptions: job.infra_interruptions,
+                created_at: job.created_at,
+                retry_policy: job.retry_policy,
+                requirements: job.requirements,
+                metadata: job.metadata,
+            };
+
+            {
+                let mut jobs = self.scheduler_state.job_queue.lock();
+
+                jobs.insert(queued_job);
+            }
+
+            self.scheduler_state.total_submitted.fetch_add(1, Ordering::SeqCst); //increment total_submitted in SchedulerState
 
         }
 
@@ -51,6 +135,7 @@ impl SchedulerService for MySchedulerService {
        
     }
 
+
     async fn get_job_status(&self, request: Request<proto::JobIdRequest>) -> Result<Response<proto::JobStatus>, Status> {
         let job_id_request = request.into_inner();
 
@@ -58,26 +143,24 @@ impl SchedulerService for MySchedulerService {
 
         match job_id_request {
             Ok(job_uuid) => {
-                let jobs_lock = self.jobs.lock().unwrap();
-                let job = jobs_lock.get(&job_uuid);
+
+                //this is assuming that no duplicates will exist between job_queue, running_jobs, and completed_jobs at a time
+                //should be ensured during migrations between data structures
+ 
+                let mut job_state = self.scan_lists_for_job_status(job_uuid);
+
+                if let Err(e) = job_state {
+                    return Err(e);
+                } //return early here if job couldn't be found
                 
-                match job {
-                    Some(job) => {
-                        match job_state_to_proto(job.state.clone()) {
-                            Ok(proto_job_status) => {
-                                return Ok(tonic::Response::new(proto_job_status))
-                            },
-
-                            Err(e) => {
-                                return Err(tonic::Status::internal("invalid job entered the system")) //this shouldn't occur due to the entrypoint having bounds, if this happens something has gone very wrong
-                            }
-                        }
-
+                match job_state_to_proto(job_state.unwrap()) { //safe to unwrap here
+                    Ok(proto_job_status) => {
+                        return Ok(tonic::Response::new(proto_job_status))
                     },
 
-                    None => {
-                        return Err::<Response<proto::JobStatus>, Status>(tonic::Status::not_found("job was not found in MySchedulerService"));
-                    },
+                    Err(e) => {
+                        return Err(tonic::Status::internal("invalid job entered the system")) //this shouldn't occur due to the entrypoint having bounds, if this happens something has gone very wrong
+                    }
                 }
             },
             Err(e) => {
@@ -145,15 +228,15 @@ fn validate_retry_policy(policy: &RetryPolicy) -> Result<(), ConversionError> {
     // wherever the policy variant carries them
 }
 
-
-async fn bind_spawn_connect_for_tests() -> (scheduler_service_client::SchedulerServiceClient<tonic::transport::Channel>, Arc<Mutex<std::collections::HashMap<uuid::Uuid, Job>>>) {
+//`Mutex<RawMutex, BTreeSet<QueuedJob>>` and `std::sync::Mutex<BTreeSet<QueuedJob>>`
+async fn bind_spawn_connect_for_tests() -> (scheduler_service_client::SchedulerServiceClient<tonic::transport::Channel>, Arc<Mutex<std::collections::BTreeSet<QueuedJob>>>) { //return back the job_queue clone instead
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let incoming = tonic::transport::server::TcpIncoming::from(listener);
 
     let service = MySchedulerService::new();
 
-    let clone_check = service.jobs.clone();
+    let clone_check = service.scheduler_state.job_queue.clone();
 
     tokio::spawn(async move {
         tonic::transport::Server::builder()
@@ -198,16 +281,13 @@ async fn job_submission_success() {
 
     match client.submit_job(job).await {
         Ok(dum) => {
-            let dum = dum.into_inner();
+            let dum = dum.into_inner();  
             match uuid::Uuid::from_slice(&dum.id) {
                 Ok(id) => {
                     {
-                        let jobs_stored = clone_check.lock().unwrap();
-                        match jobs_stored.get(&id) {
-                            Some(_) => {},
-                            None => {
-                                panic!();
-                            }
+                        let jobs_stored = clone_check.lock();
+                        if !jobs_stored.iter().any(|job| job.id == id) {
+                            panic!();
                         }
                     }
                 },
@@ -320,7 +400,7 @@ async fn get_job_status_success() {
 
 #[tokio::test]
 async fn get_job_status_not_found() {
-    let (mut client, clone_check) = bind_spawn_connect_for_tests().await;
+    let (mut client, _clone_check) = bind_spawn_connect_for_tests().await;
 
     let nonexistent_id = uuid::Uuid::now_v7();
     let nonexistent_id = nonexistent_id.as_bytes();
@@ -345,7 +425,7 @@ async fn get_job_status_not_found() {
 
 #[tokio::test]
 async fn get_job_status_invalid_id() {
-    let (mut client, clone_check) = bind_spawn_connect_for_tests().await;
+    let (mut client, _clone_check) = bind_spawn_connect_for_tests().await;
 
     let invalid_uuid = vec![1, 2, 3];
 

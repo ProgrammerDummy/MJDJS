@@ -135,7 +135,7 @@ impl RetryPolicy {
 pub enum JobState {
     Queued,
     Running {
-        worker_id: u64,
+        worker_id: uuid::Uuid,
         started_at: u64,
     },
     Succeeded {

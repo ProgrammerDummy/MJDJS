@@ -54,7 +54,7 @@ message JobStatus {
     message Queued {}
 
     message Running {
-        uint64 worker_id = 1;
+        bytes worker_id = 1;
         uint64 started_at = 2;
     }
 
@@ -93,7 +93,7 @@ message JobStatus {
 
 message JobResult {
     bytes job_id = 1;
-    uint64 worker_id = 2;
+    bytes worker_id = 2;
     JobOutcome job_outcome = 3;
 }
 
@@ -154,14 +154,17 @@ message ListRequest {}
 message Worker {
     map<string, string> tags = 1;
     map<string, string> capabilities = 2;
+    string hostname = 3;
+    repeated string job_types_supported = 4;
+    uint32 max_concurrent_jobs = 5;
 }
 
 message AssignedWorkerID {
-    uint64 worker_id = 1;
+    bytes worker_id = 1;
 }
 
 message HeartbeatPing {
-    uint64 worker_id = 1;
+    bytes worker_id = 1;
     uint64 sent_at = 2;
 }
 

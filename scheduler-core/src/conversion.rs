@@ -116,6 +116,8 @@ pub fn job_state_to_proto(state: JobState) -> Result<proto::JobStatus, Conversio
         },
 
         JobState::Running { worker_id, started_at } => {
+            let worker_id = worker_id.as_bytes().to_vec();
+
             Ok(proto::JobStatus { state: Some(proto::job_status::State::Running(proto::job_status::Running { worker_id, started_at}))})
         },
 
@@ -148,6 +150,13 @@ pub fn proto_to_job_status(state: Option<proto::job_status::State>) -> Result<Jo
         Some(proto::job_status::State::Queued(_)) => Ok::<JobState, ConversionError>(JobState::Queued),
 
         Some(proto::job_status::State::Running(proto::job_status::Running { worker_id, started_at })) => {
+            let worker_id = match uuid::Uuid::from_slice(&worker_id) {
+                Ok(uuid) => { uuid },
+                Err(e) => {
+                    return Err(ConversionError::InvalidId(e))
+                }
+            };
+
             Ok(JobState::Running { worker_id, started_at })
         },
 

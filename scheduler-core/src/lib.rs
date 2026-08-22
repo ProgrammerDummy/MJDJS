@@ -1,6 +1,7 @@
 pub mod state_machine;
 pub mod job_data_structures;
 pub mod conversion;
+pub mod worker;
 
 pub mod proto {
     tonic::include_proto!("scheduler");
