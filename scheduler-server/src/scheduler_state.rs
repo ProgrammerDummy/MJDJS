@@ -120,7 +120,7 @@ pub struct SchedulerState {
     pub total_failed: Arc<AtomicU64>,
     pub total_dead_lettered: Arc<AtomicU64>,
     pub retry_notify: Arc<Notify>,
-    pub new_worker_notify: Arc<Notify>,
+    pub new_worker_deadline_notify: Arc<Notify>,
 
     //chose to wrap each field with Arc and mutex/dashmap so that only necessary components can clone the arc handle rather than having access to entire struct
 
@@ -146,7 +146,7 @@ impl SchedulerState {
             total_failed: Arc::new(0.into()),
             total_dead_lettered: Arc::new(0.into()),
             retry_notify: Arc::new(Notify::new()),
-            new_worker_notify: Arc::new(Notify::new()),
+            new_worker_deadline_notify: Arc::new(Notify::new()),
         }
 
     }

@@ -116,6 +116,9 @@ impl WorkerService for MyWorkerService {
          
         self.scheduler_state.workers.insert(new_worker_id, new_worker);
 
+        //notify background task for worker heartbeats of new registered worker
+
+        self.scheduler_state.new_worker_notify.notify_one();
 
         return Ok(Response::new(proto::AssignedWorkerId { worker_id: new_worker_id.as_bytes().to_vec() }));
 
@@ -319,7 +322,13 @@ impl WorkerService for MyWorkerService {
                                                 //insert job into retry_queue with calculated timeout with jitter
 
                                                 //increment total_failed
+                                            
+                                                
                                             }
+
+                                            //notify background retry_queue drain task
+
+                                            self.scheduler_state.retry_notify.notify_one();
 
                                         },
 
@@ -618,6 +627,7 @@ impl WorkerService for MyWorkerService {
 
         let workers = self.scheduler_state.workers.clone(); //arc clone
         let heartbeat_timer_lock = self.scheduler_state.worker_heartbeat_timer.clone();
+        let retry_notify = self.scheduler_state.retry_notify.clone();
 
         //one spawned task that continously loops in the background for heartbeats
         //poll for the heartbeats, i can tell what is happening on the channel based on the returned values
@@ -654,7 +664,13 @@ impl WorkerService for MyWorkerService {
 
                             guard.insert((now + NEXT_HEARTBEAT_DEADLINE, worker_uuid));
 
+                            retry_notify.notify_one();
+
+                            //notify retry_queue background task of updated heartbeat deadline
+                            
                         } 
+
+                     
                         
                         //now modify the workers to update last_heartbeat_at
                         if let Some(mut workers_mutref) = workers.get_mut(&worker_uuid) {

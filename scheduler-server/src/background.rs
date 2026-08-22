@@ -231,12 +231,12 @@ pub async fn run_death_detector(state: SchedulerState) {
             DeadlineResult::Waiting(deadline) => {
                 tokio::select! {
                     _ = tokio::time::sleep_until(deadline.into()) => {},
-                    _ = state.new_worker_notify.notified() => {},
+                    _ = state.new_worker_deadline_notify.notified() => {},
                 }
             },
 
             DeadlineResult::EmptyQueue => {
-                state.new_worker_notify.notified().await;
+                state.new_worker_deadline_notify.notified().await;
             },
 
         }
