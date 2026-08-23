@@ -4,9 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+futures = "0.3.34"
 gethostname = "1.1.0"
+parking_lot = "0.12.5"
 prost = "0.14.4"
 scheduler-core = { path = "../scheduler-core" }
 tokio = "1.53.0"
+tokio-stream = "0.1.19"
 tokio-util = "0.7.19"
 tonic = "0.14.6"
+tracing = "0.1.44"
+uuid = "1.25.0"
