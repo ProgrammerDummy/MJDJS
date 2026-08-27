@@ -4,11 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+async-trait = "0.1.92"
 futures = "0.3.34"
 gethostname = "1.1.0"
+ordered-float = "5.5.0"
 parking_lot = "0.12.5"
 prost = "0.14.4"
+rand = "0.10.2"
 scheduler-core = { path = "../scheduler-core" }
+thiserror = "2.0.20"
 tokio = "1.53.0"
 tokio-stream = "0.1.19"
 tokio-util = "0.7.19"
