@@ -171,7 +171,7 @@ pub async fn send_heartbeats(addr: SocketAddr, worker_id: Arc<Mutex<uuid::Uuid>>
    
 }
 
-async fn sleep_timer(retry_count: u32) {
+pub async fn sleep_timer(retry_count: u32) {
 
     const BASE_MS : u64 = 100;
     const CEILING_MS : u64 = 2000;
