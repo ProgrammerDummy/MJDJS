@@ -253,11 +253,11 @@ pub fn proto_to_job_status(
                         retry_after: std_duration,
                     }),
 
-                    Err(e) => return Err(ConversionError::NegativeDuration),
+                    Err(_e) => Err(ConversionError::NegativeDuration),
                 },
 
                 None => {
-                    return Err(ConversionError::NoDuration);
+                    Err(ConversionError::NoDuration)
                 }
             }
         }
@@ -274,6 +274,6 @@ pub fn proto_to_job_status(
             abandoned_at,
         }),
 
-        None => return Err(ConversionError::MissingState),
+        None => Err(ConversionError::MissingState),
     }
 }

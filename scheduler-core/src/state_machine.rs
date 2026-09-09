@@ -47,13 +47,13 @@ pub fn determine_next_event(job: &Job) -> JobEvent {
     match job.retry_policy.next_delay(job.retry_count) {
         Some(delay) => {
             //let now = std::time::Instant::now();
-            return JobEvent::Retry { retry_after: delay };
+            JobEvent::Retry { retry_after: delay }
         }
 
         None => {
-            return JobEvent::DeadLetter {
+            JobEvent::DeadLetter {
                 reason: "retries exhausted".to_string(),
-            };
+            }
         }
     }
 }
@@ -68,9 +68,9 @@ pub fn determine_reclaim_event(job: &Job) -> JobEvent {
         };
     }
 
-    return JobEvent::WorkerLost {
+    JobEvent::WorkerLost {
         reason: "worker was lost".to_string(),
-    };
+    }
 }
 
 //transition should be a pure function
@@ -216,7 +216,6 @@ pub fn transition(job: &mut Job, event: JobEvent) -> Result<(), TransitionError>
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, fs::Metadata};
 
     use super::*;
     use crate::job_data_structures::{Job, JobQueue, JobState, QueueError, RetryPolicy};
@@ -557,7 +556,7 @@ mod tests {
             requirements: std::collections::HashMap::new(),
             metadata: std::collections::HashMap::new(),
         };
-        let result = determine_next_event(&mut job);
+        let result = determine_next_event(&job);
 
         match result {
             JobEvent::Retry { retry_after } => {
@@ -583,7 +582,7 @@ mod tests {
             requirements: std::collections::HashMap::new(),
             metadata: std::collections::HashMap::new(),
         };
-        let result = determine_next_event(&mut job);
+        let result = determine_next_event(&job);
 
         assert_eq!(
             result,
@@ -612,7 +611,7 @@ mod tests {
             metadata: std::collections::HashMap::new(),
         };
 
-        let result = determine_next_event(&mut job);
+        let result = determine_next_event(&job);
 
         assert_eq!(
             result,
@@ -631,7 +630,7 @@ mod tests {
 
         let id2 = uuid::Uuid::now_v7();
         queue.enqueue(Job {
-            id: id1.clone(),
+            id: id1,
             job_type: "test_job".to_string(),
             payload: 2,
             priority: 1,
@@ -645,7 +644,7 @@ mod tests {
         });
 
         queue.enqueue(Job {
-            id: id2.clone(),
+            id: id2,
             job_type: "test_job".to_string(),
             payload: 2,
             priority: 2,
@@ -700,7 +699,7 @@ mod tests {
 
         let mut queue = JobQueue::new();
         queue.enqueue(Job {
-            id: id1.clone(),
+            id: id1,
             job_type: "test_job".to_string(),
             payload: 2,
             priority: 1,
@@ -714,7 +713,7 @@ mod tests {
         });
 
         queue.enqueue(Job {
-            id: id2.clone(),
+            id: id2,
             job_type: "test_job".to_string(),
             payload: 2,
             priority: 1,
@@ -774,7 +773,7 @@ mod tests {
 
     #[test]
     fn determine_reclaim_event_to_worker_lost() {
-        let mut job = Job {
+        let job = Job {
             id: uuid::Uuid::now_v7(),
             job_type: "test_job".to_string(),
             payload: 1,

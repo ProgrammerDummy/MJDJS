@@ -87,7 +87,7 @@ impl RetryPolicy {
     pub fn next_delay(&self, retry_count: u64) -> Option<std::time::Duration> {
         //returns a duration computed
         match self {
-            NoRetry => return None,
+            NoRetry => None,
 
             FixedDelay {
                 delay_ms,
@@ -97,9 +97,9 @@ impl RetryPolicy {
                     return None;
                 }
 
-                return Some(std::time::Duration::from_millis(
+                Some(std::time::Duration::from_millis(
                     ((*delay_ms as f64) * rand::random_range(0.75..1.25)) as u64,
-                )); //added jitter to fixed delay
+                )) //added jitter to fixed delay
             }
 
             ExponentialBackoff {
@@ -122,7 +122,7 @@ impl RetryPolicy {
                     return Some(std::time::Duration::from_millis(*max_delay_ms));
                 }
 
-                return Some(std::time::Duration::from_millis(computed_delay));
+                Some(std::time::Duration::from_millis(computed_delay))
             }
         }
     }
@@ -166,6 +166,12 @@ pub enum QueueError {
 
 pub struct JobQueue {
     heap: BinaryHeap<Job>,
+}
+
+impl Default for JobQueue {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl JobQueue {
