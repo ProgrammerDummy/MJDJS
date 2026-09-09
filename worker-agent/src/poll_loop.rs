@@ -10,249 +10,253 @@
 use std::{collections::HashMap, sync::{Arc, atomic::AtomicBool}};
 
 use parking_lot::Mutex;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, OwnedSemaphorePermit};
 
 use scheduler_core::proto::{self, JobOutcome};
 use tokio_util::sync::CancellationToken;
-use tonic::Request;
+use tonic::{Request, transport::Channel};
 use std::net::SocketAddr;
 
-use crate::executor::{ExecutorRegistry};
+use std::sync::atomic::Ordering;
+use proto::worker_service_client::WorkerServiceClient;
+
+
+use crate::executor::{ExecutorRegistry, JobError, JobExecutor};
 use crate::heartbeat::sleep_timer;
+
+
+const DRAIN_POLL_INTERVAL : std::time::Duration = std::time::Duration::from_millis(500);
+
+
+//basic helper functions for jobs, outcomes, and results to send through for report_result RPC
+//to help wih code conciseness and clarity
+
+fn extract_job(response: proto::RequestWorkResponse) -> Option<proto::Job> {
+    match response.result? {
+        proto::request_work_response::Result::Job(job) => Some(job),
+        proto::request_work_response::Result::None(_) => None,
+    }
+}
+
+fn outcome_from(exec_result: Result<u64, JobError>) -> proto::JobOutcome {
+    let outcome = match exec_result {
+        Ok(result) => proto::job_outcome::Outcome::Success(
+            proto::job_outcome::Success { result }
+        ),
+        Err(JobError::Cancelled) => proto::job_outcome::Outcome::Cancelled(
+            proto::job_outcome::Cancelled {}
+        ),
+        Err(e) => proto::job_outcome::Outcome::Failure(
+            proto::job_outcome::Failure { error: e.error_code_translation() }
+        ),
+    };
+    proto::JobOutcome { outcome: Some(outcome) }
+}
+
+fn build_result(job_id: Vec<u8>, worker_id: uuid::Uuid, outcome: proto::JobOutcome) -> proto::JobResult {
+    proto::JobResult {
+        job_id,
+        worker_id: worker_id.as_bytes().to_vec(),
+        job_outcome: Some(outcome),
+    }
+}
+
+
+
+//I/O helper functions for retrying for report_result and reconnection with exp backoff for channel connection to gRPC server
+
+async fn connect_with_backoff(addr: SocketAddr) -> WorkerServiceClient<Channel> {
+    //loops and attempts to connect with exponential backoff in retries
+    //will not return unless connection is successful
+
+    let mut retry_attempts = 0u32;
+    loop {
+        if(retry_attempts != 0) {
+            sleep_timer(retry_attempts).await;
+        }
+
+        let Ok(channel) = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
+            .await else {
+                retry_attempts += 1;
+                continue;
+        };
+
+        return proto::worker_service_client::WorkerServiceClient::new(channel)
+
+
+    }
+}
+
+/// Retries transport failures; gives up on semantic rejections
+/// (NOT_FOUND, FAILED_PRECONDITION, INVALID_ARGUMENT).
+async fn report_with_retry(
+    client: &mut WorkerServiceClient<Channel>,
+    result: proto::JobResult,
+) {
+
+    let mut retry_attempts = 0u32;
+
+    const MAX_REPORT_ATTEMPTS : u32 = 3;
+    
+
+    loop {
+        if retry_attempts != 0 {
+            sleep_timer(retry_attempts).await;
+        }  
+
+        match client.report_result(Request::new(result.clone())).await {
+            Ok(_) => return,
+            Err(e) => {
+                match e.code() {
+                    tonic::Code::Unknown | tonic::Code::DeadlineExceeded | tonic::Code::Unavailable => {
+                        if(retry_attempts < MAX_REPORT_ATTEMPTS) {
+                            retry_attempts += 1;
+                            continue;
+                        }
+
+                        return;
+                    }
+
+                    _ => {
+                        tracing::warn!("report request was rejected");
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+
+
+async fn run_job(
+    job: proto::Job,
+    job_uuid: uuid::Uuid,
+    executor: Arc<dyn JobExecutor>,
+    cancel: CancellationToken,
+    mut client: WorkerServiceClient<Channel>,
+    worker_uuid: Arc<Mutex<uuid::Uuid>>,
+    token_map: Arc<Mutex<HashMap<uuid::Uuid, CancellationToken>>>,
+    _permit: OwnedSemaphorePermit,   // held for the task's lifetime, dropped on return
+) {
+    let job_id = job.id.clone();
+    let exec_result = executor.execute(job.payload, cancel).await;
+
+    let worker_id = *worker_uuid.lock();
+    report_with_retry(&mut client, build_result(job_id, worker_id, outcome_from(exec_result))).await;
+
+    token_map.lock().remove(&job_uuid);
+} //spawned separately and detached
+
+
+
+
+async fn work_loop(
+    mut client: WorkerServiceClient<Channel>,
+    worker_uuid: Arc<Mutex<uuid::Uuid>>,
+    semaphore: Arc<Semaphore>,
+    token_map: Arc<Mutex<HashMap<uuid::Uuid, CancellationToken>>>,
+    main_token: &CancellationToken,
+    stop_accepting_work: Arc<AtomicBool>,
+    registry: Arc<ExecutorRegistry>,
+) {
+    let mut idle_polls = 0;
+
+    loop {
+        if idle_polls != 0 { //sleep with exponential backoff
+            sleep_timer(idle_polls).await; 
+        }
+
+        if stop_accepting_work.load(Ordering::Relaxed) { //load in latest status of stop_accepting_work
+            //if its true, then the jobs must drain so dont request any more work but stay alive for jobs to finish
+            tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
+            continue;
+        }
+
+        let Ok(permit) = semaphore.clone().acquire_owned().await else {
+            return;   // semaphore closed, which is permanent on non-retryable
+        };
+
+        let worker_id = *worker_uuid.lock();
+        let request = Request::new(proto::AssignedWorkerId {
+            worker_id: worker_id.as_bytes().to_vec(),
+        });
+
+        let response = match client.request_work(request).await {
+            Ok(r) => r.into_inner(),
+            Err(status) => {
+                //FAILED_PRECONDITION here means stale registration 
+                //heartbeat.rs should fix this by itself so backoff for now regardless of what kind of error 
+                idle_polls += 1;
+                continue;
+            }
+        };
+
+        let Some(job) = extract_job(response) else {
+            idle_polls += 1;
+            continue;
+        };
+
+        let job_uuid = match uuid::Uuid::from_slice(&job.id) {
+            Ok(u) => u,
+            Err(_) => { 
+                tracing::warn!(worker_id = %worker_id, "invalid job uuid was detected at worker");
+                idle_polls += 1; 
+                continue; 
+            }   
+        };
+
+        let Some(executor) = registry.get(&job.job_type) else {
+            let worker_id = *worker_uuid.lock();
+            let outcome = outcome_from(Err(JobError::NoExecutor));
+            report_with_retry(&mut client, build_result(job.id, worker_id, outcome)).await;
+            idle_polls += 1;
+            continue;
+        };
+
+        idle_polls = 0;
+
+        let cancel = main_token.child_token();
+        token_map.lock().insert(job_uuid, cancel.clone());
+
+        tokio::spawn(run_job(
+            job, job_uuid, executor, cancel,
+            client.clone(), worker_uuid.clone(), token_map.clone(), permit,
+        ));
+    }
+}
 
 pub async fn poll_loop(
     addr: SocketAddr,
-    worker_uuid: Arc<Mutex<uuid::Uuid>>, 
-    max_concurrent_jobs: u32, 
+    worker_uuid: Arc<Mutex<uuid::Uuid>>,
+    max_concurrent_jobs: u32,
     token_map: Arc<Mutex<HashMap<uuid::Uuid, CancellationToken>>>,
     main_token: CancellationToken,
     stop_accepting_work: Arc<AtomicBool>,
-    exec_registry: Arc<ExecutorRegistry>, 
-    ) {
+    registry: Arc<ExecutorRegistry>,
+) {
+    let semaphore = Arc::new(Semaphore::new(max_concurrent_jobs as usize));
 
     tokio::select! {
-        _ = main_token.cancelled() => {
-
-        },
-
+        _ = main_token.cancelled() => {}
         _ = async {
+            loop { //outer connection loop
 
-            let mut connection_failures = 0; //serves as the outer loops retry for connection to server and determines timeout times
+                let client = connect_with_backoff(addr).await;
 
-            loop {
-                
-                if connection_failures != 0 {
-                    sleep_timer(connection_failures).await;
-                }
-
-
-                let displayable_worker_id = {
-                    let guard = worker_uuid.lock();
-                    guard.clone()
-                };
-
-                let channel = match tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
-                    .unwrap()
-                    .connect()
-                    .await 
-                {
-
-                    Ok(channel) => {
-                        channel
-                        
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            worker_id = %displayable_worker_id,
-                            "poll_loop could not connect to scheduler server, retrying"  
-                        );
-                        connection_failures += 1;
-                        continue;
-                    }
-                };
-
-                connection_failures = 0;
-
-                let mut worker_client = proto::worker_service_client::WorkerServiceClient::new(channel);
-
-                //create a semaphore from max_concurrent_jobs
-                let current_jobs = Arc::new(Semaphore::new(max_concurrent_jobs as usize));
-                
-                
-                //always have the cancellationtoken ready
-                //race it with sleeps or entire loop?
-
-                
-                let mut empty_queue_polls = 0; //serves as the retry counter for the inner loop's timeouts
-
-                loop {
-                    
-
-                    if empty_queue_polls != 0 {
-                        sleep_timer(empty_queue_polls).await;
-                    }
-                    
-                    //check if we have space by incrementing job pool semaphore
-
-                    let Ok(job_slot) = current_jobs.clone().acquire_owned().await else {
-                        tracing::warn!("acquiring current_jobs semaphore failed");
-                        empty_queue_polls += 1;
-                        continue;
-                    };
-
-                    let request = Request::new(proto::AssignedWorkerId { worker_id: displayable_worker_id.as_bytes().to_vec()});
-
-                    let Ok(job) = worker_client.request_work(request).await else {
-                        empty_queue_polls += 1;
-                        continue;
-                    };
-
-                    let job = match job.into_inner().result {
-                        Some(req_work_response) => {
-
-                            if let proto::request_work_response::Result::Job(job) = req_work_response {
-                                Some(job)
-                            }
-
-                            else {
-                                None
-                            }
-                        },
-                        
-                        None => {
-                            None
-                        },
-                    };
-
-
-                    let Some(job) = job else {
-                        empty_queue_polls += 1;
-                        continue;
-                    };
-
-                    let executor = exec_registry.get(&job.job_type);
-
-                    let Some(executor) = executor else {
-                        //report that there was no executor for specific job type
-
-                        //worker_client.report_result().await;
-
-
-                        empty_queue_polls += 1;
-                        continue;
-                    };
-
-                    let child_token = main_token.child_token();
-
-                    let job_uuid = match uuid::Uuid::from_slice(&job.id) {
-                        Ok(uuid) => {
-                            uuid
-                        }
-
-                        Err(_) => {
-                            tracing::warn!(
-                                worker_id = %displayable_worker_id,
-                                "invalid job uuid detected at worker"
-                            );
-
-                            break;
-                            //i should just log this and continue
-                        }
-                    };
-
-
-                    {
-                        let mut token_map_guard = token_map.lock();
-                        token_map_guard.insert(job_uuid, child_token.clone());
-                    }  
-
-                    empty_queue_polls = 0;
-
-                    let mut worker_client_clone = worker_client.clone();
-
-                    let worker_uuid_clone = worker_uuid.clone();
-
-                    let token_map_clone = token_map.clone();
-
-                    tokio::spawn(async move {
-                        let exec_result = executor.execute(job.payload, child_token).await;
-                        
-                        //report the result through report_result RPC using worker_client_clone, and remove from token_map
-                        //also translate the error type into an error code after getting exec_result
-
-                        let job_outcome = match exec_result {
-                            Ok(success_num) => {
-                                Some(JobOutcome {
-                                    outcome: Some(proto::job_outcome::Outcome::Success(
-                                        proto::job_outcome::Success { result: success_num}
-                                    ))
-                                })      
-                            }
-
-                            Err(job_error) => {
-
-                                if job_error.error_code_translation() == 103 {
-                                    Some(JobOutcome { 
-                                        outcome: Some(proto::job_outcome::Outcome::Cancelled(
-                                            proto::job_outcome::Cancelled {}
-                                        )) 
-                                    })
-                                }
-
-                                else {
-                                    Some(JobOutcome { 
-                                        outcome: Some(proto::job_outcome::Outcome::Failure(
-                                            proto::job_outcome::Failure { error: job_error.error_code_translation() }
-                                        )) 
-                                    })
-                                }
-                            }
-                        };
-
-                        let worker_id = {
-                            let worker_uuid_guard = worker_uuid_clone.lock();
-                            *worker_uuid_guard
-                        };
-
-                        let request = proto::JobResult {
-                            job_id: job.id,
-                            worker_id: worker_id.as_bytes().to_vec(),
-                            job_outcome
-                        };
-
-                        //check returned value from server
-
-                        worker_client_clone.report_result(Request::new(request)).await;
-
-                        
-                        {
-                            //remove from token mapping
-                            let mut token_map_guard = token_map_clone.lock();
-                            token_map_guard.remove(&job_uuid);
-                        }
-
-
-                        drop(job_slot); //drop the semaphore within the spawned task after job finishes
-                    });
-
-                    
-                    /*
-                    
-                    idea: 
-                    - to prevent the blocking nature of .join, i can use a mpsc channel and send the sender side to another spawned task then have it feed in the result?
-                    - and to 
-                    */ 
-
-                }
-            
+                work_loop( //inner work loop
+                    client, worker_uuid.clone(), semaphore.clone(),
+                    token_map.clone(), &main_token,
+                    stop_accepting_work.clone(), registry.clone(),
+                ).await;
+                //if the work_loop returns, then the connection died so reconnect
             }
-
         } => {}
     }
-
-
 }
-
 
 /*
 
