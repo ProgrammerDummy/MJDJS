@@ -50,11 +50,9 @@ pub fn determine_next_event(job: &Job) -> JobEvent {
             JobEvent::Retry { retry_after: delay }
         }
 
-        None => {
-            JobEvent::DeadLetter {
-                reason: "retries exhausted".to_string(),
-            }
-        }
+        None => JobEvent::DeadLetter {
+            reason: "retries exhausted".to_string(),
+        },
     }
 }
 

@@ -256,9 +256,7 @@ pub fn proto_to_job_status(
                     Err(_e) => Err(ConversionError::NegativeDuration),
                 },
 
-                None => {
-                    Err(ConversionError::NoDuration)
-                }
+                None => Err(ConversionError::NoDuration),
             }
         }
 
