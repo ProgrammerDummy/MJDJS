@@ -43,6 +43,8 @@ pub enum JobError {
     ExecutionFailure(u64),
     #[error("Job was cancelled")]
     Cancelled,
+    #[error("No executor for Job's job_type")]
+    NoExecutor,
 }
 
 
@@ -61,6 +63,9 @@ impl JobError {
             },
             JobError::Cancelled => {
                 103
+            }
+            JobError::NoExecutor => {
+                104
             }
         }
     }
