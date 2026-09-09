@@ -538,7 +538,7 @@ mod tests {
     #[test]
     fn expected_return_retry() {
         let id = uuid::Uuid::now_v7();
-        let mut job = Job {
+        let job = Job {
             id,
             job_type: "test_job".to_string(),
             payload: 1,
@@ -567,7 +567,7 @@ mod tests {
     #[test]
     fn expected_return_deadletter() {
         let id = uuid::Uuid::now_v7();
-        let mut job = Job {
+        let job = Job {
             id,
             job_type: "test_job".to_string(),
             payload: 1,
@@ -590,7 +590,7 @@ mod tests {
         );
 
         let id = uuid::Uuid::now_v7();
-        let mut job = Job {
+        let job = Job {
             id,
             job_type: "test_job".to_string(),
             payload: 1,
