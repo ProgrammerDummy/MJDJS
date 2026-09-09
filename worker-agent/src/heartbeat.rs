@@ -55,7 +55,7 @@ pub async fn send_heartbeats(addr: SocketAddr, worker_id: Arc<Mutex<uuid::Uuid>>
             Err(e) => {
                 tracing::warn!(
                     worker_id = %displayable_worker_id,
-                    "could not connect to scheduler server, retrying"
+                    "heartbeat could not connect to scheduler server, retrying"
                 );
                 retry_count += 1;
                 continue;
