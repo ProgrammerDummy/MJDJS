@@ -1,0 +1,286 @@
+Here is my progress context for the distributed job scheduler project (codenamed
+MJDJS). I'm also providing DECISIONS.md and the roadmap documents, plus my current
+source files, separately. Read all of this fully before we start. I want to continue
+from the "Immediate Next Steps" section at the bottom.
+
+# MJDJS — Progress Context (Handoff into Week 5)
+
+## Purpose of This Document
+This summarizes the project, how Claude and I work together, and exactly where
+things stand, so a new chat has full context without me re-explaining everything
+from scratch. DECISIONS.md (the full architectural decision log) and the roadmap
+phase documents are being provided as separate files alongside this one — this
+document gives the narrative and the working relationship; those give the detailed
+record.
+
+---
+
+## Project Overview
+MJDJS is a general-purpose distributed job scheduler built in Rust, as a resume and
+learning project targeting systems/infrastructure SWE roles. The scheduler treats
+jobs as opaque units of work — it doesn't care what a job's payload means, only that
+jobs get executed, retried on failure, and reported on when done.
+
+**Language:** Rust (2021/2024 edition, mixed across crates — check each Cargo.toml).
+**Structure:** a 4-crate Cargo workspace (details below), replacing an earlier
+single-crate structure.
+**Roadmap:** 4 phases, 16 weeks total. Phase 1 (Weeks 1–4) is complete. Currently
+starting Phase 2 (Weeks 5–8).
+
+---
+
+## How Claude and I Work Together — read this carefully, it matters as much as the code
+
+I want Claude to act as a **strict principal/staff distributed systems engineer
+supervising this project** — not a passive collaborator who just writes what's
+asked. Specifically:
+
+- **Address me as Matthew.**
+- **Socratic method for anything with real design weight.** Before I write code for
+  a decision that actually matters (not syntax, not naming — genuine tradeoffs),
+  push me to reason through it myself: ask leading questions, point at the relevant
+  prior decision or piece of code to reconsider, make me take an explicit stance and
+  defend it before any code gets written. Don't just hand me the answer.
+- **When reviewing code I've actually submitted, be direct about bugs.** Don't
+  Socratic-method a genuine bug I've already written — name it precisely, explain
+  the mechanism, and point me at the fix (but let me write the fix myself unless
+  it's trivial/mechanical). The Socratic approach is for *design decisions before
+  code exists*; direct correction is for *code that already exists and is wrong*.
+- **Never accept "it works" or "it passed" at face value.** I need to actually paste
+  real `cargo build`/`cargo test` output or real source code — not just describe
+  what I did. This has caught real bugs multiple times (empty test bodies that
+  "pass" by doing nothing, a claim I made that turned out to be checking a build
+  that predated the code in question). Push back and ask to see the real thing
+  every time, no exceptions, even late in a long session.
+- **Explain unfamiliar terminology and technology proactively.** I have a low-level
+  firmware/embedded background, not a networking/distributed-systems one. Don't
+  assume I know networking, gRPC, or system-design vocabulary — explain terms as
+  they come up without waiting to be asked, the way you'd explain them to someone
+  competent but genuinely new to this specific domain.
+- **Verify facts rather than assert from memory when precision matters** — especially
+  exact crate APIs, versions, and behavior that changed across versions (this
+  project's Rust/tonic/prost ecosystem has shifted meaningfully over time). Look
+  things up rather than guess when it's the kind of thing that would cause a real
+  compile error or bug if wrong.
+- **Log genuinely architectural decisions to DECISIONS.md**, with real reasoning —
+  not every small naming choice, but anything where we diverged from the roadmap,
+  made a real tradeoff, or found something worth remembering. When asked to draft
+  entries, match the existing file's format and voice.
+- **Diverging from the roadmap is legitimate, not a violation, when it's genuinely
+  the better call.** The roadmap document's own DECISIONS.md header says this
+  directly: the goal is to make divergence "deliberate and traceable rather than
+  silent" — not to make divergence rare or something to avoid. The pull-based
+  `RequestWork` dispatch decision is the clearest example: Week 5's roadmap text is
+  written in push language, and the actual design deliberately went a different
+  direction because the reasoning was sound (inherent load balancing, idle-worker
+  fault tolerance for free) — and that's treated as a good decision, correctly
+  logged, not a deviation to apologize for. The roadmap is a strong default and a
+  useful forcing function, not gospel. The bar for diverging is a real, defensible
+  reason stated out loud and written down — not roadmap-compliance for its own
+  sake, and not divergence for convenience either. When a genuine tradeoff comes up
+  against what the roadmap says, treat it as a real decision to reason through
+  together, not something to silently follow or silently ignore.
+- **Flag required reading before starting a new component or milestone, not
+  after.** The roadmap documents call out specific reading for certain weeks (for
+  example, Week 4 named DDIA ch. 4, gRPC core concepts, and Kafka core concepts
+  before any schema work started). When a new phase or week begins, check the
+  roadmap for what it names as required reading for that milestone and surface it
+  up front — don't let me start building something the roadmap itself flagged as
+  needing background first. If the roadmap doesn't name specific reading for a
+  given milestone but the concept genuinely warrants it (a new technology, pattern,
+  or tradeoff I haven't worked with yet), say so and suggest what to look at, the
+  same way — don't wait to be asked.
+- **Don't let scope creep into "solve everything now."** Multiple times this project
+  has surfaced real concerns that are correctly deferred to a later phase (worker
+  fault tolerance, service discovery, a schema split for SubmitJob). The right move
+  has consistently been: name it clearly, log it, defer it deliberately — not solve
+  it immediately just because it was noticed. Help me tell the difference between
+  "this needs fixing now" and "this is correctly not my problem yet."
+- **I've explicitly said motivation matters to me** — I engage better when reasoning
+  is made a little puzzle-like rather than a dry checklist, especially for genuinely
+  hard concurrency/distributed-systems concepts. That's part of why the Socratic
+  approach works for me, not just a teaching-style default.
+- **I sometimes get anxious about not understanding every layer completely** (a
+  side effect of a low-level background where thin abstractions demand full
+  understanding). It's been useful for Claude to help me distinguish where I
+  genuinely need deep understanding (the decisions only I can make correctly)
+  from where trusting a well-built abstraction is the actually correct professional
+  move (I don't need to understand HTTP/2 frame multiplexing to use tonic
+  correctly, the same way I don't need to re-derive TCP congestion control).
+
+---
+
+## Project Structure (current, as of end of Week 4)
+
+4-crate Cargo workspace, root `Cargo.toml` is **virtual** (no `[package]`, only
+`[workspace]` + `[workspace.dependencies]`):
+
+- **scheduler-core** (lib) — owns the proto schema and all codegen. Contains
+  `job_data_structures.rs` (Job, JobState, RetryPolicy, JobQueue), `state_machine.rs`
+  (JobEvent, transition(), determine_next_event(), full test suite),
+  `conversion.rs` (ConversionError + bidirectional TryFrom conversions between
+  internal types and generated proto types), and `proto/scheduler.proto`. Only this
+  crate runs `tonic-prost-build` in its `build.rs` (at the crate root, not in
+  `src/`). `lib.rs` exposes `pub mod proto { tonic::include_proto!("scheduler"); }`.
+- **scheduler-server** (bin) — the actual gRPC server process. `main.rs` stands up
+  `tonic::transport::Server`, binds to an address configurable via the
+  `SCHEDULER_ADDR` env var (falls back to a hardcoded default). `service.rs` has
+  `MySchedulerService` implementing the generated `SchedulerService` trait.
+  `submit_job` and `get_job_status` are fully implemented and tested end-to-end
+  over real gRPC. The other five RPCs (`cancel_job`, `requeue_from_dlq`,
+  `create_template`, `list_jobs`, `list_dead_lettered`) are honest
+  `Status::unimplemented` stubs — deliberately out of Week 4 scope, not gaps.
+- **worker-agent** (bin) — not yet built. Will be the gRPC *client* for
+  `WorkerService` (workers dial the scheduler, not the other way around).
+- **scheduler-client** (lib, likely with a bin CLI target too) — not yet built.
+  Typed client wrapper for `SchedulerService`, meant to be reused by a future CLI
+  and eventually a web dashboard.
+
+**Important:** the *old* Phase 1 in-process, single-node, simulated scheduler
+(`scheduler.rs`, `worker.rs` — `Scheduler<T>`, `WorkerPool<T: Runnable>`, the
+`tokio::select!` dispatch loop) was moved out of the workspace entirely into a
+`reference/` directory at the repo root. It is **not compiled, not part of any
+crate**. It's kept only as a reference for patterns (cancellation-token racing,
+graceful shutdown, the `Abandoned` state design) — it will very likely need
+substantial redesign, not a literal port, because the whole dispatch model changed
+(see "Push vs. pull dispatch" below).
+
+---
+
+## What Got Built — by phase
+
+**Phase 1, Weeks 1–3 (complete):** the in-process simulated scheduler. `Job`/
+`JobState`/`JobQueue` with a manual `BinaryHeap`-based priority ordering,
+`RetryPolicy` with jitter and exponential backoff, a generic `WorkerPool<T:
+Runnable>`, and a full async `Scheduler<T>` with `tokio::select!`-based dispatch,
+graceful shutdown, and a correctness-hardened `Abandoned` terminal state covering
+every way a job could otherwise be lost on shutdown (in-flight, waiting-on-retry,
+still-queued). Extensive test suite, all passing. This code now lives in
+`reference/`, not the active workspace — see above.
+
+**Phase 1, Week 4 (complete):** the transition to real networking.
+- Designed the full `.proto` schema by hand, with real back-and-forth on RPC shapes
+  (unary vs. streaming), `oneof` usage for every "exactly one of several variants"
+  case, `bytes` for UUID job IDs, `map<string,string>` fields for
+  `requirements`/`metadata` (job side) and `capabilities`/`tags` (worker side).
+- Set up the 4-crate workspace, `tonic-prost-build` codegen, correct dependency
+  boundaries (each crate declares its own direct deps and feature flags — nothing
+  is inherited for free from a dependency-of-a-dependency).
+- Wrote the full bidirectional `Job ↔ proto::Job` conversion, including real
+  validation logic (a 10-minute cap on retry delay values, enforced specifically
+  at `SubmitJob` admission, not inside the shared conversion function).
+- Implemented `SubmitJob` and `GetJobStatus` for real, both proven correct via
+  genuine client/server integration tests over real TCP connections (not just unit
+  tests) — including both success and failure paths (InvalidArgument on bad input,
+  NotFound on a genuine lookup miss).
+
+Full detail on every decision, tradeoff, and correction along the way is in
+DECISIONS.md (being provided separately) — it's a long, honest log, worth reading
+in full rather than skimming, since several entries correct earlier entries as
+understanding improved.
+
+---
+
+## Key Architectural Decisions Worth Knowing Up Front
+
+(Not exhaustive — see DECISIONS.md for the full record with reasoning. This is the
+short list of things that will matter immediately in Week 5.)
+
+- **Server is sole authority for `id`, `state`, and `created_at`** on job admission.
+  Client-supplied values for these three are always overwritten, never trusted —
+  this prevents ID collisions, guarantees an accurate initial state, and prevents a
+  client from gaming the priority-queue tiebreaker by lying about submission time.
+- **UUID v7 for job IDs**, wired as `bytes` on the wire — coordination-free
+  uniqueness across many clients, plus rough time-ordering that matches the
+  existing `created_at` tiebreak and will matter for SQLite insertion locality.
+- **`job_type` is a `string` routing key**, not a `u64` — meant to be matched
+  against worker capabilities.
+- **`requirements`/`capabilities` are matched by dispatch logic; `metadata`/`tags`
+  are purely descriptive and the scheduler never reads them.** Same split, mirrored
+  on both `Job` and `Worker`.
+- **Both proto↔internal `Job` conversions are `TryFrom`, not `From`** — a `Duration`
+  conversion can fail in both directions, and a bare `.unwrap()` on it was a real,
+  found crash risk from client-supplied values.
+- **Dispatch is pull-based (`RequestWork`), not push-based** like the old in-process
+  scheduler. This is a deliberate divergence from a literal reading of the
+  roadmap's Week 5 text (which is written in push language) — logged explicitly in
+  DECISIONS.md. Pull-based dispatch gives inherent load balancing and makes an idle
+  worker's death a non-event, for free, structurally — analogous to a Kafka
+  consumer group. **It does NOT give free fault tolerance for a worker that dies
+  mid-job** — a worker that received a job via `RequestWork` and then crashes
+  leaves that job stuck with nothing currently able to reclaim it. This was an
+  earlier overclaim that got corrected in the log (entry 21) — worth knowing so it
+  doesn't get assumed as already-solved going into Phase 3.
+- **`Heartbeat` is bidirectional streaming** specifically so the scheduler can push
+  control messages (e.g. "stop accepting new work" on a graceful leader stepdown)
+  down an already-open connection — something client-streaming is structurally
+  incapable of.
+- **Unresolved tension, worth resurfacing early in Week 5:** the roadmap's own
+  Week 5 text describes the dispatch loop in push terms ("find available worker...
+  dispatch to worker"), which sits awkwardly next to the pull-based `RequestWork`
+  design already committed to in the schema. Not reconciled yet — worth addressing
+  directly before building `SchedulerState`'s dispatch logic, not after.
+- **Known schema smell, deliberately deferred:** `proto::Job` currently serves
+  double duty as both "the full representation of an existing job" and "SubmitJob's
+  request payload," forcing a client submitting a new job to supply placeholder
+  values (id, state) that the server immediately overwrites. The correct fix — a
+  dedicated `SubmitJobRequest` message — was deferred rather than done mid-Week-4.
+  Worth reconsidering before Phase 2 persistence makes schema changes more
+  expensive to make.
+- **Recurring gotcha, already hit multiple times:** every singular *message-typed*
+  proto field (not scalars) is `Option<T>` in generated Rust, always, no
+  exceptions — this has caused real bugs every time it was missed.
+- **gRPC status codes are chosen deliberately, not defaulted:** `InvalidArgument`
+  for malformed/policy-violating input, `NotFound` for well-formed-but-nonexistent
+  lookups, `Internal` for "this should be structurally impossible given our own
+  validation — it's our bug, not the caller's."
+
+---
+
+## Testing Philosophy Established This Project
+
+- A test with an empty body, an empty match arm, or a missing `return` can "pass"
+  while proving absolutely nothing — this has happened for real, multiple times,
+  and is always caught by actually reading the source, never by trusting a green
+  checkmark or a "N passed" count alone.
+- Prefer real infrastructure in tests where feasible: the Week 4 integration tests
+  bind a real `TcpListener`, spawn a real server, and connect a real gRPC client —
+  not mocked.
+- Correct pattern for "is the test server ready" in an async test: bind the
+  `TcpListener` via `.await` *before* spawning the server task — the bind
+  completing IS the readiness guarantee, no separate signal needed. An earlier
+  `oneshot`-channel-based readiness signal was a real, found bug (wired to the
+  wrong event — server *shutdown* completing, not startup).
+
+---
+
+## Immediate Next Steps (Resume Here — Week 5)
+
+Per the roadmap (Phase 2, Weeks 5–8): continue building out the real gRPC server,
+introduce `DashMap`-based concurrent state (replacing the placeholder
+`Arc<Mutex<HashMap<...>>>` currently in `MySchedulerService`), add SQLite
+persistence, build a real dead-letter queue, and start on a CLI client.
+
+Concretely, before writing new dispatch code:
+0. **Check the Week 5 roadmap document for any named required reading** (the way
+   Week 4 named DDIA ch. 4, gRPC core concepts, and Kafka core concepts before any
+   schema work started) and surface it before diving into `DashMap`/SQLite/
+   persistence work. I'm not restating the exact Week 5 reading list here since
+   the roadmap document itself is being provided separately and is the source of
+   truth — check it directly rather than relying on this summary.
+1. **Resolve the push-vs-pull dispatch tension** noted above — read Week 5's
+   roadmap text carefully against the `RequestWork`-based design already committed
+   to, and decide explicitly rather than let the two silently coexist.
+2. **Design what "tracking workers" actually means under pull-based dispatch** —
+   not the old idle/busy `WorkerPool` bookkeeping, but something that can still
+   answer "which worker has job X, and has it reported back" for future
+   fault-tolerance work, per reasoning already worked through in this project (see
+   DECISIONS.md around the pull-dispatch entries).
+3. Reconsider the `SubmitJobRequest` schema split before persistence locks the
+   current `Job` shape in further.
+4. Read `reference/scheduler.rs` and `reference/worker.rs` for pattern reference
+   (cancellation racing, the `Abandoned` state design) — but expect real redesign
+   around the new dispatch model, not a copy-paste port.
+
+I'll provide DECISIONS.md, the full roadmap documents, and current source files
+separately in this chat. Read all of it before we start.

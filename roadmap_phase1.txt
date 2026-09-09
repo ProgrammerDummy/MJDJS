@@ -1,0 +1,653 @@
+================================================================================
+PHASE 1 — RUST FOUNDATIONS + DOMAIN CONCEPTS
+Weeks 1–4 | Before internship | 6 hrs/day | Full-time focus
+================================================================================
+GOAL: Learn Rust deeply enough to build real async systems. No project code yet.
+Read how real job schedulers work in parallel with Rust study. By week 4 you
+should understand both the language and the domain before touching the project.
+
+CRITICAL RULE: Do NOT skip to project code early. Every async bug in weeks 5–16
+traces back to gaps built here. Your firmware background compresses weeks 1 and 4.
+Week 3 (async) is the wall — everyone hits it regardless of background.
+
+READ + BUILD in parallel each day. Morning: conceptual reading. Afternoon: Rust.
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WEEK 1 — Ownership, borrowing, error handling, job state machine
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Daily hours: 6 hrs | Split: 2h conceptual reading · 2.5h Rust study · 1.5h coding
+Milestone: Can model a Job as a Rust struct with a state machine enum, implement
+all valid state transitions with full error handling, and explain ownership without
+looking anything up.
+
+── READ ────────────────────────────────────────────────────────────────────────
+
+[MUST] DDIA Chapter 1 — Reliable, Scalable, Maintainable
+  Book: "Designing Data-Intensive Applications" by Martin Kleppmann
+  Read this first, before anything else in the project.
+  Understand: reliability (tolerating faults), scalability (handling growth),
+  maintainability (operating and evolving systems).
+  Every design decision in your scheduler maps to one of these three.
+  Questions to answer:
+    - Which properties of a job scheduler are about reliability?
+    - Which are about scalability?
+    - What is the difference between a fault and a failure?
+
+[MUST] Celery Architecture Overview
+  URL: docs.celeryq.dev/en/stable/getting-started/introduction.html
+  Read: "What do I need?" and "Celery is..." sections.
+  Celery is the most widely deployed Python job scheduler. Learn its vocabulary:
+  broker (message queue), worker (process that executes jobs), task (unit of work),
+  result backend (where results are stored).
+  Questions to answer:
+    - What is a broker? What is a worker? What is a result backend?
+    - How does Celery know when a job is done?
+    - How does Celery know when a job failed?
+
+── RUST STUDY ──────────────────────────────────────────────────────────────────
+
+[MUST] The Rust Book — Chapters 4, 6, 9
+  URL: doc.rust-lang.org/book
+  Chapter 4 (ownership): Read twice. Most important chapter in the book.
+  Chapter 6 (enums/match): Your JobState is an enum. Read carefully.
+  Chapter 9 (error handling): No unwrap() anywhere from day one.
+  After chapter 4: explain stack vs heap allocation out loud to yourself.
+  After chapter 6: write a match statement handling every arm of an enum.
+
+[MUST] Rustlings exercises 1–50
+  URL: github.com/rust-lang/rustlings
+  Rule: Read every compiler error message FULLY before changing anything.
+  The compiler is teaching you — let it.
+  Redo any exercise you got wrong on the first attempt.
+  Focus especially on: move semantics, borrowing, the enums section.
+  After finishing: write the 3 borrowing rules in your own words.
+
+[REC] Too Many Linked Lists (free online book)
+  URL: rust-unofficial.github.io/too-many-lists
+  The best ownership tutorial through deliberate pain. Read alongside the
+  priority queue exercise below. Explains why Box<T>, Rc<T>, RefCell<T> exist.
+
+── BUILD ────────────────────────────────────────────────────────────────────────
+
+[MUST] Build the Job struct and JobState state machine
+  Define in Rust:
+    struct Job {
+      id: String,          // will become UUID v7 in the project
+      job_type: String,
+      payload: Vec<u8>,
+      priority: u32,       // 1–10, higher = dispatched first
+      retry_count: u32,
+      retry_policy: RetryPolicy,  // will define in week 2
+      created_at: u64,     // Unix ms
+      state: JobState,
+    }
+
+    enum JobState {
+      Queued,
+      Running { worker_id: String, started_at: u64 },
+      Succeeded { completed_at: u64 },
+      Failed { error: String, attempts: u32 },
+      Retrying { retry_at: u64, attempts: u32 },
+      DeadLettered { reason: String },
+    }
+
+  Implement: Display, Debug, Clone on all types.
+  Implement: fn transition(current: JobState, event: JobEvent) -> Result<JobState, TransitionError>
+  Invalid transitions (e.g. Succeeded → Running) return Err — never panic.
+
+  Valid transitions to implement:
+    Queued → Running       (event: Dispatched { worker_id })
+    Running → Succeeded    (event: Completed)
+    Running → Failed       (event: WorkerError { error })
+    Failed → Retrying      (event: RetryScheduled { retry_at })
+    Failed → DeadLettered  (event: ExhaustedRetries { reason })
+    Retrying → Queued      (event: RetryDue)
+    Running → Queued       (event: WorkerDied — heartbeat timeout)
+    Queued → Cancelled     (event: Cancelled)
+    Running → Cancelled    (event: Cancelled — via CancellationToken)
+
+[MUST] Build the priority queue using BinaryHeap
+  Wrap BinaryHeap<QueuedJob> where QueuedJob implements Ord.
+  Higher priority = dequeued first (max-heap behavior).
+  Implement: enqueue, dequeue, peek, len, is_empty.
+  
+  struct QueuedJob {
+    priority: u32,
+    created_at: u64,  // tiebreaker: older jobs first
+    job_id: String,
+  }
+  impl Ord for QueuedJob {
+    // higher priority wins, then earlier created_at
+  }
+
+── TEST ─────────────────────────────────────────────────────────────────────────
+
+[MUST] Test every state transition — valid AND invalid
+  Write a test for every valid transition (at least 8).
+  Write a test for every invalid transition (at least 10).
+  Invalid transitions must return a descriptive Err, never panic.
+  Run: cargo test -- --nocapture to see transition logs.
+  Write 15 unit tests on the priority queue:
+    - empty dequeue returns None
+    - equal priority preserves FIFO order (older job first)
+    - priority inversion works correctly (lower number = lower priority)
+
+── CRATES THIS WEEK ─────────────────────────────────────────────────────────────
+  std only — no external crates this week.
+
+── RISKS ────────────────────────────────────────────────────────────────────────
+  [RED] Skipping the state machine — every scheduler bug in weeks 5–12 is a
+  state transition you didn't model correctly. Model it now while it's small.
+
+  [AMBER] Reading Celery docs without building anything — read it, then
+  immediately implement a tiny Rust version of the concept. Don't separate them.
+
+── NOTES ────────────────────────────────────────────────────────────────────────
+  Your firmware background: You already understand stack vs heap, pointer
+  ownership, and why double-free is a bug. Rust's borrow checker mechanically
+  enforces rules you've been enforcing manually in C. The concepts aren't new —
+  the enforcement is just automatic now. You'll move through week 1 faster than
+  a pure software person.
+
+  Why read Celery this week: You're building exactly what Celery is. Reading how
+  Celery models brokers, workers, and tasks gives you a mental map before you
+  design your own. When you make design decisions in weeks 5–8, you'll have a
+  reference: "Celery does X this way — do I want the same tradeoff?"
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WEEK 2 — Traits, generics, retry logic, worker pool abstraction
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Daily hours: 6 hrs | Split: 1.5h conceptual reading · 2h Rust study · 2.5h coding
+Milestone: Generic WorkerPool<T> and a fully typed RetryPolicy that produces
+correct exponential backoff delays with jitter — both tested with property tests.
+
+── READ ────────────────────────────────────────────────────────────────────────
+
+[MUST] AWS Builders' Library — Timeouts, Retries, and Backoff with Jitter
+  URL: aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter
+  Read in full. Written by Amazon engineers who designed exactly the retry system
+  you're building.
+  Questions to answer after reading:
+    - Why does adding randomness (jitter) to retry delays matter?
+    - What is the thundering herd problem?
+    - How does retry jitter prevent the thundering herd?
+    - What timeout should you use for your gRPC RPCs?
+  KEY TAKEAWAY: Without jitter, all retrying jobs hit the scheduler simultaneously
+  after each backoff interval. Add jitter (±25%) to every retry delay.
+
+[MUST] Temporal Concepts — Workflows, Activities, Workers
+  URL: docs.temporal.io/concepts
+  Read: "what is a workflow", "what is an activity", "what is a worker"
+  Temporal's conceptual model is the cleanest in the industry for job scheduling.
+  Questions to answer:
+    - What is the difference between a workflow and a job?
+    - How does Temporal's activity retry policy compare to your week 1 design?
+    - What does "durable execution" mean?
+
+── RUST STUDY ──────────────────────────────────────────────────────────────────
+
+[MUST] The Rust Book — Chapters 10, 13
+  URL: doc.rust-lang.org/book
+  Chapter 10 (generics/traits/lifetimes): The densest chapter in the book.
+  Read it twice. Your WorkerPool<T> and RetryPolicy are both generic types.
+  Chapter 13 (closures/iterators): You'll use iterator chains constantly.
+  After ch 10: Write 3 programs using generics and 3 using dyn Trait.
+            Understand when each is appropriate.
+  After ch 13: Re-implement map, filter, flat_map from scratch (no std).
+
+[MUST] burntsushi error handling post
+  Google: "burntsushi rust error handling 2022"
+  Author: Andrew Gallant (author of ripgrep)
+  Read in full. Permanently clarifies thiserror vs anyhow vs custom enums.
+  Decision for your project:
+    - scheduler-core (lib): use thiserror for typed errors
+    - scheduler-server (bin): use anyhow for ergonomic propagation
+    - Same pattern for worker-agent
+
+[MUST] Rustlings exercises 50–90
+  URL: github.com/rust-lang/rustlings
+  Focus on traits and generics sections specifically.
+  Redo anything wrong on first attempt.
+
+── BUILD ────────────────────────────────────────────────────────────────────────
+
+[MUST] Implement RetryPolicy with correct exponential backoff + jitter
+  enum RetryPolicy {
+    NoRetry,
+    FixedDelay { delay_ms: u64, max_attempts: u32 },
+    ExponentialBackoff {
+      base_ms: u64,
+      multiplier: f64,
+      max_attempts: u32,
+      max_delay_ms: u64,
+    },
+  }
+
+  impl RetryPolicy {
+    fn next_delay(&self, attempt: u32) -> Option<Duration> {
+      // Returns Some(delay) if more retries remain, None if exhausted
+      // Apply jitter: multiply computed delay by rand(0.75..1.25)
+    }
+  }
+
+  Test cases required:
+    - ExponentialBackoff base=1000ms, multiplier=2: delays ~1s, ~2s, ~4s, ~8s
+    - Delay never exceeds max_delay_ms
+    - After max_attempts, next_delay returns None
+    - Jitter is actually random (run 100 times, verify variance)
+
+[MUST] Build a generic WorkerPool<T: Runnable>
+  trait Runnable {
+    async fn run(&self, cancel: CancellationToken) -> Result<Output, Error>;
+  }
+
+  struct WorkerPool<T: Runnable> {
+    workers: Vec<Worker<T>>,
+    submission_tx: mpsc::Sender<(JobId, T)>,
+    result_rx: mpsc::Receiver<(JobId, Result<Output, Error>)>,
+  }
+
+  API:
+    fn submit(&self, id: JobId, job: T) -> Result<(), PoolError>
+    async fn next_result(&mut self) -> Option<(JobId, Result<Output, Error>)>
+
+  Tests:
+    - Submit 100 jobs to 5-worker pool, verify all 100 complete
+    - Submit a job that panics — pool must NOT crash, other jobs continue
+    - Submit more jobs than capacity — verify queuing works
+
+── TEST ─────────────────────────────────────────────────────────────────────────
+
+[MUST] Property tests for RetryPolicy using proptest
+  URL: docs.rs/proptest
+  Generate random (base_ms, multiplier, max_attempts) combinations.
+  Verify invariants:
+    - Delays are monotonically non-decreasing (ignoring jitter variation)
+    - No delay exceeds max_delay_ms
+    - None returned exactly after max_attempts
+  A proptest failure = bug in your retry logic. Fix it before moving on.
+
+── CRATES THIS WEEK ─────────────────────────────────────────────────────────────
+  thiserror    — custom error types with derive macros
+  anyhow       — ergonomic error propagation for binaries
+  proptest     — property-based testing for RetryPolicy invariants
+
+── RISKS ────────────────────────────────────────────────────────────────────────
+  [RED] Implementing retry without jitter. Without jitter, all retrying jobs
+  retry simultaneously → thundering herd. The AWS article explains this clearly.
+  Add jitter (±25%) to every delay calculation.
+
+  [AMBER] Not building WorkerPool this week. Without a concrete preview, the
+  real implementation in week 6 will feel like designing from scratch.
+
+── NOTES ────────────────────────────────────────────────────────────────────────
+  Why read Temporal this week: Temporal's distinction between workflows (durable,
+  can pause and resume) and activities (individual units with retry policies) is
+  the most rigorous model for what you're building. Your JobState machine is a
+  simplified version of their workflow state. Understanding their model helps you
+  understand what you're simplifying and why.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WEEK 3 — Async Rust, tokio, all 4 channel types, simulated scheduler
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Daily hours: 7 hrs | Split: 1.5h conceptual reading · 2.5h async study · 3h coding
+Milestone: A local async scheduler (no networking) that dispatches jobs by
+priority across multiple workers via channels, handles graceful shutdown, and
+passes a 1000-job stress test.
+NOTE: This week takes 8 days for most people. Budget for it. Do not compress it.
+
+── READ ────────────────────────────────────────────────────────────────────────
+
+[MUST] Amazon SQS Visibility Timeout documentation
+  URL: docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/
+       sqs-visibility-timeout.html
+  Read in full. SQS's visibility timeout = production implementation of your
+  heartbeat + lease mechanism. When a worker picks up a job, it becomes invisible
+  to other workers for N seconds. If not deleted in time, becomes visible again.
+  This is exactly your at-least-once guarantee.
+  Questions to answer:
+    - How is SQS visibility timeout equivalent to your heartbeat threshold?
+    - What happens if the timeout is too short?
+    - What happens if it's too long?
+    - This is what AWS charges money for. You're building the open source version.
+
+[MUST] DDIA Chapter 8 — Sections 8.1 and 8.2 (first half of chapter)
+  Book: "Designing Data-Intensive Applications" by Martin Kleppmann
+  Read: Faults and Partial Failures (8.1), Unreliable Networks (8.2)
+  This explains:
+    - Why you cannot assume a worker is alive just because it was 5 seconds ago
+    - Why network timeouts are fundamentally ambiguous
+    - Why a slow worker and a dead worker look identical from outside
+    - Why failure detection is hard
+  KEY INSIGHT: A network timeout tells you the response didn't arrive — not
+  whether the request succeeded. This is the core problem in week 6.
+
+── RUST STUDY ──────────────────────────────────────────────────────────────────
+
+[MUST] Rust Async Book — Chapters 1–4
+  URL: rust-lang.github.io/async-book
+  Chapter 2 (under the hood): How the executor polls futures. Non-negotiable.
+  Chapter 4 (pinning): Why Pin<P> exists. Non-negotiable.
+  After ch 2: Write in your own words what a Waker is and why it exists.
+  After ch 4: Write in your own words why Pin<P> exists and when you need it.
+
+[MUST] tokio Tutorial — full
+  URL: tokio.rs/tokio/tutorial
+  Read every section. Most important for this project:
+    - Shared state (why you can't hold MutexGuard across .await)
+    - Channels (mpsc vs oneshot vs broadcast vs watch — when to use each)
+  Read channels section twice.
+  After shared state: explain why std::sync::MutexGuard is not Send.
+  After channels: write in your own words when to use each of the 4 types.
+
+[MUST] Jon Gjengset: Crust of Rust — async/await (YouTube video)
+  Search: "Crust of Rust async await Jon Gjengset"
+  Duration: 3+ hours. Watch before writing any async code.
+  Pause when he hits "Future is not Send" and try to explain why before he does.
+  This is more useful than any documentation.
+
+[REC] Jon Gjengset: Building an async executor from scratch (YouTube)
+  Search: "Jon Gjengset async executor from scratch"
+  Duration: ~2 hours. Watch if the executor model still feels magical after
+  reading the async book. Demystifies how tokio works internally.
+
+── TOKIO CHANNEL TYPES — LEARN ALL 4 ───────────────────────────────────────────
+
+You will use ALL 4 of these in the project. Know each one:
+
+mpsc (multi-producer, single-consumer):
+  tokio::sync::mpsc::channel(buffer_size)
+  USE FOR: job submissions from clients → scheduler
+  USE FOR: scheduler dispatching jobs → each worker task
+  Bounded: provides backpressure (sender blocks when full)
+  Unbounded: no backpressure (use only when you control the sender rate)
+
+oneshot (single-use, single message):
+  tokio::sync::oneshot::channel()
+  USE FOR: worker reporting a single job result back to scheduler
+  USE FOR: cancel signal from scheduler to a specific running job
+  After sending once, channel is consumed.
+
+broadcast (one sender, many receivers):
+  tokio::sync::broadcast::channel(capacity)
+  USE FOR: scheduler broadcasting shutdown signal to all workers
+  Every receiver gets every message. Lagging receivers get errors.
+
+watch (latest value, many readers):
+  tokio::sync::watch::channel(initial_value)
+  USE FOR: scheduler broadcasting current capacity / health state
+  Receivers always get the most recent value (not historical).
+
+── BUILD ────────────────────────────────────────────────────────────────────────
+
+[MUST] Build the simulated scheduler — channels only, no networking
+  This is the core scheduler logic, proven locally before adding gRPC.
+  
+  Architecture:
+    1. Scheduler task: receives job submissions on mpsc::Receiver<Job>
+       Maintains BinaryHeap<QueuedJob> (priority queue from week 1)
+       Dispatches jobs to worker tasks via per-worker mpsc::Sender<Job>
+       Receives results on mpsc::Receiver<(JobId, JobResult)>
+    
+    2. Worker tasks (N of them):
+       Each has: mpsc::Receiver<Job> (receives from scheduler)
+       Shared: mpsc::Sender<(JobId, JobResult)> (sends results to scheduler)
+       Processes one job at a time (or max_concurrent_jobs at a time)
+    
+    3. Shutdown: broadcast::Sender<()> (scheduler sends to all workers)
+                 CancellationToken (workers pass to job executors)
+
+  Channel assignments:
+    Job submission:  mpsc — client → scheduler
+    Job dispatch:    mpsc — scheduler → each worker (one channel per worker)
+    Job result:      mpsc — all workers → scheduler (shared sender, cloned)
+    Shutdown signal: broadcast — scheduler → all workers
+    Capacity state:  watch — scheduler broadcasts current queue depth
+
+  Tests required:
+    - Submit 50 jobs with mixed priorities → verify execution is priority-ordered
+    - Submit 100 jobs to 5 workers → verify all 100 complete, none lost
+    - Submit 200 jobs (more than worker capacity) → verify queuing is correct
+
+[MUST] Implement graceful shutdown with CancellationToken
+  URL: docs.rs/tokio-util (CancellationToken)
+  On SIGINT/SIGTERM:
+    1. Stop accepting new job submissions
+    2. Wait for in-flight jobs to complete (30 second max timeout)
+    3. Drain result channel
+    4. Shut down worker tasks cleanly
+  
+  Tests:
+    - Send shutdown while 20 jobs running → all 20 must complete before exit
+    - Send shutdown while 100 jobs queued → in-flight complete, queued logged
+
+── TEST ─────────────────────────────────────────────────────────────────────────
+
+[MUST] Stress test the simulated scheduler: 1000 jobs, 10 workers, 60 seconds
+  Submit 1000 jobs with random priorities and random sleep durations (1–100ms).
+  Verify: all 1000 complete, no panics, no deadlocks, correct counts.
+  Run 5 times — must pass every time.
+  If it deadlocks: use tokio-console to observe which tasks are stuck.
+
+── CRATES THIS WEEK ─────────────────────────────────────────────────────────────
+  tokio (full features)  — async runtime, all channel types, timers
+  tokio-util             — CancellationToken for graceful shutdown
+  tokio-console          — INSTALL NOW, use to debug deadlocks
+
+── RISKS ────────────────────────────────────────────────────────────────────────
+  [RED] Holding a std::sync::MutexGuard across an .await point. This makes the
+  Future not Send and panics at runtime in multi-threaded tokio runtime.
+  Fix: use tokio::sync::Mutex for guards held across awaits.
+
+  [RED] Not building the simulated scheduler this week. If you skip this, you'll
+  debug gRPC and async logic simultaneously in week 5. The simulated scheduler
+  proves your logic is correct before adding networking complexity.
+
+  [AMBER] This week takes 8 days. Budget for it. Do not compress it.
+
+  [AMBER] Async Rust error messages are among the worst in any language. When
+  you get a wall of red, look at the FIRST error only. Fix it and recompile
+  before reading the rest.
+
+── NOTES ────────────────────────────────────────────────────────────────────────
+  The simulated scheduler is the most important thing you build this week.
+  When you add gRPC in week 7, you need to know the async scheduler logic is
+  already proven correct. Debugging networking AND async logic simultaneously
+  is how projects get stuck for weeks.
+
+  Why read SQS visibility timeout this week: SQS is the production implementation
+  of exactly what you're building. Reading it before week 6 (heartbeat + failure
+  detection) means you'll recognize the pattern immediately when you implement it.
+  "My design is equivalent to SQS's visibility timeout mechanism" is a strong
+  interview answer.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WEEK 4 — gRPC with tonic, proto schema design, workspace setup
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Daily hours: 6 hrs | Split: 1.5h conceptual reading · 1.5h gRPC study · 3h building
+Milestone: Working gRPC client and server exchanging SubmitJob and GetJobStatus
+RPCs with correct generated Rust types, full error handling, and workspace set up.
+
+── READ ────────────────────────────────────────────────────────────────────────
+
+[MUST] DDIA Chapter 4 — Encoding and Evolution (sections 4.1 and 4.2)
+  Book: "Designing Data-Intensive Applications" by Martin Kleppmann
+  Read sections 4.1 (formats for encoding data) and 4.2 (Protocol Buffers).
+  WHY: You are committing to a proto schema that governs all inter-process
+  communication for 12 more weeks. Understanding schema evolution prevents
+  the worst kind of refactor: changing a schema 4 crates depend on.
+  Questions to answer:
+    - What happens if you add a new optional field and an old client sends
+      a message without it? (Answer: safe — proto treats it as default value)
+    - What happens if you remove a field? (Answer: breaking — never reuse numbers)
+    - What happens if you rename a field? (Answer: safe — proto uses numbers)
+    - Why do proto field numbers matter? (Answer: wire format uses numbers)
+
+[MUST] Kafka Architecture — Core Concepts
+  URL: docs.confluent.io/kafka/introduction.html (read through "Core Concepts")
+  Kafka is not a job scheduler but solves the same problem: how do you get work
+  from producers to consumers reliably, at scale, with fault tolerance?
+  Questions to answer:
+    - What is a partition? (parallel queues)
+    - What is a consumer group? (group of workers that share a partition)
+    - How does Kafka guarantee at-least-once delivery?
+    - What is the equivalent of a Kafka consumer group in your scheduler?
+
+[MUST] gRPC Core Concepts
+  URL: grpc.io/docs/what-is-grpc/core-concepts
+  Read fully. Understand:
+    - Unary RPC: one request, one response (SubmitJob, GetJobStatus)
+    - Server streaming: one request, many responses (ListJobs with live updates)
+    - Client streaming: many requests, one response (bulk submit)
+    - Bidirectional streaming: many requests AND responses (worker heartbeat)
+  Questions to answer:
+    - Which RPC type for job submission? (Unary)
+    - Which RPC type for worker heartbeat? (Bidirectional streaming)
+    - What is a deadline? How is it different from a timeout?
+
+── DESIGN ───────────────────────────────────────────────────────────────────────
+
+[MUST] Design the full proto schema ON PAPER before touching code
+  Do this before any code. Get it right now — changing proto schemas later
+  requires migrating all stored jobs and updating all 4 crates simultaneously.
+
+  Services to define:
+    SchedulerService {
+      rpc SubmitJob(SubmitJobRequest) returns (SubmitJobResponse)
+      rpc GetJobStatus(GetJobStatusRequest) returns (GetJobStatusResponse)
+      rpc CancelJob(CancelJobRequest) returns (CancelJobResponse)
+      rpc ListJobs(ListJobsRequest) returns (ListJobsResponse)
+      rpc CreateTemplate(CreateTemplateRequest) returns (CreateTemplateResponse)
+      rpc ListDeadLettered(ListDLQRequest) returns (ListDLQResponse)
+      rpc RequeueFromDLQ(RequeueRequest) returns (RequeueResponse)
+    }
+
+    WorkerService {
+      rpc Register(RegisterRequest) returns (RegisterResponse)
+      rpc Heartbeat(stream HeartbeatRequest) returns (stream HeartbeatResponse)
+      rpc ReportResult(ReportResultRequest) returns (ReportResultResponse)
+      rpc RequestWork(RequestWorkRequest) returns (RequestWorkResponse)
+      rpc ScheduleChildren(ScheduleChildrenRequest) returns (ScheduleChildrenResponse)
+    }
+
+  Key message fields — get types right:
+    Job {
+      uint64 id = 1;              // UUID v7 as uint64 — time ordered
+      string job_type = 2;        // routing key — REQUIRED
+      bytes payload = 3;
+      uint32 priority = 4;        // 1–10
+      uint32 retry_count = 5;
+      RetryPolicy retry_policy = 6;
+      uint64 created_at = 7;      // Unix ms — uint64, not string
+      JobState state = 8;
+      map<string, string> requirements = 9;  // tag matching for routing
+      map<string, string> metadata = 10;     // user-defined tags
+      optional uint64 parent_id = 11;        // for fan-out jobs (week 11)
+    }
+
+  RULES:
+    - Use uint64 for all IDs and timestamps — NEVER string for performance fields
+    - Use map<string, string> for requirements and metadata — needed in week 10
+    - NEVER reuse a field number if you add/remove fields
+    - Add requirements and metadata NOW — adding them later is a breaking change
+
+── BUILD ────────────────────────────────────────────────────────────────────────
+
+[MUST] Set up the Cargo workspace with 4 crates — do this NOW
+  Workspace structure:
+    Cargo.toml               (workspace root)
+    scheduler-core/          (lib: job types, state machine, proto types, errors)
+    scheduler-server/        (bin: gRPC server, dispatch loop, leader election)
+    worker-agent/            (bin: worker process, heartbeat, job execution)
+    scheduler-client/        (lib: typed gRPC client wrapper for CLI and tests)
+
+  Makefile targets:
+    make server     — cargo build --bin scheduler-server
+    make worker     — cargo build --bin worker-agent
+    make test       — cargo test --workspace
+    make proto      — regenerates Rust types from .proto files
+    make lint       — cargo clippy --workspace -- -D warnings
+    make fmt        — cargo fmt --workspace --check
+
+  GitHub Actions CI (.github/workflows/ci.yml):
+    On every push: cargo test, cargo clippy --deny warnings, cargo fmt --check
+    Cache: cargo registry and target directory
+    Add cargo-deny check for license compliance
+
+[MUST] Set up tonic with prost code generation
+  Add build.rs to scheduler-core:
+    fn main() {
+      tonic_build::compile_protos("proto/scheduler.proto").unwrap();
+    }
+  Add generated files to .gitignore — always regenerate from source.
+  Read the generated Rust code — understand what prost creates.
+  Write conversion functions: proto::Job ↔ internal::Job (mismatches appear here)
+
+[MUST] Implement minimal SubmitJob and GetJobStatus RPCs
+  SubmitJob handler:
+    - Validate: job_type not empty, priority 1–10
+    - Assign UUID v7 ID (use uuid crate with v7 feature)
+    - Set state = Queued
+    - Return job ID
+  GetJobStatus handler:
+    - Look up job by ID
+    - Return current state with all timestamps
+    - If not found: return gRPC NOT_FOUND status code
+  No dispatch logic yet — just RPC plumbing working end-to-end.
+  Measure round-trip latency: SubmitJob on localhost must be under 2ms.
+  Record this as your baseline.
+
+── TEST ─────────────────────────────────────────────────────────────────────────
+
+[MUST] Integration tests: real gRPC client → real server → assert responses
+  NOT mocks. Spin up real server in tokio::test, connect real gRPC client.
+  Test: submit job, poll GetJobStatus, verify state=Queued
+  Test: submit 50 jobs concurrently — server must not panic
+  Test: missing required field (empty job_type) → gRPC INVALID_ARGUMENT, not panic
+  Test: GetJobStatus for non-existent ID → gRPC NOT_FOUND, not panic
+
+── CRATES THIS WEEK ─────────────────────────────────────────────────────────────
+  tonic        — gRPC server and client implementation
+  prost        — protobuf code generation (used by tonic)
+  tower        — middleware for gRPC (timeouts, rate limiting)
+  tokio        — async runtime
+  uuid         — UUID v7 for time-ordered job IDs (enable v7 feature flag)
+
+── RISKS ────────────────────────────────────────────────────────────────────────
+  [RED] Designing the proto schema too narrowly. If requirements and metadata
+  maps are not in the schema now, you need a BREAKING schema change in week 10
+  when you add worker routing. Breaking changes require migrating all stored jobs.
+
+  [RED] Not setting up the workspace now. Retrofitting workspace structure in
+  week 8 breaks import paths, CI, and all test infrastructure simultaneously.
+
+── NOTES ────────────────────────────────────────────────────────────────────────
+  Read tonic examples before writing any handler:
+    URL: github.com/hyperium/tonic/tree/master/examples
+    Read: helloworld (basic unary RPC)
+    Read: routeguide (streaming RPCs — directly relevant to heartbeat design)
+    Read the GENERATED Rust code from each example — understand what prost gives you.
+
+  Install grpcurl now:
+    URL: github.com/fullstorydev/grpcurl
+    This lets you test gRPC handlers manually without a client binary.
+    Essential for debugging weeks 5–8.
+
+  Why read DDIA Chapter 4 this week: You are committing to a proto schema that
+  will govern all inter-process communication for 12 more weeks. Understanding
+  schema evolution — why field numbers matter, what breaks vs what doesn't —
+  prevents the worst kind of refactor later.
+
+  UUID v7 vs v4:
+    v7 = time-ordered (first 48 bits are timestamp) → efficient DB indexes,
+         free ordering for ListJobs
+    v4 = random → index fragmentation, expensive ORDER BY created_at queries
+    Always use v7 for job IDs.
+
+================================================================================
+END OF PHASE 1
+================================================================================

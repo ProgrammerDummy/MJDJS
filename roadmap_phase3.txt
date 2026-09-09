@@ -1,0 +1,783 @@
+================================================================================
+PHASE 3 — DISTRIBUTION + ADVANCED FEATURES (Ship v2.0)
+Weeks 9–13 | During internship | 2–3 hrs/day evenings + full weekends
+================================================================================
+GOAL: Distribute the scheduler across school servers and add the features that
+separate a toy from a real production system. You are doing this after full
+work days. Two focused hours beats four exhausted hours every time.
+
+SCHOOL SERVER LAYOUT (7 machines total):
+  Machine A: scheduler-server (leader)
+  Machine B: scheduler-server (standby)
+  Machine C: etcd (coordination service)
+  Machines D, E, F, G: worker-agent (4 workers)
+
+Deploy script: deploy.sh (rsync release binary + systemctl restart)
+Submit jobs: from your laptop over school network
+
+WHY THIS MATTERS: Most distributed systems projects run on localhost.
+You run on real machines with real network latency. This is fundamentally
+different and interviewers notice immediately.
+
+CRITICAL RULE: v1.0 always exists as a complete fallback. Every line you write
+in Phase 3 is pure upside. If you get stuck, you always have something to show.
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WEEK 9 — Multi-node schedulers: leader election via etcd
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Daily hours: 2.5 hrs weekdays · 6 hrs weekend
+Split: Weekend: read + implement + deploy · Weekdays: test + fix bugs
+Milestone: Two scheduler nodes — one active leader, one standby. On leader
+SIGKILL, standby takes over within 30 seconds, zero jobs lost. Running on
+REAL SCHOOL HARDWARE (not localhost).
+
+── READ ────────────────────────────────────────────────────────────────────────
+
+[MUST] ZooKeeper paper — Introduction and Section 2 only
+  Google: "ZooKeeper wait-free coordination internet-scale systems"
+  Read: Introduction + Section 2 (The ZooKeeper Service) only.
+  WHY: ZooKeeper is what etcd replaced. Reading the original paper explains
+  why distributed coordination services exist and what primitives you need.
+  Questions to answer:
+    - What is an ephemeral node? (equivalent to an etcd lease)
+    - What is a watch? (equivalent to etcd watch on a key)
+    - Why do you need a separate coordination service instead of coordinating
+      directly between scheduler nodes? (split-brain scenarios, correct consensus)
+  After reading: you should understand WHY etcd exists, not just how to use it.
+
+[MUST] etcd documentation — Leases and Leader Election recipe
+  URL: etcd.io/docs/v3.5/dev-guide/interacting_v3/#lease
+  Read the lease section and the leader election recipe fully.
+  BEFORE writing Rust code: install etcd locally and run these commands manually:
+    etcdctl lease grant 10
+    etcdctl put mykey myvalue --lease=<lease_id>
+    etcdctl lease keep-alive <lease_id>
+    etcdctl lease revoke <lease_id>
+    etcdctl watch mykey
+  You must understand the data model before writing Rust against it.
+
+[MUST] AWS Builders' Library — Leader Election in Distributed Systems
+  Google: "AWS builders library leader election distributed systems"
+  Read fully. Covers tradeoffs, failure modes, how to handle leader transition.
+  Questions to answer:
+    - During leader transition, who handles new job submissions?
+      (Answer: return UNAVAILABLE, let clients retry with backoff)
+    - What happens to jobs the old leader dispatched but hasn't confirmed yet?
+      (Answer: they stay in SQLite as Running → on new leader startup they become Queued)
+
+── BUILD ────────────────────────────────────────────────────────────────────────
+
+[MUST] Implement leader election using etcd leases
+  URL: docs.rs/etcd-client
+  
+  On scheduler startup:
+    1. Grant etcd lease with 10-second TTL:
+         let lease = etcd.lease_grant(10, None).await?;
+    2. Try to PUT scheduler/leader with own node_id, attached to the lease:
+         etcd.put("scheduler/leader", node_id, Some(PutOptions::new().with_lease(lease.id()))).await?;
+    3. If PUT succeeds (key didn't exist) → BECOME LEADER:
+         - Start renewing lease every 3 seconds (keep_alive loop)
+         - Load all incomplete jobs from SQLite → re-queue them
+         - Start the dispatch loop
+         - Start the heartbeat checker
+    4. If PUT fails (key exists, another scheduler is leader) → BECOME STANDBY:
+         - Watch the key for changes: etcd.watch("scheduler/leader").await?
+         - When key is deleted (lease expired): retry step 2
+
+  On losing leadership (lease renewal failure or explicit yield):
+    - Stop dispatch loop
+    - Stop accepting new job submissions (return UNAVAILABLE to clients)
+    - Stop heartbeat checker
+    - Transition to standby mode
+
+  Lease renewal loop (runs while leader):
+    Every 3 seconds:
+      if etcd.lease_keep_alive(lease_id).await is Err:
+        // Connection to etcd lost — we may have lost leadership
+        // Do not dispatch any more jobs until we re-confirm leadership
+        attempt_to_become_leader()
+
+[MUST] Deploy to school servers
+  Write deploy.sh:
+    #!/bin/bash
+    cargo build --release
+    rsync target/release/scheduler-server user@machine-a:~/
+    rsync target/release/scheduler-server user@machine-b:~/
+    rsync target/release/worker-agent user@machine-d:~/
+    rsync target/release/worker-agent user@machine-e:~/
+    rsync target/release/worker-agent user@machine-f:~/
+    rsync target/release/worker-agent user@machine-g:~/
+    ssh machine-a "systemctl restart scheduler-server"
+    ssh machine-b "systemctl restart scheduler-server"
+    ssh machine-d "systemctl restart worker-agent"
+    # ... etc
+
+  systemd unit file for scheduler-server (/etc/systemd/system/scheduler.service):
+    [Unit]
+    Description=Distributed Job Scheduler
+    After=network.target
+    
+    [Service]
+    ExecStart=/home/user/scheduler-server \
+      --etcd-addr machine-c:2379 \
+      --listen-addr 0.0.0.0:7777 \
+      --node-id machine-a \
+      --db-path /var/lib/scheduler/jobs.db
+    Restart=always
+    RestartSec=2
+    
+    [Install]
+    WantedBy=multi-user.target
+
+  BEFORE deploying: Test connectivity:
+    nc -zv machine-b 7777  (gRPC port)
+    nc -zv machine-c 2379  (etcd port)
+    If these fail: school firewall rules — open ports or use VPN
+
+── TEST ─────────────────────────────────────────────────────────────────────────
+
+[MUST] Leader failover correctness test on school hardware — 10 runs
+  Setup: 2 schedulers on machines A and B, etcd on C, 4 workers on D/E/F/G
+  Action:
+    1. Submit 200 jobs from laptop
+    2. Verify leader is machine A (check etcd key)
+    3. SSH to machine A: sudo poweroff
+    4. Wait and observe
+  Verify:
+    - Machine B detects leader loss within 30 seconds
+    - Machine B becomes leader (check etcd key changes)
+    - All 200 jobs eventually complete
+    - No job runs twice (check SQLite result deduplication)
+  Record per run: failover time (seconds), any lost jobs (must be 0)
+  Run 10 consecutive times. Any failure = bug. Fix and restart count.
+  
+  IMPORTANT: Record this as a video. This is your killer demo asset.
+
+── CRATES THIS WEEK ─────────────────────────────────────────────────────────────
+  etcd-client    — etcd leases and leader election
+  sqlx           — SQLite for shared persistent state
+  tokio          — async runtime
+
+── RISKS ────────────────────────────────────────────────────────────────────────
+  [RED] Implementing your own leader election. A bully algorithm or hand-rolled
+  lease protocol has subtle bugs under split-brain scenarios. etcd's lease
+  mechanism is battle-tested. Use it. "My scheduler's value is in scheduling
+  logic, not re-implementing consensus."
+
+  [RED] SQLite over NFS is fragile. If school NFS mounts are used for the shared
+  SQLite file, concurrent writes from two nodes can corrupt it. Instead: only the
+  LEADER writes to SQLite. The standby reads from it. On failover, the new leader
+  loads state from SQLite and continues.
+
+  [AMBER] School network firewall blocking ports. Test nc -zv machine-b 7777
+  BEFORE implementing. Do not spend a day debugging what is a firewall rule.
+
+── NOTES ────────────────────────────────────────────────────────────────────────
+  Interview answer for "why etcd instead of implementing your own":
+  "Leader election requires solving distributed consensus. etcd provides a
+  correct, battle-tested implementation (Raft-based). My scheduler's value is in
+  the scheduling logic — priority routing, failure detection, retry semantics.
+  Building my own consensus protocol would take 6 weeks and produce something
+  less reliable than etcd. Engineering is about choosing the right tool."
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WEEK 10 — Worker routing, priority aging, resource-aware scheduling
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Daily hours: 2 hrs weekdays · 5 hrs weekend
+Split: 50% implementation · 50% testing
+Milestone: Tag-based routing, resource-aware scheduling, and priority starvation
+prevention all working and tested on school hardware with heterogeneous workers.
+
+── READ ────────────────────────────────────────────────────────────────────────
+
+[MUST] Kubernetes Scheduler — Filtering and Scoring
+  URL: kubernetes.io/docs/concepts/scheduling-eviction/kube-scheduler
+  Read: Filtering section + Scoring section.
+  Your tag-based routing IS Kubernetes node selectors.
+  Your resource checking IS Kubernetes resource requests.
+  Kubernetes scheduling is two phases:
+    1. Filter: which nodes CAN run this pod? (your: which workers CAN run this job?)
+    2. Score: which of those nodes is BEST? (your: which worker has most capacity?)
+  After reading: what is Kubernetes "taints and tolerations"? Could you add it?
+  Interview line: "My worker routing implements the equivalent of Kubernetes node
+  selectors and resource requests. Any engineer who has used Kubernetes will
+  immediately understand the design."
+
+[REC] MIT OCW — Scheduling Algorithms
+  Google: "MIT operating systems scheduling algorithms"
+  Read: FIFO, priority scheduling, round-robin, weighted fair queuing.
+  Theoretical basis for what you're building.
+
+── BUILD ────────────────────────────────────────────────────────────────────────
+
+[MUST] Implement tag-based worker routing
+  Workers declare tags on registration:
+    tags: map<string, string> = {"gpu": "true", "region": "us-east", "memory_gb": "32"}
+  
+  Jobs declare requirements on submission:
+    requirements: map<string, string> = {"gpu": "true"}
+  
+  Dispatch rule: job routes to worker ONLY IF job.requirements ⊆ worker.tags
+  (every key in job.requirements must exist in worker.tags with the same value)
+  
+  Implementation in dispatch loop:
+    fn worker_matches_job(worker: &WorkerInfo, job: &QueuedJob) -> bool {
+      job.requirements.iter().all(|(k, v)| {
+        worker.tags.get(k).map(|wv| wv == v).unwrap_or(false)
+      })
+    }
+  
+  If no matching worker is available: job stays in queue until a matching worker
+  is free. This can cause priority inversion (a low-priority job might be
+  dispatchable while a high-priority job waits for a specific worker type).
+  Document this as a known limitation.
+  
+  Tests:
+    - 3 GPU workers, 3 CPU workers: 10 GPU jobs + 10 CPU jobs
+    - Verify: GPU jobs ONLY run on gpu=true workers (check logs + SQLite worker_id)
+    - Verify: CPU jobs can run on any worker
+  
+  On school servers: label machines with real tags based on actual hardware.
+
+[MUST] Implement resource-aware scheduling
+  Workers declare on registration:
+    available_cpu_cores: u32
+    available_memory_mb: u32
+  
+  Jobs declare on submission:
+    requires_cpu_cores: u32     (default: 1)
+    requires_memory_mb: u32     (default: 256)
+  
+  Scheduler tracks per worker (in WorkerInfo):
+    allocated_cpu: AtomicU32
+    allocated_memory: AtomicU32
+  
+  Dispatch rule: worker can receive a job ONLY IF:
+    worker.available_cpu - worker.allocated_cpu >= job.requires_cpu_cores
+    AND
+    worker.available_memory - worker.allocated_memory >= job.requires_memory_mb
+  
+  On dispatch: increment allocated_cpu and allocated_memory
+  On job completion: decrement allocated_cpu and allocated_memory
+  
+  Tests:
+    - Worker: 4 CPU cores. Submit 6 jobs each requiring 1 core.
+      Verify: max 4 run concurrently, 5th and 6th wait.
+    - Worker: 8192 MB RAM. Submit job requiring 10000 MB.
+      Verify: job NEVER dispatches to that worker (stays queued).
+
+[MUST] Implement priority starvation prevention (aging)
+  Problem: A constant stream of high-priority jobs can starve low-priority ones.
+  Solution: Aging — boost a job's effective_priority by 1 every N seconds it waits.
+  
+  Add to QueuedJob:
+    effective_priority: u32,    // starts = original priority, boosted by aging
+    original_priority: u32,     // immutable — what the user submitted
+    queued_at: Instant,         // when the job entered the queue
+  
+  Background task (runs every 30 seconds):
+    for each job in job_queue:
+      wait_seconds = now - job.queued_at
+      if wait_seconds > aging_threshold_seconds (config, default: 300):
+        boosts = (wait_seconds / aging_interval_seconds) as u32
+        job.effective_priority = min(
+          job.original_priority + boosts,
+          10  // cap at max priority
+        )
+        // Re-insert into BinaryHeap (remove + re-insert since BinaryHeap is immutable)
+  
+  Note: BinaryHeap does not support in-place mutation. To update a job's priority:
+    1. Drain the entire heap into a Vec
+    2. Modify the job's effective_priority
+    3. Rebuild the heap from the Vec
+  This is O(n) — acceptable for a background task running every 30 seconds.
+  
+  Tests:
+    - Submit 1000 high-priority (priority=9) jobs
+    - Submit 1 low-priority (priority=1) job
+    - Verify: the low-priority job eventually runs despite constant high-priority traffic
+    - Log every priority boost: job_id, original_priority, new_effective_priority
+
+── TEST ─────────────────────────────────────────────────────────────────────────
+
+[MUST] Heterogeneous worker routing test on school hardware
+  Setup: 2 workers with tag gpu=true, 3 workers without gpu tag
+  Submit: 20 GPU jobs (requires gpu=true) + 30 CPU jobs (no requirements)
+  Verify from SQLite: every completed GPU job has worker_id of a gpu=true worker
+  Verify: no routing violations in scheduler logs
+  Verify: CPU jobs completed on all worker types
+
+── CRATES THIS WEEK ─────────────────────────────────────────────────────────────
+  dashmap    — concurrent storage for worker resource tracking
+  tokio      — async runtime, timers for aging task
+  tracing    — structured logging for routing decisions
+
+── RISKS ────────────────────────────────────────────────────────────────────────
+  [AMBER] Priority aging with BinaryHeap requires drain-modify-rebuild which is
+  O(n). For large queues (>100k jobs) this may be slow. Consider switching to a
+  custom data structure (e.g., a segmented BTreeMap keyed by effective_priority)
+  if this becomes a bottleneck. Document this as a known scaling limitation.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WEEK 11 — Rate limiting and fan-out jobs
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Daily hours: 2 hrs weekdays · 5 hrs weekend
+Split: 60% implementation · 40% testing
+Milestone: Per-job-type rate limiting enforced. Global token bucket rate limiter
+working. Fan-out jobs with correct parent completion semantics. All tested.
+
+── READ ────────────────────────────────────────────────────────────────────────
+
+[MUST] Stripe Engineering Blog — Designing Robust Rate Limiting
+  Google: "stripe rate limiting blog"
+  Read fully. The reference for production rate limiting design.
+  Covers: token bucket vs leaky bucket vs sliding window, jitter in rate limiters,
+  distributed rate limiting across multiple scheduler nodes.
+  Questions to answer:
+    - Token bucket vs sliding window — which is better for bursty traffic?
+    - How would you extend your single-node rate limiter to work across 2
+      scheduler nodes sharing a limit? (This is a good interview question.)
+
+[MUST] Google SRE Book — Chapter 21: Handling Overload
+  URL: sre.google/sre-book/handling-overload
+  Read fully. How Google handles when the job system is overloaded.
+  Covers: load shedding, per-client quotas, utilization signals.
+  KEY: When should your scheduler REJECT new submissions instead of queuing them?
+  (Answer: when queue depth exceeds a configurable maximum — add a queue depth
+   limit to SubmitJob and return RESOURCE_EXHAUSTED when full)
+
+[REC] governor crate documentation
+  URL: docs.rs/governor
+  Production-ready Rust rate limiter. Read and decide: use it or roll your own.
+  Decision: if you want to ship faster, use governor.
+  If you want the interview talking point "I implemented a token bucket from
+  scratch", implement it yourself.
+
+── BUILD ────────────────────────────────────────────────────────────────────────
+
+[MUST] Implement per-job-type rate limiting
+  Config: max_concurrent_per_type: HashMap<String, u32>
+  
+  In dispatch loop, before dispatching job of type X:
+    running_count = running_jobs.iter().filter(|j| j.job_type == job_type).count()
+    if running_count >= max_concurrent_per_type[job_type]:
+      skip this job in the queue, try the next one
+      (job stays queued until a slot opens)
+  
+  Efficient tracking:
+    running_count_by_type: DashMap<String, AtomicU32>
+    On dispatch: running_count_by_type[job_type].fetch_add(1)
+    On completion: running_count_by_type[job_type].fetch_sub(1)
+  
+  Tests:
+    - Config: max_concurrent_per_type["resize_image"] = 3
+    - Submit 10 resize_image jobs to 10 workers
+    - Verify: max 3 resize_image jobs run concurrently at any moment
+    - Check every 100ms using the scheduler's metrics counters
+
+[MUST] Implement global token bucket rate limiter
+  This limits the TOTAL jobs dispatched per second across all types.
+  
+  struct TokenBucket {
+    capacity: u32,           // max tokens (burst size)
+    tokens: AtomicU32,       // current tokens available
+    last_refill: AtomicU64,  // Unix ms of last refill
+    refill_rate_per_sec: u32, // tokens added per second
+  }
+  
+  impl TokenBucket {
+    fn try_consume(&self) -> bool {
+      // 1. Compute tokens to add since last_refill:
+      //    elapsed_ms = now - last_refill
+      //    tokens_to_add = (elapsed_ms * refill_rate_per_sec) / 1000
+      // 2. Add tokens (capped at capacity)
+      // 3. Update last_refill
+      // 4. If tokens > 0: decrement and return true
+      // 5. Else: return false (caller waits and retries)
+    }
+  }
+  
+  IMPORTANT: Use INTEGER tokens (not float). Float drift causes incorrect behavior
+  over long runtimes. Multiply by 1000 for sub-1-per-second rates.
+  
+  In dispatch loop: before each dispatch, call token_bucket.try_consume().
+  If false: sleep until next token (1000ms / refill_rate_per_sec) and retry.
+  
+  Tests:
+    - Set rate limit to 10 jobs/sec, submit 100 jobs to 20 workers
+    - Measure throughput every second for 10 seconds
+    - Verify: throughput is 10 ± 1 jobs/sec in EVERY window (not just average)
+    - A spiky profile means your token refill is batching — fix it
+
+[MUST] Implement fan-out jobs (parent-child, depth=1 ONLY)
+  A running job can spawn child jobs via ScheduleChildren RPC.
+  Parent job remains Running until ALL children complete.
+  If any child fails and exhausts retries: parent is marked Failed.
+  
+  Data model additions:
+    Add parent_id: Option<JobId> to Job struct and SQLite schema
+    Add children: Arc<DashMap<JobId, ChildStatus>> to track parent's children
+  
+  ScheduleChildren RPC (called by a running job):
+    1. Validate caller is actually Running (check running_jobs map)
+    2. Validate depth: if caller has a parent_id, reject (max depth = 1)
+    3. Submit each child job (same as SubmitJob but with parent_id set)
+    4. Record children in parent's tracking structure
+  
+  Completion listener (called whenever a job completes):
+    if job.parent_id is Some:
+      parent_children = get_children_of(parent_id)
+      if all children are Succeeded:
+        mark parent as Succeeded
+      elif any child is DeadLettered:
+        mark parent as Failed { reason: "child job {id} dead-lettered" }
+      // else: some children still running, do nothing yet
+  
+  Circular dependency detection:
+    Before accepting a ScheduleChildren call, check: is the caller's job_id
+    anywhere in the ancestry of the proposed children? (Build ancestry by
+    following parent_id chain. With depth=1, this is just: does any proposed
+    child have the same id as an ancestor?)
+    If circular: return INVALID_ARGUMENT
+  
+  Tests:
+    - Parent spawns 5 children, all succeed → parent becomes Succeeded
+    - Parent spawns 5 children, 2 dead-letter → parent becomes Failed
+    - Attempt to spawn grandchildren → rejected with INVALID_ARGUMENT
+  
+  Document in README: "Fan-out supports depth=1 (parent-child only).
+  Full DAG dependencies are not supported."
+
+── TEST ─────────────────────────────────────────────────────────────────────────
+
+[MUST] Rate limiter accuracy test under sustained load
+  Setup: 600 jobs total, global rate limit = 10 jobs/sec
+  Method: Submit all 600 jobs instantly, measure throughput every 10 seconds
+  Expected: 10 ± 1 jobs/sec in every 10-second window (not just overall average)
+  A consistently flat throughput profile = correct token bucket implementation.
+
+── CRATES THIS WEEK ─────────────────────────────────────────────────────────────
+  tokio      — async runtime, timers
+  dashmap    — concurrent tracking of per-type run counts
+  governor   — optional production rate limiter (use if rolling your own is slow)
+
+── RISKS ────────────────────────────────────────────────────────────────────────
+  [AMBER] Fan-out circular dependency — job A spawns B which spawns A. Detect
+  by checking if proposed child ID exists in caller's ancestry. With depth=1,
+  the only check needed: proposed child must not have a parent_id that matches
+  any ancestor of the caller. Unchecked cycles → infinite recursion in completion
+  listener → stack overflow.
+
+  [AMBER] Token bucket thundering herd — if you refill all tokens at once per
+  second (e.g., add 10 tokens every 1000ms), you get a burst of 10 dispatches
+  instantly, then 0 for 1 second. Refill CONTINUOUSLY: compute elapsed_ms since
+  last_refill on every try_consume call, add proportional tokens, update last_refill.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WEEK 12 — Cron scheduling and job templates
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Daily hours: 2 hrs weekdays · 5 hrs weekend
+Split: 40% reading + design · 60% implementation + testing
+Milestone: Cron jobs fire at correct times, survive scheduler restarts, do NOT
+double-fire after leader failover — proven by a controlled failover-during-
+fire-window test run 5 times.
+
+── READ ────────────────────────────────────────────────────────────────────────
+
+[MUST] "Falsehoods Programmers Believe About Time"
+  Google: "falsehoods programmers believe about time"
+  Read BEFORE touching any cron or timestamp code. Non-negotiable.
+  Timezone and DST bugs are the most common cron implementation mistakes.
+  Key falsehoods for your cron:
+    - "A minute always has 60 seconds" → DST transitions can add/remove seconds
+    - "Two machines agree on the current time" → clock skew affects your
+      double-fire prevention if you use wall clock for idempotency
+    - "The local time zone can be determined by the server's clock" → don't trust it
+  RULE: Store ALL timestamps as UTC in SQLite. Convert to user timezone ONLY at
+  display time. NEVER store local time. This is absolute.
+
+[MUST] DDIA Chapter 8 — Monotonic vs Wall Clocks section
+  Book: "Designing Data-Intensive Applications" by Martin Kleppmann
+  Read: "Monotonic Versus Time-of-Day Clocks" section
+  Use monotonic clocks (std::time::Instant) for: measuring durations,
+  heartbeat intervals, retry delays.
+  Use wall clocks (chrono::Utc::now()) for: storing timestamps, cron scheduling.
+  NEVER compare Instant values from different machines.
+  NEVER use Instant to store timestamps in SQLite (no absolute meaning across restarts).
+
+[MUST] Kubernetes CronJob docs — Concurrency Policy
+  URL: kubernetes.io/docs/concepts/workloads/controllers/cron-jobs
+  Read: "Concurrency Policy" section.
+  Three policies: Allow (run even if previous still running),
+                  Forbid (skip if previous still running),
+                  Replace (cancel previous, start new).
+  Decide which to implement as your default. Recommend: Forbid (safest).
+  How does Kubernetes handle double-fire after controller restart? Compare to yours.
+
+── BUILD ────────────────────────────────────────────────────────────────────────
+
+[MUST] Implement cron expression parsing and next-fire computation
+  Use the cron crate: docs.rs/cron
+  
+  SQLite table:
+    CREATE TABLE cron_jobs (
+      cron_id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      expression TEXT NOT NULL,      -- standard cron expression e.g. "*/5 * * * *"
+      template_id TEXT NOT NULL,     -- references job_templates table
+      last_fired_at INTEGER,         -- Unix ms UTC (NULL if never fired)
+      next_fire_at INTEGER NOT NULL, -- Unix ms UTC
+      concurrency_policy TEXT NOT NULL DEFAULT 'Forbid',
+      enabled INTEGER NOT NULL DEFAULT 1,
+      created_at INTEGER NOT NULL
+    );
+  
+  On startup AND after each leader election:
+    Load all enabled cron jobs from SQLite.
+    For each: compute next_fire_at using:
+      let schedule = cron::Schedule::from_str(&expression)?;
+      let next = schedule.after(&Utc::now()).next()?;
+      next_fire_at = next.timestamp_millis() as u64;
+    
+  Tests:
+    - Expression "*/5 * * * *" → next_fire_at always within next 5 minutes
+    - Expression "0 9 * * 1-5" → next_fire_at skips weekends
+
+[MUST] Implement the cron tick loop
+  A dedicated tokio task that wakes at the earliest next_fire_at.
+  Uses tokio::time::sleep_until — NOT polling every second.
+  
+  Loop:
+    1. Find earliest next_fire_at across all enabled cron jobs
+    2. sleep_until(earliest_next_fire_at)
+    3. For each cron job where next_fire_at <= now:
+       a. CHECK IDEMPOTENCY GUARD:
+            current_interval_start = floor_to_cron_interval(now, expression)
+            if last_fired_at >= current_interval_start:
+              // Already fired this interval (e.g., after failover)
+              skip — do not fire again
+       b. Check concurrency policy (Forbid: skip if previous still Running)
+       c. Submit a job using the referenced template (call SubmitFromTemplate)
+       d. Update last_fired_at = now, compute new next_fire_at
+       e. Write both to SQLite (atomically — single transaction)
+    4. Go back to step 1
+  
+  THE IDEMPOTENCY GUARD IS THE CRITICAL PART:
+  After a leader failover, the new leader loads cron jobs from SQLite and
+  starts the tick loop. If last_fired_at is within the current cron interval,
+  it means the old leader already fired it. The guard prevents double-firing.
+  Without the guard: every failover causes a duplicate cron job execution.
+  
+  Tests:
+    - Set cron to every 1 minute, crash scheduler at 30s into a minute
+    - Restart. Verify: exactly 1 job fires per minute, not 0, not 2.
+    - Failover mid-minute (kill leader, standby takes over)
+    - Verify: exactly 1 firing for that minute across both leaders.
+
+[MUST] Implement job templates
+  SQLite table:
+    CREATE TABLE job_templates (
+      template_id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      job_type TEXT NOT NULL,
+      default_payload BLOB,
+      default_priority INTEGER NOT NULL DEFAULT 5,
+      default_retry_policy TEXT,    -- JSON
+      default_requirements TEXT,    -- JSON map<string,string>
+      default_metadata TEXT,        -- JSON map<string,string>
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+  
+  gRPC RPCs to add:
+    CreateTemplate(CreateTemplateRequest) → CreateTemplateResponse
+    GetTemplate(GetTemplateRequest) → GetTemplateResponse
+    UpdateTemplate(UpdateTemplateRequest) → UpdateTemplateResponse
+    DeleteTemplate(DeleteTemplateRequest) → DeleteTemplateResponse
+    ListTemplates(ListTemplatesRequest) → ListTemplatesResponse
+    SubmitFromTemplate(SubmitFromTemplateRequest) → SubmitJobResponse
+      (request includes template_id + optional field overrides)
+  
+  SubmitFromTemplate merges: template defaults ← overrides
+  Test: template priority=5, submit with priority_override=8 → job has priority=8
+
+── TEST ─────────────────────────────────────────────────────────────────────────
+
+[MUST] Double-fire prevention test — run 5 times
+  1. Set up cron job: "*/1 * * * *" (every minute)
+  2. Run 2 schedulers (leader + standby)
+  3. At T+30 seconds into a minute: kill the leader
+  4. Standby becomes leader
+  5. Verify: exactly 1 job fires for that minute (check SQLite job count)
+  Run this 5 times. Any double-fire = bug in idempotency guard.
+  Any missed fire after failover = bug in new leader's cron reload.
+
+── CRATES THIS WEEK ─────────────────────────────────────────────────────────────
+  cron     — cron expression parsing and Schedule::after()
+  chrono   — UTC timestamps, timezone handling
+  sqlx     — SQLite for cron_jobs and job_templates tables
+  tokio    — async runtime, sleep_until for efficient cron wake
+
+── RISKS ────────────────────────────────────────────────────────────────────────
+  [RED] Storing timestamps in local timezone. DST transitions cause cron jobs to
+  fire twice or not at all during the ambiguous hour. Always store UTC. Always.
+
+  [RED] Not implementing the idempotency guard. After failover, both the old
+  leader (if briefly recovering) and new leader may try to fire the same cron job.
+  The guard (check last_fired_at against current interval start) is the only
+  protection against double-fire.
+
+  [AMBER] Using polling (sleep 1 second, check all cron jobs) instead of
+  sleep_until. At 1000 cron jobs × 60 wakeups/minute = 60,000 unnecessary
+  iterations/minute. Use sleep_until targeting the earliest next_fire_at.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WEEK 13 — Full chaos test suite on school hardware, ship v2.0
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Daily hours: 2.5 hrs weekdays · 6 hrs weekend
+Split: 20% writing tests · 80% running + diagnosing + fixing
+Milestone: All 5 chaos tests pass 10 consecutive runs each on school hardware.
+v2.0.0 tagged.
+
+── READ ────────────────────────────────────────────────────────────────────────
+
+[MUST] Jepsen — read 2 analyses (any 2 from jepsen.io/analyses)
+  Read 2 complete Jepsen analyses. Understand what "linearizability violation"
+  means and how chaos testing finds distributed system bugs.
+  Questions to answer:
+    - What is a linearizability violation? Can your scheduler violate it?
+    - What test patterns does Jepsen use? Which of these apply to your scheduler?
+
+[MUST] DDIA Chapter 9 — Sections 9.1 and 9.2
+  Book: "Designing Data-Intensive Applications" by Martin Kleppmann
+  Read: Consistency Guarantees (9.1) and Linearizability (9.2)
+  This explains what your scheduler actually guarantees.
+  After reading, answer:
+    - What consistency guarantee does your scheduler provide?
+      (Answer: eventual consistency for job state, with leader as source of truth.
+       Job submissions are linearizable if all go through the leader.)
+    - Is your job submission linearizable?
+      (Answer: Yes, if clients always submit to the current leader.
+       If a client submits to the standby, it returns UNAVAILABLE.)
+
+── BUILD ────────────────────────────────────────────────────────────────────────
+
+[MUST] 5 Chaos Tests — run each 10 consecutive times on SCHOOL HARDWARE
+
+  TEST 1: Leader failover
+    Setup: 2 schedulers, etcd, 4 workers on school machines
+    Action: Submit 200 jobs, kill leader with: ssh machine-a sudo poweroff
+    Wait: up to 60 seconds
+    Verify: standby takes over within 30s, all 200 jobs complete, 0 lost
+    Record: failover time per run (mean, p99)
+
+  TEST 2: Worker mass failure
+    Setup: 5 workers running, 100 jobs queued
+    Action: Kill 3 workers simultaneously with SIGKILL
+    Verify: remaining 2 workers receive rerouted jobs, all 100 complete
+    Record: time from SIGKILL to last job completing
+
+  TEST 3: Scheduler restart with jobs in flight
+    Setup: Submit 500 jobs, let 100 start executing
+    Action: SIGKILL scheduler
+    Action: Restart scheduler within 5 seconds
+    Verify: all 500 jobs eventually complete (some may run twice — acceptable)
+    Record: restart time, recovery time, number of double-runs
+
+  TEST 4: Network partition (workers disconnected from scheduler)
+    Setup: Workers running jobs normally
+    Action: SSH to worker machines, run:
+      iptables -A INPUT -p tcp --dport 7777 -j DROP
+      iptables -A OUTPUT -p tcp --dport 7777 -j DROP
+    Wait 30 seconds (scheduler detects worker deaths, requeues jobs)
+    Action: Remove iptables rules:
+      iptables -D INPUT -p tcp --dport 7777 -j DROP
+      iptables -D OUTPUT -p tcp --dport 7777 -j DROP
+    Verify: workers reconnect and re-register, jobs resume, nothing permanently lost
+
+  TEST 5: Cron double-fire after failover
+    Setup: Cron job firing every 1 minute, 2 schedulers
+    Action: Kill leader exactly 30 seconds into a cron minute
+    Verify: exactly 1 cron job fires for that minute (not 0, not 2)
+    Run: 5 times (this one is harder to run 10 times due to timing)
+
+  RULES FOR ALL TESTS:
+    - Run on school hardware only — localhost results don't count
+    - Any failure = stop, diagnose in logs, fix code, restart count to 0
+    - Record results in a table: test_name, run_number, pass/fail, key_metrics
+    - These numbers go in your README and are what interviewers ask about
+
+[MUST] Fix all bugs found during chaos testing
+  Budget the FULL WEEK for this. Chaos testing always finds bugs.
+  Common bugs you will likely hit:
+    - Race condition in dispatch loop when leader changes
+    - Heartbeat stream not auto-reconnecting after network partition heals
+    - Cron double-fire at exact moment of failover (timing edge case)
+    - Worker re-registration failing silently after network restore
+    - SQLite write failing during high-concurrency load
+
+[MUST] Tag v2.0.0 — update README
+  Add to README:
+    - Multi-node architecture diagram (2 schedulers + etcd + N workers)
+    - Chaos test results table:
+        | Test                | Runs | Pass rate | Mean time | Notes |
+        |---------------------|------|-----------|-----------|-------|
+        | Leader failover     | 10   | 100%      | 18s       |       |
+        | Worker mass failure | 10   | 100%      | 12s       |       |
+        | ...                 |      |           |           |       |
+    - Known limitations (be honest):
+        - At-least-once delivery (jobs may run twice)
+        - Fan-out depth=1 only
+        - Single etcd node is a SPOF
+        - No horizontal SQLite scaling
+        - Fixed heartbeat threshold (not adaptive phi accrual)
+        - No exactly-once semantics
+  
+  Record a 3-minute demo video on school hardware (SAVE FOR WEEK 16):
+    Start 2 schedulers + 5 workers + etcd on school machines
+    Submit 200 jobs from laptop
+    Kill the leader scheduler mid-execution
+    Show automatic failover
+    Show all jobs complete
+    This video is your single most powerful interview asset.
+
+── CRATES THIS WEEK ─────────────────────────────────────────────────────────────
+  tokio      — async runtime
+  tracing    — structured logging for chaos test analysis
+
+── RISKS ────────────────────────────────────────────────────────────────────────
+  [RED] Discovering a fundamental design flaw during chaos testing (e.g., two
+  schedulers both dispatch the same job during leader transition). If this happens:
+  document it as a known limitation, implement a mitigation (e.g., job dispatch
+  lock via etcd), and note it explicitly in the README. A documented limitation
+  is better than a hidden bug.
+
+  [AMBER] Internship energy drain. Week 13 is the most tiring week.
+  The chaos test loop (run→fail→debug→fix→repeat) is exhausting after full work
+  days. Protect BOTH days of the weekend. The weekend is when real debugging
+  happens for this week.
+
+── WHAT YOU HAVE AFTER WEEK 13 ─────────────────────────────────────────────────
+  Distributed job scheduler with:
+    ✓ Multi-node with etcd leader election (lease-based, 30s failover)
+    ✓ Deployed on 7 school machines (2 schedulers, etcd, 4 workers)
+    ✓ Tag-based worker routing (job requirements ⊆ worker tags)
+    ✓ Resource-aware scheduling (CPU/memory tracking)
+    ✓ Priority starvation prevention (aging)
+    ✓ Per-job-type rate limiting
+    ✓ Global token bucket rate limiter
+    ✓ Fan-out jobs (parent-child, depth=1)
+    ✓ Cron scheduling with double-fire prevention
+    ✓ Job templates
+    ✓ SQLite persistence
+    ✓ Chaos tested: 5 tests × 10 runs on real hardware, zero job loss
+    ✓ 3-minute demo video (save for week 16)
+
+================================================================================
+END OF PHASE 3
+================================================================================

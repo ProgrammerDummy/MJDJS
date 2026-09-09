@@ -1,0 +1,633 @@
+================================================================================
+PHASE 4 — OBSERVABILITY + POLISH + LAUNCH
+Weeks 14–16 | During internship | 1–2 hrs/day evenings
+================================================================================
+GOAL: Make the project undeniably, visibly impressive to someone who clicks your
+GitHub link, watches a 3-minute video, or asks about it in a 45-minute interview.
+
+The coding is mostly done. This phase is about presentation, performance numbers,
+and interview preparation.
+
+TRUTH: A great project with a poor README and no benchmark numbers is worth less
+than a good project with a compelling README, a demo video, and numbers you know
+cold. Invest real time here.
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WEEK 14 — Prometheus metrics, Grafana dashboard, docker-compose
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Daily hours: 1.5–2 hrs weekdays · 4 hrs weekend
+Split: 60% coding metrics · 40% Grafana dashboard setup
+Milestone: docker-compose up starts 2 schedulers + 5 workers + etcd + Prometheus
++ Grafana. Dashboard shows job throughput, queue depth, worker health, leader
+election events, and rate limiter utilization in real time.
+The Grafana failover screenshot is your most powerful single interview asset.
+
+── BUILD ────────────────────────────────────────────────────────────────────────
+
+[MUST] Add Prometheus metrics to scheduler-server
+  Use: docs.rs/prometheus
+  Expose on port 9090 via a minimal axum HTTP server (GET /metrics)
+  Keep this separate from gRPC port 7777.
+  
+  Required scheduler metrics:
+    jobs_submitted_total           Counter  {job_type}
+    jobs_completed_total           Counter  {job_type, result=succeeded|failed|cancelled}
+    jobs_queued_depth              Gauge    {priority_bucket=high|medium|low}
+    jobs_dead_lettered_total       Counter  {job_type}
+    dispatch_latency_seconds       Histogram (buckets: 0.001, 0.005, 0.01, 0.05, 0.1, 0.5)
+    leader_elections_total         Counter  {node_id}
+    worker_count                   Gauge    {state=active|dead|draining}
+    rate_limit_utilization         Gauge    {job_type} (0.0–1.0, current/max)
+    queue_capacity_ratio           Gauge    (current queue depth / max queue size)
+    job_end_to_end_duration_sec    Histogram by job_type (submit to completion)
+  
+  Label every metric with scheduler_id so you can compare 2 nodes in Grafana.
+
+[MUST] Add Prometheus metrics to worker-agent
+  Required worker metrics:
+    jobs_executed_total            Counter  {job_type, result=succeeded|failed|cancelled}
+    job_execution_duration_seconds Histogram {job_type}
+    heartbeat_sent_total           Counter
+    heartbeat_failures_total       Counter
+    worker_utilization             Gauge    (current_jobs / max_concurrent_jobs)
+  
+  Label every metric with worker_id.
+
+[MUST] Build the 6-panel Grafana dashboard
+  Panel 1: Job throughput
+    Metric: rate(jobs_completed_total[1m]) by job_type
+    Type: stacked area chart
+    Purpose: shows jobs/sec, stratified by job type
+  
+  Panel 2: Queue depth over time
+    Metric: jobs_queued_depth by priority_bucket
+    Type: line chart
+    Purpose: shows when the queue is building up — load spike visible immediately
+  
+  Panel 3: End-to-end latency p50/p95/p99
+    Metric: histogram_quantile(0.99, rate(job_end_to_end_duration_sec_bucket[5m]))
+    Type: line chart (3 lines: p50, p95, p99)
+    Purpose: latency impact of leader failover is visible as a spike + recovery
+  
+  Panel 4: Worker pool utilization
+    Metric: worker_utilization by worker_id
+    Type: line chart (one line per worker)
+    Purpose: shows load distribution across workers
+  
+  Panel 5: Leader election events (THE MONEY SHOT PANEL)
+    Metric: increase(leader_elections_total[1m]) by node_id
+    Type: step chart or bar chart
+    Purpose: clearly shows which node is leader, when it changes
+  
+  Panel 6: Rate limiter utilization + DLQ rate
+    Metric: rate_limit_utilization by job_type + rate(jobs_dead_lettered_total[1m])
+    Type: dual line chart
+    Purpose: shows when rate limiting is active and when jobs are failing hard
+  
+  REQUIRED: Take a screenshot during a leader failover (kill Machine A):
+    The dashboard should show:
+    - Panel 5: step change from machine-a to machine-b as leader
+    - Panel 2: queue depth spike (jobs re-queued during transition)
+    - Panel 3: latency spike then recovery
+    Annotate the screenshot: "leader killed here" → "new leader elected" → "recovery"
+    This screenshot goes at the TOP of your README. First thing anyone sees.
+    It is worth 1000 words in an interview.
+
+[MUST] Write docker-compose.yml for the full local stack
+  Services:
+    scheduler-1   (machine-a simulation: --node-id node1 --port 7777)
+    scheduler-2   (machine-b simulation: --node-id node2 --port 7778)
+    etcd          (official etcd:latest image, port 2379)
+    worker-1 through worker-5 (each on different ports)
+    prometheus    (scrapes all schedulers and workers)
+    grafana       (imports dashboard JSON automatically on startup)
+  
+  Critical: depends_on with health checks so Grafana waits for Prometheus.
+  Commit Grafana dashboard JSON to repo (grafana/dashboards/scheduler.json).
+  
+  Target: docker-compose up → full observable distributed system within 90 seconds.
+  Test: docker-compose up on a CLEAN machine, verify all services healthy in 90s.
+
+── CRATES THIS WEEK ─────────────────────────────────────────────────────────────
+  prometheus     — Prometheus metrics registry and metric types
+  axum           — minimal HTTP server for /metrics endpoint
+  tonic-health   — gRPC health check protocol for docker-compose health checks
+
+── RISKS ────────────────────────────────────────────────────────────────────────
+  [AMBER] Spending more than 4 hours on Grafana aesthetics. The dashboard needs
+  to show the right data during a failover. Correct data > pretty colors.
+  Timebox visual design to 3 hours maximum.
+
+  [AMBER] Not taking the failover screenshot. This is your most important single
+  asset for interviews. Do a controlled test specifically to capture it:
+    1. Start docker-compose stack
+    2. Submit 500 jobs
+    3. docker-compose stop scheduler-1
+    4. Screenshot the Grafana dashboard in the next 60 seconds
+    5. Annotate the screenshot before saving it
+
+── NOTES ────────────────────────────────────────────────────────────────────────
+  The Grafana failover screenshot is your #1 interview asset. In a 45-minute
+  technical interview, showing a screenshot where the leader panel switches,
+  queue depth spikes, and then drains — all visible in a 10-second window — is
+  more convincing than any verbal explanation. Put it at the top of your README.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WEEK 15 — Web dashboard UI, profiling, benchmark writeup
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Daily hours: 1.5 hrs weekdays · 4 hrs weekend
+Split: 40% web UI · 30% profiling · 30% writing benchmark analysis
+Milestone: Working web dashboard with live job status. BENCHMARKS.md with
+honest numbers, hardware spec, and analysis of every performance gap.
+
+── BUILD ────────────────────────────────────────────────────────────────────────
+
+[MUST] Build a minimal web dashboard with axum + htmx
+  URL (axum): docs.rs/axum
+  URL (htmx): htmx.org/docs
+  
+  WHY htmx not React: A React frontend adds a week of JavaScript debugging that
+  teaches nothing new. htmx enables live-updating pages in 2 days with server-side
+  Rust templates. Nobody expects a Rust job scheduler to have a frontend — any
+  frontend is a bonus.
+  
+  htmx attributes you need (only 5):
+    hx-get="/endpoint"          — makes a GET request
+    hx-trigger="every 2s"      — polls every 2 seconds
+    hx-target="#element-id"    — where to put the response
+    hx-swap="innerHTML"        — replace inner HTML
+    hx-push-url="true"         — update browser URL bar
+  
+  Pages to implement:
+    GET /
+      → redirect to /jobs
+    
+    GET /jobs
+      Query params: ?state=all|queued|running|completed|failed&page=1&limit=50
+      Shows: paginated job table with columns:
+        job_id (truncated), job_type, priority, state, created_at, duration
+      Refreshes every 2 seconds via htmx polling
+    
+    GET /jobs/:id
+      Shows full job detail:
+        - All fields including payload and metadata
+        - State history timeline (Queued → Running → Succeeded, with timestamps)
+        - Retry log (each attempt: error message, timestamp, delay before retry)
+        - Assigned worker ID and hostname
+        - Total execution duration
+        - Parent job ID (if fan-out child)
+        - Child job IDs (if fan-out parent)
+    
+    GET /workers
+      Shows worker table:
+        worker_id, hostname, job_types_supported, tags,
+        current_jobs / max_concurrent_jobs, CPU% allocated,
+        last_heartbeat (show as "5s ago" — color red if > 10s),
+        state (Active/Dead/Draining)
+      Refreshes every 5 seconds
+    
+    GET /dlq
+      Dead-letter queue: job_id, job_type, failure_reason, attempts, final_failed_at
+      With: [Requeue] button per row (posts to /dlq/:id/requeue)
+    
+    GET /cron
+      Cron jobs: name, expression, template, next_fire_at, last_fired_at, enabled
+      Shows "fires in X minutes" for each job
+  
+  Use askama for server-side templates: docs.rs/askama
+  Type-safe Jinja2-like templates. Compile-time verified. Much safer than strings.
+  
+  The /workers page is your most impressive live view — heartbeat staleness
+  visible in real time as colors change from green → yellow → red.
+
+[MUST] Profile with cargo flamegraph — find and fix one hotspot
+  URL: github.com/flamegraph-rs/flamegraph
+  Install: cargo install flamegraph
+  
+  Run under load:
+    cargo flamegraph --bin scheduler-server &
+    # Submit 10,000 jobs with 20 workers
+    # Wait 30 seconds
+    # Kill the flamegraph process
+    # Open the .svg file in a browser
+  
+  Reading the flamegraph:
+    Width of a bar = % of total CPU time spent in that function
+    Depth = call stack (bottom = main, top = leaf function)
+    Find the widest bar — that is your bottleneck
+    Fix it. Re-run. Measure improvement.
+  
+  Common hotspots to look for:
+    - Queue lock held too long during dispatch → minimize lock scope
+    - SQLite write blocking on every state transition → batch non-critical writes
+    - JSON serialization for state_history → use binary format
+    - Tokio context switching overhead → review task granularity
+  
+  Save before + after flamegraph SVGs in repo under bench/
+  Even a 10% improvement is worth documenting.
+
+[MUST] Run comprehensive criterion benchmarks on school hardware
+  URL: bheisler.github.io/criterion.rs/book
+  Run on SCHOOL HARDWARE for distributed numbers. Localhost ≠ real network latency.
+  
+  Benchmark 1: Job submission throughput
+    Submit 10,000 jobs with no-op executors
+    Measure: jobs submitted per second (RPC overhead only)
+    Units: jobs/sec
+  
+  Benchmark 2: End-to-end latency for trivial job (1ms execution)
+    Submit job, wait for completion, measure total elapsed time
+    Measure: p50, p95, p99 latency
+    This is your SYSTEM OVERHEAD — the scheduler tax
+    Units: milliseconds
+  
+  Benchmark 3: Throughput scaling with worker count
+    Test: 1, 5, 10, 20 workers, measure jobs/sec at each
+    Expected: scales linearly until scheduler becomes bottleneck
+    Report: jobs/sec and efficiency % at each worker count
+  
+  Benchmark 4: SQLite WAL impact
+    With fsync (default, durable): measure jobs/sec
+    Without fsync (PRAGMA synchronous=OFF): measure jobs/sec
+    Document BOTH with warning: "no-fsync sacrifices durability on crash"
+    The ratio tells you the cost of durability
+  
+  Benchmark 5: Failure detection latency distribution
+    Run 20 SIGKILL tests on school hardware
+    Record each detection time
+    Report: mean, p50, p95, p99, worst case
+  
+  Benchmark 6: Leader failover impact on throughput
+    Submit continuous jobs at 80% of peak throughput
+    Kill the leader, measure throughput gap during failover
+    Report: throughput drop %, recovery time, total jobs delayed
+
+[MUST] Write BENCHMARKS.md — honest, specific, with hardware spec
+  Required sections:
+    
+    1. Hardware
+       CPU: [exact model, cores, GHz]
+       RAM: [GB]
+       Disk: [SSD/NVMe, model]
+       Network: [school network, estimated latency between machines]
+    
+    2. Single-node performance
+       | Benchmark              | Value       | Notes                          |
+       |------------------------|-------------|--------------------------------|
+       | Submission throughput  | X jobs/sec  | RPC overhead only              |
+       | E2E latency p50        | Xms         | 1ms executor, single client    |
+       | E2E latency p99        | Xms         | 1ms executor, single client    |
+       | E2E latency p99 (100c) | Xms         | 100 concurrent clients         |
+       | SQLite WAL write cost  | +Xms/job    | vs in-memory (no persistence)  |
+    
+    3. Distributed performance (school hardware)
+       | Benchmark              | Value       | Notes                          |
+       |------------------------|-------------|--------------------------------|
+       | Failover detection     | Xs mean     | SIGKILL → standby takes over   |
+       | Failover p99           | Xs          | across 20 runs                 |
+       | Post-failover recovery | Xs          | until normal throughput        |
+       | Throughput w/ 4 workers| X jobs/sec  | school network latency         |
+    
+    4. Performance analysis
+       Explain every number. Do not just list them.
+       Example: "The p99 latency is 45ms vs p50 of 8ms. The tail latency is
+       driven by SQLite fsync (measured at 30ms) when a heavily loaded disk
+       delays the WAL write. Under --no-fsync mode, p99 drops to 12ms."
+    
+    5. Comparison baseline
+       Measure throughput of a no-op tokio task spawn (no scheduler at all)
+       Your scheduler overhead = raw throughput - scheduled throughput
+       Report this explicitly: "The scheduling tax is Xms per job"
+
+── CRATES THIS WEEK ─────────────────────────────────────────────────────────────
+  axum        — web server for dashboard
+  askama      — type-safe server-side templates
+  criterion   — benchmarking framework
+  flamegraph  — cargo install flamegraph (profiling)
+
+── RISKS ────────────────────────────────────────────────────────────────────────
+  [AMBER] Building the web UI before running benchmarks. Benchmarks expose bugs
+  (race conditions visible as latency spikes, correctness issues visible as failed
+  job counts) that need fixing before clean numbers. Do benchmarks first.
+
+  [AMBER] Only reporting average throughput. Averages hide the interesting parts.
+  Always report p50/p95/p99. The tail is where the problems live.
+
+── NOTES ────────────────────────────────────────────────────────────────────────
+  Know your numbers before every interview. When asked "what throughput does it
+  achieve?", your answer must be specific:
+  "Single-node with SQLite WAL: ~X,000 job submissions per second RPC overhead,
+  end-to-end p99 of Yms for a 1ms job. The 2-node distributed setup achieves
+  ~Z,000 submissions per second, with leader failover within Ws on average and
+  zero job loss across 20 chaos runs."
+  Specific numbers signal you actually measured it. Vague ranges signal you didn't.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WEEK 16 — Final README, demo video, interview prep, public launch
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Daily hours: 1 hr weekdays · 4 hrs weekend
+Split: Weekend: README + demo video · Weekdays: interview prep + posting
+Milestone: Public GitHub repo with video, comprehensive README, chaos test results,
+benchmark table — posted to HN and r/rust. 15 deep technical questions answered
+fluently out loud.
+
+── BUILD ────────────────────────────────────────────────────────────────────────
+
+[MUST] Write the final comprehensive README
+  Structure (in this EXACT order — do not rearrange):
+  
+  1. One-sentence description
+     "A distributed job scheduler written in Rust with etcd leader election,
+     priority-based routing, and chaos-tested reliability."
+  
+  2. Grafana failover screenshot (annotated)
+     Caption: Leader failover on school hardware — automatic switchover in 18s
+  
+  3. Architecture diagram
+     Show: Clients → Scheduler-1 (Leader) / Scheduler-2 (Standby) ← etcd
+                    Schedulers → Workers (N)
+     With arrows for: job submission, dispatch, heartbeat, result reporting,
+                      leader election lease
+  
+  4. Feature checklist
+     ✓ Priority queue with starvation prevention (aging)
+     ✓ etcd-based leader election (30s failover)
+     ✓ Tag-based worker routing (Kubernetes node selector equivalent)
+     ✓ Resource-aware scheduling (CPU + memory tracking)
+     ✓ Heartbeat failure detection (3× interval threshold)
+     ✓ Exponential backoff retry with jitter
+     ✓ Dead-letter queue with inspection and requeue
+     ✓ SQLite WAL persistence (survive SIGKILL)
+     ✓ Per-job-type rate limiting
+     ✓ Global token bucket rate limiter
+     ✓ Fan-out jobs (parent-child, depth=1)
+     ✓ Cron scheduling with double-fire prevention
+     ✓ Job templates
+     ✓ Prometheus metrics + Grafana dashboard
+     ✓ Web dashboard UI
+     ✓ Full CLI client (--output json, proper exit codes)
+     ✓ Deployed on 7-machine school cluster
+     ✓ Chaos tested: 5 scenarios × 10 runs, zero job loss
+  
+  5. Benchmark table (with hardware spec header)
+  
+  6. Quick start — must work in 60 seconds, copy-paste only
+     Option A (local, docker-compose):
+       git clone https://github.com/you/scheduler
+       docker-compose up
+       scheduler submit --type resize_image --priority 8 --payload '{"file":"photo.jpg"}'
+     Option B (build from source):
+       cargo build --release
+       ./target/release/scheduler-server --etcd-addr localhost:2379 &
+       ./target/release/worker-agent --scheduler-addr localhost:7777 \
+         --job-types resize_image,send_email &
+  
+  7. Design decisions (explain WHY for each — not just what)
+     - WHY etcd: leader election requires consensus. etcd is correct and battle-tested.
+       My scheduler's value is in scheduling logic, not reinventing Raft.
+     - WHY at-least-once (not exactly-once): impossible across system boundaries.
+       See: "You Cannot Have Exactly-Once Delivery" (link the post).
+     - WHY DashMap over Mutex<HashMap>: concurrent reads don't serialize.
+       GetJobStatus is the hot read path. Global Mutex = bottleneck under load.
+     - WHY bidirectional streaming heartbeat: one persistent stream per worker
+       vs 1,200 RPCs/minute at 100 workers with repeated unary calls.
+     - WHY SQLite WAL mode: concurrent reads during writes. Critical for
+       GetJobStatus throughput while state transitions are happening.
+     - WHY heartbeat threshold = 3×: tolerates 2 dropped packets without false
+       positive. 2× is too tight. 3× is the safe minimum.
+     - WHY UUID v7: time-ordered IDs = efficient DB indexes + free ListJobs ordering.
+  
+  8. Chaos test results table
+  
+  9. Known limitations (honest — this is a sign of engineering maturity)
+     - At-least-once delivery: jobs may run twice if worker completes but
+       scheduler crashes before recording. Executors must be idempotent.
+     - Fan-out depth=1: parent-child only. Full DAGs not supported.
+     - Single etcd node: etcd itself is a SPOF in this deployment.
+     - Fixed heartbeat threshold: not adaptive to network jitter (phi accrual
+       would be better — would reduce false positives under high load).
+     - No exactly-once semantics (see design decisions above).
+     - No cluster membership changes at runtime.
+  
+  10. Building from source
+
+[MUST] Record a 3-minute demo video on school hardware
+  Use asciinema for terminal: asciinema.org
+  Script (practice 3 times before recording):
+  
+  0:00 — "I built a distributed job scheduler in Rust. Let me show it running
+         on school servers."
+  0:15 — Start 2 schedulers + 5 workers + etcd on school machines (via SSH)
+  0:45 — Show all machines in Grafana: all nodes green, etcd connected
+  1:00 — Submit 200 jobs via CLI from laptop: scheduler submit --type ... (10 times)
+  1:15 — Show web dashboard: /jobs page, jobs running across workers in real time
+  1:40 — SSH to Machine A: sudo poweroff
+  1:50 — Show Grafana: leader panel switches to Machine B, queue spikes, recovers
+  2:20 — Show web dashboard: all 200 jobs complete, nothing lost
+  2:45 — Show GitHub repo. END.
+  
+  Upload to YouTube (unlisted or public).
+  Link prominently in README (below the Grafana screenshot).
+  The school hardware is your differentiator — make it obvious these are real
+  machines with real network latency.
+
+[MUST] Prepare and answer 15 deep technical questions OUT LOUD
+  Time each answer: target 2–3 minutes. Record yourself on 3 of them and watch back.
+  
+  1. How does leader election work?
+     Answer: etcd lease with 10s TTL. On startup, race to PUT scheduler/leader key
+     with lease attached. Winner becomes leader, losers watch the key and retry
+     on key deletion. Leader renews lease every 3 seconds.
+  
+  2. What happens to in-flight jobs when the leader dies?
+     Answer: They stay in SQLite as state=Running. When the standby becomes leader,
+     it loads all jobs where state=Running and transitions them back to Queued.
+     The new leader then dispatches them to available workers. This is at-least-once
+     — the worker may have completed the job before the crash, so it might run twice.
+  
+  3. Why at-least-once and not exactly-once?
+     Answer: Exactly-once is impossible across system boundaries. The scheduler
+     cannot atomically execute a job AND record its completion. If the scheduler
+     crashes between those two events, the job ran but wasn't recorded. The only
+     correct guarantee across boundaries is at-least-once. We mitigate with
+     idempotent executors — jobs produce the same result if run twice.
+  
+  4. How do you choose the heartbeat threshold?
+     Answer: 3× the heartbeat interval. At 5-second heartbeats, the threshold is 15
+     seconds. This tolerates 2 consecutive dropped packets without declaring a live
+     worker dead (false positive). Going to 2× is too tight — one jittered packet
+     causes a false alarm. Going beyond 4× delays reassignment of real failures.
+  
+  5. What is priority starvation and how do you prevent it?
+     Answer: A constant stream of high-priority jobs can prevent low-priority jobs
+     from ever running. We prevent it with aging: a job's effective_priority is
+     boosted by 1 every N seconds it waits. Eventually a low-priority job reaches
+     a high enough effective_priority to run.
+  
+  6. How does tag-based routing work?
+     Answer: Workers declare a map of tags on registration (e.g., gpu=true). Jobs
+     declare a requirements map on submission. A job routes to a worker only if
+     the job's requirements are a subset of the worker's tags. This is equivalent
+     to Kubernetes node selectors — any engineer who has used Kubernetes will
+     immediately understand it.
+  
+  7. How does the token bucket rate limiter work?
+     Answer: A bucket has a capacity and a refill rate (tokens/sec). Before each
+     dispatch, the scheduler tries to consume one token. If the bucket is empty,
+     it waits until the next token arrives. Tokens refill continuously (not in
+     batches) to prevent burst behavior. We use integer tokens to avoid float drift.
+  
+  8. What does the job state machine look like?
+     Answer: States: Queued, Running, Succeeded, Failed, Retrying, DeadLettered.
+     Transitions are implemented as fn transition(state, event) -> Result<state, error>.
+     Invalid transitions (e.g., Succeeded → Running) return Err — never panic.
+     [Draw the state machine on a whiteboard if available.]
+  
+  9. How do cron jobs survive failover without double-firing?
+     Answer: Each cron job records last_fired_at in SQLite. The tick loop has an
+     idempotency guard: before firing a cron job, it computes the current interval's
+     start time and checks if last_fired_at >= interval_start. If so, the cron job
+     already fired this interval (perhaps the old leader fired it), and we skip it.
+  
+  10. What is your job submission throughput?
+      Answer: [fill in from BENCHMARKS.md] On school hardware with SQLite WAL
+      enabled, approximately X,000 submissions/sec RPC overhead. Without persistence
+      (in-memory only) it's Y,000/sec — the delta is the WAL write cost of Zms/job.
+  
+  11. What is your failure detection latency p99?
+      Answer: [fill in from BENCHMARKS.md] Across 20 SIGKILL tests on school
+      hardware, mean detection is Xs, p99 is Xs. The variance is driven by the
+      heartbeat scan interval (10 seconds) plus propagation delay.
+  
+  12. What would you do differently if starting over?
+      Answer: I'd use an in-memory message broker (like Redis streams) for job
+      dispatch instead of pure gRPC — it would simplify the scheduler state and
+      provide built-in persistence semantics. I'd also implement phi accrual failure
+      detection instead of the fixed threshold, which would reduce false positives
+      under variable network conditions.
+  
+  13. How would you add exactly-once semantics?
+      Answer: You would need the worker to atomically write the result AND delete
+      the "processing" lease in a single transaction. This requires the worker to
+      participate in the scheduler's persistence layer — the result write and the
+      job completion acknowledgment must be atomic. Practical approach: give each
+      job a unique idempotency key, have workers write results to a shared database
+      with an upsert (idempotency key + result), and have the scheduler check this
+      database before declaring a job failed. This is how Stripe implements it.
+  
+  14. How would you scale to 1,000 workers?
+      Answer: The current bottleneck is the dispatch loop — single-threaded, one
+      dispatcher. To scale: shard the job queue by job_type into multiple queues,
+      each with its own dispatcher. Each shard can then run independently. The
+      worker heartbeat overhead (1,000 streams) is manageable with the current
+      bidirectional streaming design. The SQLite bottleneck would require sharding
+      by job_id hash across multiple SQLite files or switching to PostgreSQL with
+      connection pooling.
+  
+  15. What are your known limitations?
+      Answer: At-least-once delivery (not exactly-once). Fan-out depth=1 only.
+      Single etcd node is a SPOF. Fixed heartbeat threshold (not adaptive phi accrual).
+      Priority aging requires O(n) BinaryHeap rebuild. No horizontal SQLite scaling.
+      [Say these confidently — knowing your limitations is engineering maturity.]
+
+[MUST] Post to Hacker News and r/rust
+  HN post title: "Show HN: Distributed job scheduler in Rust — leader election,
+  cron, rate limiting, chaos tested on real hardware"
+  First paragraph: what it is + one technical highlight + GitHub link
+  Post on: Tuesday–Thursday, 9am–12pm Eastern Time (peak HN traffic)
+  Engage with EVERY comment — critical comments are free interview practice
+  
+  r/rust post: Same project, different framing.
+  Focus on: Rust-specific decisions:
+    - DashMap vs Mutex<HashMap> for hot read paths
+    - tokio bidirectional streaming for heartbeats (not repeated unary)
+    - sqlx with SQLite WAL mode for async persistence
+    - CancellationToken for job cancellation propagation
+    - UUID v7 for time-ordered job IDs
+
+[MUST] Finalize resume line with specific numbers (fill in from benchmarks)
+  "Built a distributed job scheduler in Rust — etcd leader election,
+  tag-based worker routing, resource-aware scheduling, priority aging,
+  token bucket rate limiting, exponential backoff retry with jitter, cron
+  scheduling, and fan-out jobs. Deployed on a 7-machine school cluster.
+  Benchmarked at [X]k job submissions/sec with end-to-end p99 of [Y]ms.
+  Chaos-tested with random leader kills and network partitions — zero job loss
+  across [N] consecutive runs."
+  
+  Add to LinkedIn with:
+    - 3-sentence description
+    - Grafana failover screenshot as media attachment
+    - Link to GitHub repo
+
+── CRATES THIS WEEK ─────────────────────────────────────────────────────────────
+  mdBook   — optional, generate a project website from markdown
+             URL: rust-lang.github.io/mdBook
+
+── RISKS ────────────────────────────────────────────────────────────────────────
+  [RED] Skipping the demo video. A 3-minute video of a real failover on real school
+  hardware is your single strongest interview asset. It takes 2 hours to record.
+  It pays dividends in every single interview. Do not skip it.
+
+  [AMBER] Not practicing verbal answers. Knowing how you built it and being able
+  to explain it under interview pressure are DIFFERENT SKILLS. The 15-question
+  exercise must be done OUT LOUD, timed, with a recording of at least 3 answers.
+  Doing it in your head is not sufficient.
+
+  [AMBER] Posting to HN on a Friday evening. Posts submitted Friday evening through
+  Sunday have dramatically lower visibility. Post Tuesday–Thursday 9am–12pm ET only.
+
+================================================================================
+FINAL PROJECT SUMMARY
+================================================================================
+
+WHAT YOU BUILT:
+  A distributed job scheduler in Rust deployed on real school hardware.
+
+TECHNICAL FEATURES:
+  - gRPC API (SubmitJob, GetJobStatus, CancelJob, ListJobs, DLQ, templates)
+  - Priority queue with BinaryHeap (higher priority first)
+  - etcd-based leader election (10s lease, 30s failover SLA)
+  - Tag-based worker routing (Kubernetes node selector equivalent)
+  - Resource-aware scheduling (CPU + memory tracking)
+  - Priority starvation prevention (time-based priority aging)
+  - Heartbeat + failure detection (5s interval, 15s threshold, 3× ratio)
+  - Exponential backoff retry with jitter (RetryPolicy type system)
+  - Dead-letter queue with ListDeadLettered + RequeueFromDLQ
+  - SQLite WAL persistence (survive SIGKILL, recover on restart)
+  - Per-job-type rate limiting
+  - Global token bucket rate limiter
+  - Fan-out jobs (parent-child, depth=1)
+  - Cron scheduling with double-fire prevention (idempotency guard)
+  - Job templates
+  - Prometheus metrics + 6-panel Grafana dashboard
+  - Web dashboard UI (axum + htmx, live updates)
+  - Full CLI client (clap, --output json, proper exit codes)
+  - docker-compose for full local stack
+
+DEPLOYMENT:
+  - 7 school machines: 2 schedulers, etcd, 4 workers
+  - Real multi-machine cluster with real network latency
+  - systemd unit files for process management
+  - deploy.sh for rsync + restart
+
+TESTING:
+  - 5 chaos tests × 10 consecutive runs each on school hardware
+  - Zero job loss across all runs
+  - Tests: leader failover, worker mass failure, scheduler restart,
+           network partition, cron double-fire after failover
+
+INTERVIEW TALKING POINTS:
+  At-least-once delivery (can explain exactly why exactly-once is impossible)
+  Heartbeat threshold design (3× ratio, tradeoffs vs phi accrual)
+  etcd for leader election (vs. implementing own consensus)
+  DashMap vs Mutex<HashMap> (hot read path reasoning)
+  Token bucket with continuous refill (vs. batch refill thundering herd)
+  Kubernetes equivalence of tag routing (immediately relatable)
+  School hardware demo (real distribution, not simulated)
+
+================================================================================
+END OF PHASE 4
+================================================================================

@@ -25,128 +25,202 @@ pub enum JobEvent {
     },
     WorkerLost {
         reason: String,
-    }
+    },
 }
 
 #[derive(Error, PartialEq, Debug)]
 pub enum TransitionError {
-    #[error("Invalid transition attempted, previous state: {previous_state:?}, attempted state: {attempted_transition:?}")]
+    #[error(
+        "Invalid transition attempted, previous state: {previous_state:?}, attempted state: {attempted_transition:?}"
+    )]
     InvalidTransition {
         previous_state: JobState,
         attempted_transition: JobEvent,
     }, //an example of an invalid transition between states would be success and run
     #[error("Retry limit reached maximum")]
-    RetryLimitReached, 
+    RetryLimitReached,
     //when the retry count reaches its maximum so must be deadlettered, for now the error is unreachable so just a placeholder rn
 }
 
-pub fn determine_next_event(job: &Job) -> JobEvent { //this is for determining if a failed job should be deadlettered or retried
+pub fn determine_next_event(job: &Job) -> JobEvent {
+    //this is for determining if a failed job should be deadlettered or retried
     match job.retry_policy.next_delay(job.retry_count) {
         Some(delay) => {
             //let now = std::time::Instant::now();
-            return JobEvent::Retry { retry_after: delay }
-        },
+            return JobEvent::Retry { retry_after: delay };
+        }
 
         None => {
-            return JobEvent::DeadLetter { reason: "retries exhausted".to_string() }
+            return JobEvent::DeadLetter {
+                reason: "retries exhausted".to_string(),
+            };
         }
     }
 }
 
 const MAX_INFRA_INTERRUPTIONS: u64 = 5;
 
-
 pub fn determine_reclaim_event(job: &Job) -> JobEvent {
     if job.infra_interruptions >= MAX_INFRA_INTERRUPTIONS {
-        return JobEvent::DeadLetter { reason: "exceeded infrastructure interruption cap, treated as a poison pill".to_string() }
+        return JobEvent::DeadLetter {
+            reason: "exceeded infrastructure interruption cap, treated as a poison pill"
+                .to_string(),
+        };
     }
 
-    return JobEvent::WorkerLost { reason: "worker was lost".to_string() }
+    return JobEvent::WorkerLost {
+        reason: "worker was lost".to_string(),
+    };
 }
 
-//transition should be a pure function 
+//transition should be a pure function
 //think about race conditions here in the future make sure this is an atomic operation
 //along with reading into the job
 pub fn transition(job: &mut Job, event: JobEvent) -> Result<(), TransitionError> {
     let current_state = std::mem::replace(&mut job.state, JobState::Queued);
     match (current_state, event) {
-        (JobState::Queued, JobEvent::Run { worker_id, started_at }) => {
-            job.state = JobState::Running { worker_id, started_at };
+        (
+            JobState::Queued,
+            JobEvent::Run {
+                worker_id,
+                started_at,
+            },
+        ) => {
+            job.state = JobState::Running {
+                worker_id,
+                started_at,
+            };
             Ok(())
-        },
+        }
 
-        (JobState::Running {worker_id: _, started_at: _ }, JobEvent::Success { completed_at, result }) => {
-            job.state = JobState::Succeeded { completed_at, result };
+        (
+            JobState::Running {
+                worker_id: _,
+                started_at: _,
+            },
+            JobEvent::Success {
+                completed_at,
+                result,
+            },
+        ) => {
+            job.state = JobState::Succeeded {
+                completed_at,
+                result,
+            };
             Ok(())
-        },
+        }
 
-        (JobState::Running { worker_id: _, started_at: _ }, JobEvent::Fail { error }) => {
+        (
+            JobState::Running {
+                worker_id: _,
+                started_at: _,
+            },
+            JobEvent::Fail { error },
+        ) => {
             job.state = JobState::Failed { error };
             job.retry_count += 1;
-            Ok(()) 
-        },
+            Ok(())
+        }
 
         (JobState::Failed { error: _ }, JobEvent::Retry { retry_after }) => {
             job.state = JobState::Retrying { retry_after };
             Ok(())
-        },
+        }
 
-        (JobState::Retrying { retry_after: _}, JobEvent::Run { worker_id, started_at }) => {
-            job.state = JobState::Running { worker_id, started_at }; //must check for the number of attempts as well later on
+        (
+            JobState::Retrying { retry_after: _ },
+            JobEvent::Run {
+                worker_id,
+                started_at,
+            },
+        ) => {
+            job.state = JobState::Running {
+                worker_id,
+                started_at,
+            }; //must check for the number of attempts as well later on
             Ok(())
-        },
+        }
 
-        (JobState::Retrying { retry_after: _}, JobEvent::DeadLetter { reason }) => {
+        (JobState::Retrying { retry_after: _ }, JobEvent::DeadLetter { reason }) => {
             job.state = JobState::DeadLettered { reason };
             Ok(())
-        },
+        }
 
         (JobState::Failed { error: _ }, JobEvent::DeadLetter { reason }) => {
             job.state = JobState::DeadLettered { reason };
             Ok(())
-        },
+        }
 
         (JobState::Queued, JobEvent::Abandon { reason }) => {
-            job.state = JobState::Abandoned { reason, abandoned_at: now_millis() };
+            job.state = JobState::Abandoned {
+                reason,
+                abandoned_at: now_millis(),
+            };
             Ok(())
         }
 
-        (JobState::Running { worker_id: _, started_at: _ }, JobEvent::Abandon { reason }) => {
-            job.state = JobState::Abandoned { reason, abandoned_at: now_millis() };
+        (
+            JobState::Running {
+                worker_id: _,
+                started_at: _,
+            },
+            JobEvent::Abandon { reason },
+        ) => {
+            job.state = JobState::Abandoned {
+                reason,
+                abandoned_at: now_millis(),
+            };
             Ok(())
         }
 
         (JobState::Retrying { retry_after: _ }, JobEvent::Abandon { reason }) => {
-            job.state = JobState::Abandoned { reason, abandoned_at: now_millis() };
+            job.state = JobState::Abandoned {
+                reason,
+                abandoned_at: now_millis(),
+            };
             Ok(())
         }
 
-        (JobState::Running { worker_id: _, started_at: _ }, JobEvent::WorkerLost { reason: _ }) => {
+        (
+            JobState::Running {
+                worker_id: _,
+                started_at: _,
+            },
+            JobEvent::WorkerLost { reason: _ },
+        ) => {
             job.state = JobState::Queued;
             job.infra_interruptions += 1;
             Ok(())
         }
 
-        (JobState::Running { worker_id: _, started_at: _ }, JobEvent::DeadLetter { reason }) => {
+        (
+            JobState::Running {
+                worker_id: _,
+                started_at: _,
+            },
+            JobEvent::DeadLetter { reason },
+        ) => {
             job.state = JobState::DeadLettered { reason };
             Ok(())
         }
 
         (state, event) => {
-            job.state = state.clone();  
-            Err(TransitionError::InvalidTransition { previous_state: state, attempted_transition: event })
-        },
-
-    }//note: there isnt a (Failed, Abandon) arm since there is a Fail to determine_next_event() to Retry or Deadletter sequence in run()
+            job.state = state.clone();
+            Err(TransitionError::InvalidTransition {
+                previous_state: state,
+                attempted_transition: event,
+            })
+        }
+    } //note: there isnt a (Failed, Abandon) arm since there is a Fail to determine_next_event() to Retry or Deadletter sequence in run()
 }
 
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, fs::Metadata};
 
-use super::*;
+    use super::*;
     use crate::job_data_structures::{Job, JobQueue, JobState, QueueError, RetryPolicy};
- 
+
     fn make_job(state: JobState, id: uuid::Uuid) -> Job {
         Job {
             id,
@@ -168,16 +242,37 @@ use super::*;
 
     fn running_plus_success_to_succeeded() {
         let id = uuid::Uuid::now_v7();
-        let mut job = make_job(JobState::Running { worker_id: id, started_at: 1 }, id);
-        let event = JobEvent::Success { completed_at: 1, result: 1 };
+        let mut job = make_job(
+            JobState::Running {
+                worker_id: id,
+                started_at: 1,
+            },
+            id,
+        );
+        let event = JobEvent::Success {
+            completed_at: 1,
+            result: 1,
+        };
         let result = transition(&mut job, event);
         assert_eq!(result, Ok(()));
-        assert_eq!(job.state, JobState::Succeeded { completed_at: 1, result: 1 });
+        assert_eq!(
+            job.state,
+            JobState::Succeeded {
+                completed_at: 1,
+                result: 1
+            }
+        );
     }
     #[test]
     fn running_plus_fail_to_failed() {
         let id = uuid::Uuid::now_v7();
-        let mut job = make_job(JobState::Running { worker_id: id, started_at: 1 }, id);
+        let mut job = make_job(
+            JobState::Running {
+                worker_id: id,
+                started_at: 1,
+            },
+            id,
+        );
         let event = JobEvent::Fail { error: 1 };
         let result = transition(&mut job, event);
         assert_eq!(result, Ok(()));
@@ -188,37 +283,79 @@ use super::*;
     fn failed_plus_retry_to_retrying() {
         let id = uuid::Uuid::now_v7();
         let mut job = make_job(JobState::Failed { error: 1 }, id);
-        let event = JobEvent::Retry { retry_after: std::time::Duration::from_millis(200) };
+        let event = JobEvent::Retry {
+            retry_after: std::time::Duration::from_millis(200),
+        };
         let result = transition(&mut job, event);
         assert_eq!(result, Ok(()));
-        assert_eq!(job.state, JobState::Retrying { retry_after: std::time::Duration::from_millis(200) });
+        assert_eq!(
+            job.state,
+            JobState::Retrying {
+                retry_after: std::time::Duration::from_millis(200)
+            }
+        );
     }
     #[test]
     fn retrying_plus_run_to_running() {
         let id = uuid::Uuid::now_v7();
-        let mut job = make_job(JobState::Retrying { retry_after: std::time::Duration::from_millis(200) }, id);
-        let event = JobEvent::Run { worker_id: id, started_at: 1 };
+        let mut job = make_job(
+            JobState::Retrying {
+                retry_after: std::time::Duration::from_millis(200),
+            },
+            id,
+        );
+        let event = JobEvent::Run {
+            worker_id: id,
+            started_at: 1,
+        };
         let result = transition(&mut job, event);
         assert_eq!(result, Ok(()));
-        assert_eq!(job.state, JobState::Running { worker_id: id, started_at: 1 });
+        assert_eq!(
+            job.state,
+            JobState::Running {
+                worker_id: id,
+                started_at: 1
+            }
+        );
     }
     #[test]
     fn retrying_plus_deadletter_to_deadlettered() {
         let id = uuid::Uuid::now_v7();
-        let mut job = make_job(JobState::Retrying { retry_after: std::time::Duration::from_millis(200) }, id);
-        let event = JobEvent::DeadLetter { reason: "unknown for now".to_string() };
+        let mut job = make_job(
+            JobState::Retrying {
+                retry_after: std::time::Duration::from_millis(200),
+            },
+            id,
+        );
+        let event = JobEvent::DeadLetter {
+            reason: "unknown for now".to_string(),
+        };
         let result = transition(&mut job, event);
         assert_eq!(result, Ok(()));
-        assert_eq!(job.state, JobState::DeadLettered { reason: "unknown for now".to_string() });
+        assert_eq!(
+            job.state,
+            JobState::DeadLettered {
+                reason: "unknown for now".to_string()
+            }
+        );
     }
     #[test]
     fn queued_plus_run_transitions_to_running() {
         let id = uuid::Uuid::now_v7();
         let mut job = make_job(JobState::Queued, id);
-        let event = JobEvent::Run { worker_id: id, started_at: 100 };
+        let event = JobEvent::Run {
+            worker_id: id,
+            started_at: 100,
+        };
         let result = transition(&mut job, event);
         assert_eq!(result, Ok(()));
-        assert_eq!(job.state, JobState::Running { worker_id: id, started_at: 100 });
+        assert_eq!(
+            job.state,
+            JobState::Running {
+                worker_id: id,
+                started_at: 100
+            }
+        );
     }
 
     #[test]
@@ -226,28 +363,92 @@ use super::*;
     fn queued_plus_success_to_queued() {
         let id = uuid::Uuid::now_v7();
         let mut job = make_job(JobState::Queued, id);
-        let event = JobEvent::Success { completed_at: 1, result: 1 };
+        let event = JobEvent::Success {
+            completed_at: 1,
+            result: 1,
+        };
         let result = transition(&mut job, event);
-        assert_eq!(result, Err(TransitionError::InvalidTransition { previous_state: JobState::Queued, attempted_transition: JobEvent::Success { completed_at: 1, result: 1 }}));
-        assert_eq!(job.state, JobState::Queued); 
+        assert_eq!(
+            result,
+            Err(TransitionError::InvalidTransition {
+                previous_state: JobState::Queued,
+                attempted_transition: JobEvent::Success {
+                    completed_at: 1,
+                    result: 1
+                }
+            })
+        );
+        assert_eq!(job.state, JobState::Queued);
     }
     #[test]
     fn succeeded_plus_run_to_succeeded() {
         let id = uuid::Uuid::now_v7();
-        let mut job = make_job(JobState::Succeeded { completed_at: 1, result: 2 }, id);
-        let event = JobEvent::Run { worker_id: id, started_at: 3 };
+        let mut job = make_job(
+            JobState::Succeeded {
+                completed_at: 1,
+                result: 2,
+            },
+            id,
+        );
+        let event = JobEvent::Run {
+            worker_id: id,
+            started_at: 3,
+        };
         let result = transition(&mut job, event);
-        assert_eq!(result, Err(TransitionError::InvalidTransition { previous_state: JobState::Succeeded { completed_at: 1, result: 2 }, attempted_transition: JobEvent::Run { worker_id: id, started_at: 3 }}));
-        assert_eq!(job.state, JobState::Succeeded { completed_at: 1, result: 2 }); 
+        assert_eq!(
+            result,
+            Err(TransitionError::InvalidTransition {
+                previous_state: JobState::Succeeded {
+                    completed_at: 1,
+                    result: 2
+                },
+                attempted_transition: JobEvent::Run {
+                    worker_id: id,
+                    started_at: 3
+                }
+            })
+        );
+        assert_eq!(
+            job.state,
+            JobState::Succeeded {
+                completed_at: 1,
+                result: 2
+            }
+        );
     }
     #[test]
     fn running_plus_retry_to_running() {
         let id = uuid::Uuid::now_v7();
-        let mut job = make_job(JobState::Running { worker_id: id, started_at: 300 }, id);
-        let event = JobEvent::Retry { retry_after: std::time::Duration::from_millis(200) };
+        let mut job = make_job(
+            JobState::Running {
+                worker_id: id,
+                started_at: 300,
+            },
+            id,
+        );
+        let event = JobEvent::Retry {
+            retry_after: std::time::Duration::from_millis(200),
+        };
         let result = transition(&mut job, event);
-        assert_eq!(result, Err(TransitionError::InvalidTransition { previous_state: JobState::Running { worker_id: id, started_at: 300 }, attempted_transition: JobEvent::Retry { retry_after: std::time::Duration::from_millis(200)}}));
-        assert_eq!(job.state, JobState::Running { worker_id: id, started_at: 300 }); 
+        assert_eq!(
+            result,
+            Err(TransitionError::InvalidTransition {
+                previous_state: JobState::Running {
+                    worker_id: id,
+                    started_at: 300
+                },
+                attempted_transition: JobEvent::Retry {
+                    retry_after: std::time::Duration::from_millis(200)
+                }
+            })
+        );
+        assert_eq!(
+            job.state,
+            JobState::Running {
+                worker_id: id,
+                started_at: 300
+            }
+        );
     }
 
     #[test]
@@ -255,14 +456,22 @@ use super::*;
         let id = uuid::Uuid::now_v7();
         let mut job = make_job(JobState::Queued, id);
         let before = now_millis();
-        let result = transition(&mut job, JobEvent::Abandon { reason: "test".to_string() });
+        let result = transition(
+            &mut job,
+            JobEvent::Abandon {
+                reason: "test".to_string(),
+            },
+        );
         let after = now_millis();
         assert_eq!(result, Ok(()));
         match job.state {
-            JobState::Abandoned { reason, abandoned_at } => {
+            JobState::Abandoned {
+                reason,
+                abandoned_at,
+            } => {
                 assert_eq!(reason, "test");
                 assert!(abandoned_at >= before && abandoned_at <= after);
-            },
+            }
             other => panic!("expected Abandoned, got {:?}", other),
         }
     }
@@ -270,16 +479,30 @@ use super::*;
     #[test]
     fn running_plus_abandon_to_abandoned() {
         let id = uuid::Uuid::now_v7();
-        let mut job = make_job(JobState::Running { worker_id: id, started_at: 1 }, id);
+        let mut job = make_job(
+            JobState::Running {
+                worker_id: id,
+                started_at: 1,
+            },
+            id,
+        );
         let before = now_millis();
-        let result = transition(&mut job, JobEvent::Abandon { reason: "test".to_string() });
+        let result = transition(
+            &mut job,
+            JobEvent::Abandon {
+                reason: "test".to_string(),
+            },
+        );
         let after = now_millis();
         assert_eq!(result, Ok(()));
         match job.state {
-            JobState::Abandoned { reason, abandoned_at } => {
+            JobState::Abandoned {
+                reason,
+                abandoned_at,
+            } => {
                 assert_eq!(reason, "test");
                 assert!(abandoned_at >= before && abandoned_at <= after);
-            },
+            }
             other => panic!("expected Abandoned, got {:?}", other),
         }
     }
@@ -287,20 +510,32 @@ use super::*;
     #[test]
     fn retrying_plus_abandon_to_abandoned() {
         let id = uuid::Uuid::now_v7();
-        let mut job = make_job(JobState::Retrying { retry_after: std::time::Duration::from_millis(100) }, id);
+        let mut job = make_job(
+            JobState::Retrying {
+                retry_after: std::time::Duration::from_millis(100),
+            },
+            id,
+        );
         let before = now_millis();
-        let result = transition(&mut job, JobEvent::Abandon { reason: "test".to_string() });
+        let result = transition(
+            &mut job,
+            JobEvent::Abandon {
+                reason: "test".to_string(),
+            },
+        );
         let after = now_millis();
         assert_eq!(result, Ok(()));
         match job.state {
-            JobState::Abandoned { reason, abandoned_at } => {
+            JobState::Abandoned {
+                reason,
+                abandoned_at,
+            } => {
                 assert_eq!(reason, "test");
                 assert!(abandoned_at >= before && abandoned_at <= after);
-            },
+            }
             other => panic!("expected Abandoned, got {:?}", other),
         }
     }
-
 
     //tests for determine_next_event to see if decision making for if a job should retry or not is correct
     #[test]
@@ -315,7 +550,10 @@ use super::*;
             created_at: 0,
             infra_interruptions: 0,
             state: JobState::Failed { error: 1 },
-            retry_policy: RetryPolicy::FixedDelay { delay_ms: 300, max_attempts: 3 },
+            retry_policy: RetryPolicy::FixedDelay {
+                delay_ms: 300,
+                max_attempts: 3,
+            },
             requirements: std::collections::HashMap::new(),
             metadata: std::collections::HashMap::new(),
         };
@@ -324,7 +562,7 @@ use super::*;
         match result {
             JobEvent::Retry { retry_after } => {
                 assert!((225..375).contains(&retry_after.as_millis()));
-            },
+            }
 
             _ => panic!("expected Retry, got {:?}", result),
         }
@@ -347,7 +585,12 @@ use super::*;
         };
         let result = determine_next_event(&mut job);
 
-        assert_eq!(result, JobEvent::DeadLetter { reason: "retries exhausted".to_string() });
+        assert_eq!(
+            result,
+            JobEvent::DeadLetter {
+                reason: "retries exhausted".to_string()
+            }
+        );
 
         let id = uuid::Uuid::now_v7();
         let mut job = Job {
@@ -359,14 +602,24 @@ use super::*;
             infra_interruptions: 0,
             created_at: 0,
             state: JobState::Failed { error: 1 },
-            retry_policy: RetryPolicy::ExponentialBackoff { base_ms: 200, multiplier: ordered_float::OrderedFloat(1.5), max_attempts: 3, max_delay_ms: 1000 },
+            retry_policy: RetryPolicy::ExponentialBackoff {
+                base_ms: 200,
+                multiplier: ordered_float::OrderedFloat(1.5),
+                max_attempts: 3,
+                max_delay_ms: 1000,
+            },
             requirements: std::collections::HashMap::new(),
             metadata: std::collections::HashMap::new(),
         };
 
         let result = determine_next_event(&mut job);
 
-        assert_eq!(result, JobEvent::DeadLetter { reason: "retries exhausted".to_string() });
+        assert_eq!(
+            result,
+            JobEvent::DeadLetter {
+                reason: "retries exhausted".to_string()
+            }
+        );
     }
 
     #[test]
@@ -377,128 +630,136 @@ use super::*;
         let id1 = uuid::Uuid::now_v7();
 
         let id2 = uuid::Uuid::now_v7();
-        queue.enqueue(Job { 
-            id: id1.clone(), 
-            job_type: "test_job".to_string(), 
-            payload: 2, 
-            priority: 1, 
-            retry_count: 0, 
+        queue.enqueue(Job {
+            id: id1.clone(),
+            job_type: "test_job".to_string(),
+            payload: 2,
+            priority: 1,
+            retry_count: 0,
             infra_interruptions: 0,
-            created_at: 12, 
+            created_at: 12,
             state: JobState::Queued,
             retry_policy: RetryPolicy::NoRetry,
             requirements: std::collections::HashMap::new(),
             metadata: std::collections::HashMap::new(),
         });
 
-        queue.enqueue(Job { 
-            id: id2.clone(), 
-            job_type: "test_job".to_string(), 
-            payload: 2, 
-            priority: 2, 
-            retry_count: 0, 
+        queue.enqueue(Job {
+            id: id2.clone(),
+            job_type: "test_job".to_string(),
+            payload: 2,
+            priority: 2,
+            retry_count: 0,
             infra_interruptions: 0,
-            created_at: 12, 
-            state: JobState::Queued,
-            retry_policy: RetryPolicy::NoRetry, 
-            requirements: std::collections::HashMap::new(),
-            metadata: std::collections::HashMap::new(),
-        });
-
-        assert_eq!(queue.dequeue(), Ok(Job { 
-            id: id2, 
-            job_type: "test_job".to_string(), 
-            payload: 2, 
-            priority: 2, 
-            retry_count: 0, 
-            infra_interruptions: 0,
-            created_at: 12, 
-            state: JobState::Queued,
-            retry_policy: RetryPolicy::NoRetry, 
-            requirements: std::collections::HashMap::new(),
-            metadata: std::collections::HashMap::new(),
-
-        }));
-
-        assert_eq!(queue.dequeue(), Ok(Job { 
-            id: id1, 
-            job_type: "test_job".to_string(), 
-            payload: 2, 
-            priority: 1, 
-            retry_count: 0, 
-            infra_interruptions: 0,
-            created_at: 12, 
+            created_at: 12,
             state: JobState::Queued,
             retry_policy: RetryPolicy::NoRetry,
             requirements: std::collections::HashMap::new(),
             metadata: std::collections::HashMap::new(),
-        }));        
-        
-        
+        });
+
+        assert_eq!(
+            queue.dequeue(),
+            Ok(Job {
+                id: id2,
+                job_type: "test_job".to_string(),
+                payload: 2,
+                priority: 2,
+                retry_count: 0,
+                infra_interruptions: 0,
+                created_at: 12,
+                state: JobState::Queued,
+                retry_policy: RetryPolicy::NoRetry,
+                requirements: std::collections::HashMap::new(),
+                metadata: std::collections::HashMap::new(),
+            })
+        );
+
+        assert_eq!(
+            queue.dequeue(),
+            Ok(Job {
+                id: id1,
+                job_type: "test_job".to_string(),
+                payload: 2,
+                priority: 1,
+                retry_count: 0,
+                infra_interruptions: 0,
+                created_at: 12,
+                state: JobState::Queued,
+                retry_policy: RetryPolicy::NoRetry,
+                requirements: std::collections::HashMap::new(),
+                metadata: std::collections::HashMap::new(),
+            })
+        );
     }
     #[test]
     fn jobqueue_created_at_test() {
-
         let id1 = uuid::Uuid::now_v7();
 
         let id2 = uuid::Uuid::now_v7();
 
         let mut queue = JobQueue::new();
-        queue.enqueue(Job { 
-            id: id1.clone(), 
-            job_type: "test_job".to_string(), 
-            payload: 2, 
-            priority: 1, 
-            retry_count: 0, 
+        queue.enqueue(Job {
+            id: id1.clone(),
+            job_type: "test_job".to_string(),
+            payload: 2,
+            priority: 1,
+            retry_count: 0,
             infra_interruptions: 0,
-            created_at: 12, 
+            created_at: 12,
             state: JobState::Queued,
-            retry_policy: RetryPolicy::NoRetry, 
+            retry_policy: RetryPolicy::NoRetry,
             requirements: std::collections::HashMap::new(),
             metadata: std::collections::HashMap::new(),
         });
 
-        queue.enqueue(Job { 
-            id: id2.clone(), 
-            job_type: "test_job".to_string(), 
-            payload: 2, 
-            priority: 1, 
-            retry_count: 0, 
+        queue.enqueue(Job {
+            id: id2.clone(),
+            job_type: "test_job".to_string(),
+            payload: 2,
+            priority: 1,
+            retry_count: 0,
             infra_interruptions: 0,
-            created_at: 10, 
+            created_at: 10,
             state: JobState::Queued,
-            retry_policy: RetryPolicy::NoRetry, 
+            retry_policy: RetryPolicy::NoRetry,
             requirements: std::collections::HashMap::new(),
             metadata: std::collections::HashMap::new(),
         });
 
-        assert_eq!(queue.dequeue(), Ok(Job { 
-            id: id2, 
-            job_type: "test_job".to_string(), 
-            payload: 2, 
-            priority: 1, 
-            retry_count: 0, 
-            infra_interruptions: 0,
-            created_at: 10, 
-            state: JobState::Queued,
-            retry_policy: RetryPolicy::NoRetry, 
-            requirements: std::collections::HashMap::new(),
-            metadata: std::collections::HashMap::new(),
-        }));
+        assert_eq!(
+            queue.dequeue(),
+            Ok(Job {
+                id: id2,
+                job_type: "test_job".to_string(),
+                payload: 2,
+                priority: 1,
+                retry_count: 0,
+                infra_interruptions: 0,
+                created_at: 10,
+                state: JobState::Queued,
+                retry_policy: RetryPolicy::NoRetry,
+                requirements: std::collections::HashMap::new(),
+                metadata: std::collections::HashMap::new(),
+            })
+        );
 
-        assert_eq!(queue.dequeue(), Ok(Job { 
-            id: id1, 
-            job_type: "test_job".to_string(), 
-            payload: 2, 
-            priority: 1, 
-            retry_count: 0, 
-            infra_interruptions: 0,
-            created_at: 12, 
-            state: JobState::Queued,
-            retry_policy: RetryPolicy::NoRetry, 
-            requirements: std::collections::HashMap::new(),
-            metadata: std::collections::HashMap::new(),
-        }));        
+        assert_eq!(
+            queue.dequeue(),
+            Ok(Job {
+                id: id1,
+                job_type: "test_job".to_string(),
+                payload: 2,
+                priority: 1,
+                retry_count: 0,
+                infra_interruptions: 0,
+                created_at: 12,
+                state: JobState::Queued,
+                retry_policy: RetryPolicy::NoRetry,
+                requirements: std::collections::HashMap::new(),
+                metadata: std::collections::HashMap::new(),
+            })
+        );
     }
     #[test]
     fn empty_queue_peek_error() {
@@ -522,13 +783,21 @@ use super::*;
             created_at: 0,
             infra_interruptions: 0,
             state: JobState::Failed { error: 1 },
-            retry_policy: RetryPolicy::FixedDelay { delay_ms: 300, max_attempts: 3 },
+            retry_policy: RetryPolicy::FixedDelay {
+                delay_ms: 300,
+                max_attempts: 3,
+            },
             requirements: std::collections::HashMap::new(),
             metadata: std::collections::HashMap::new(),
         };
         let result = determine_reclaim_event(&job);
 
-        assert_eq!(result, JobEvent::WorkerLost { reason: "worker was lost".to_string() })
+        assert_eq!(
+            result,
+            JobEvent::WorkerLost {
+                reason: "worker was lost".to_string()
+            }
+        )
     }
 
     #[test]
@@ -541,22 +810,37 @@ use super::*;
             retry_count: 0,
             created_at: 0,
             infra_interruptions: MAX_INFRA_INTERRUPTIONS,
-            state: JobState::Running { worker_id: uuid::Uuid::now_v7(), started_at: 1 },
-            retry_policy: RetryPolicy::FixedDelay { delay_ms: 300, max_attempts: 3 },
+            state: JobState::Running {
+                worker_id: uuid::Uuid::now_v7(),
+                started_at: 1,
+            },
+            retry_policy: RetryPolicy::FixedDelay {
+                delay_ms: 300,
+                max_attempts: 3,
+            },
             requirements: std::collections::HashMap::new(),
             metadata: std::collections::HashMap::new(),
         };
         let result = determine_reclaim_event(&job);
 
-        assert_eq!(result, JobEvent::DeadLetter { reason: "exceeded infrastructure interruption cap, treated as a poison pill".to_string() });
+        assert_eq!(
+            result,
+            JobEvent::DeadLetter {
+                reason: "exceeded infrastructure interruption cap, treated as a poison pill"
+                    .to_string()
+            }
+        );
 
         let transition_result = transition(&mut job, result);
-        
+
         assert_eq!(transition_result, Ok(()));
 
-        assert_eq!(job.state, JobState::DeadLettered { reason: "exceeded infrastructure interruption cap, treated as a poison pill".to_string() });
-          
+        assert_eq!(
+            job.state,
+            JobState::DeadLettered {
+                reason: "exceeded infrastructure interruption cap, treated as a poison pill"
+                    .to_string()
+            }
+        );
     }
-
-
 }

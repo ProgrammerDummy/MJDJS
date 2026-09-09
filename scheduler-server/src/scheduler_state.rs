@@ -1,32 +1,26 @@
-use scheduler_core::job_data_structures::{JobState, RetryPolicy};
-use scheduler_core::worker::{WorkerId};
-use tokio::sync::Notify;
 use crate::worker::WorkerInfo;
+use scheduler_core::job_data_structures::{JobState, RetryPolicy};
+use scheduler_core::worker::WorkerId;
+use tokio::sync::Notify;
 
 use uuid;
 
-use std::sync::{Arc};
-use std::sync::atomic::AtomicU64;
-use std::collections::{BTreeMap, BTreeSet};
 use dashmap::DashMap;
 use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
-use std::time::Instant;
 use std::cmp::Ordering;
+use std::time::Instant;
 
 use parking_lot::Mutex;
 
 #[derive(Debug, PartialEq, Clone, Eq)]
 pub enum CompletedJobOutcome {
-    Succeeded {
-        result: u64,
-    },
-    DeadLettered {
-        reason: String,
-    },
-    Abandoned {
-        reason: String,
-    }
+    Succeeded { result: u64 },
+    DeadLettered { reason: String },
+    Abandoned { reason: String },
 }
 
 #[derive(Debug, PartialEq, Clone, Eq)]
@@ -41,7 +35,6 @@ pub struct QueuedJob {
     pub retry_policy: RetryPolicy,
     pub requirements: HashMap<String, String>,
     pub metadata: HashMap<String, String>,
-
 }
 
 impl Ord for QueuedJob {
@@ -50,7 +43,7 @@ impl Ord for QueuedJob {
         match self.priority.cmp(&other.priority).reverse() {
             Ordering::Equal => {
                 //if priorities are equal, compare the created_at time to decide which one is ordered first
-                match self.created_at.cmp(&other.created_at)  {
+                match self.created_at.cmp(&other.created_at) {
                     Ordering::Equal => self.id.cmp(&other.id),
                     other => other,
                 }
@@ -86,7 +79,10 @@ pub struct RunningJob {
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum RunningPhase {
-    Executing { worker_id: WorkerId, started_at: u64 },
+    Executing {
+        worker_id: WorkerId,
+        started_at: u64,
+    },
     Retrying,
 }
 
@@ -112,7 +108,7 @@ pub struct SchedulerState {
     pub job_queue: Arc<Mutex<BTreeSet<QueuedJob>>>, //BTreeSet ordered by priority and then created_at for retrieving first value for one at a time access
     pub running_jobs: Arc<DashMap<uuid::Uuid, RunningJob>>, //dashmap for sharding since this will have many concurrent callers, avoids contention
     pub completed_jobs: Arc<DashMap<uuid::Uuid, CompletedJob>>, //same as running_jobs
-    pub workers: Arc<DashMap<WorkerId, WorkerInfo>>, //same as above
+    pub workers: Arc<DashMap<WorkerId, WorkerInfo>>,        //same as above
     pub retry_queue: Arc<Mutex<BTreeSet<(Instant, uuid::Uuid)>>>, //BTreeSet for allowing cancellation and keyed removal of individual elements
     pub worker_heartbeat_timer: Arc<Mutex<BTreeSet<(Instant, WorkerId)>>>,
     pub total_submitted: Arc<AtomicU64>, //atomic counter
@@ -121,33 +117,30 @@ pub struct SchedulerState {
     pub total_dead_lettered: Arc<AtomicU64>,
     pub retry_notify: Arc<Notify>,
     pub new_worker_deadline_notify: Arc<Notify>,
-
     //chose to wrap each field with Arc and mutex/dashmap so that only necessary components can clone the arc handle rather than having access to entire struct
 
-    //the fields that use btreesets could be changed to bibtreemaps to accomplish the goal of preventing collisions AND 
+    //the fields that use btreesets could be changed to bibtreemaps to accomplish the goal of preventing collisions AND
     //reducign time to O(logn), maybe in the future i can do this
 
-    //actually for only a few hundred workers the O(n) time shouldnt be too performance heavy, only a couple milliseconds 
+    //actually for only a few hundred workers the O(n) time shouldnt be too performance heavy, only a couple milliseconds
     //for a linear scan, its probably likely that if worker count gets real fatty then performance costs incur at heavier scales
 }
 
 impl SchedulerState {
-
     pub fn new() -> Self {
         SchedulerState {
-            job_queue: Arc::new(Mutex::new(BTreeSet::new())), 
-            running_jobs: Arc::new(DashMap::new()), 
-            completed_jobs: Arc::new(DashMap::new()), 
-            workers: Arc::new(DashMap::new()), 
-            retry_queue: Arc::new(Mutex::new(BTreeSet::new())), 
+            job_queue: Arc::new(Mutex::new(BTreeSet::new())),
+            running_jobs: Arc::new(DashMap::new()),
+            completed_jobs: Arc::new(DashMap::new()),
+            workers: Arc::new(DashMap::new()),
+            retry_queue: Arc::new(Mutex::new(BTreeSet::new())),
             worker_heartbeat_timer: Arc::new(Mutex::new(BTreeSet::new())),
-            total_submitted: Arc::new(0.into()), 
+            total_submitted: Arc::new(0.into()),
             total_completed: Arc::new(0.into()),
             total_failed: Arc::new(0.into()),
             total_dead_lettered: Arc::new(0.into()),
             retry_notify: Arc::new(Notify::new()),
             new_worker_deadline_notify: Arc::new(Notify::new()),
         }
-
     }
 }

@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
-use tokio_util::sync::CancellationToken;
 use async_trait::async_trait;
+use tokio_util::sync::CancellationToken;
 
 use thiserror::Error;
 
@@ -12,12 +12,14 @@ pub struct ExecutorRegistry {
 
 impl ExecutorRegistry {
     pub fn new() -> Self {
-        ExecutorRegistry { registry:HashMap::new() }
+        ExecutorRegistry {
+            registry: HashMap::new(),
+        }
     }
 
     pub fn register(&mut self, executor_type: String, executor: Arc<dyn JobExecutor>) {
         self.registry.insert(executor_type, executor);
-    } 
+    }
 
     pub fn get(&self, job_type: &str) -> Option<Arc<dyn JobExecutor>> {
         self.registry.get(job_type).cloned()
@@ -47,37 +49,24 @@ pub enum JobError {
     NoExecutor,
 }
 
-
 impl JobError {
     pub fn error_code_translation(&self) -> u64 {
         //to map to a error code, depending on the error type
         match self {
-            JobError::Timeout => {
-                101
-            },
-            JobError::BadPayload => {
-                102
-            },
-            JobError::ExecutionFailure(num) => {
-                (*num).min(99)
-            },
-            JobError::Cancelled => {
-                103
-            }
-            JobError::NoExecutor => {
-                104
-            }
+            JobError::Timeout => 101,
+            JobError::BadPayload => 102,
+            JobError::ExecutionFailure(num) => (*num).min(99),
+            JobError::Cancelled => 103,
+            JobError::NoExecutor => 104,
         }
     }
 
     /*
-    
+
     1-99 are for job specific errors
     100 and beyond are for system errors
      */
 }
-
-
 
 pub struct SleepJob {}
 

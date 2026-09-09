@@ -30,14 +30,12 @@ impl Ord for Job {
         match self.priority.cmp(&other.priority) {
             Ordering::Equal => {
                 //if priorities are equal, compare the created_at time to decide which one is ordered first
-                self.created_at.cmp(&other.created_at).reverse() 
+                self.created_at.cmp(&other.created_at).reverse()
                 //use .reverse() so that earlier jobs come first if priorities are same
             }
             other => other, //if different priorites, give the ordering as is
         }
     }
-
-
 }
 
 impl Job {
@@ -53,7 +51,6 @@ impl Job {
     }
 }
 
-
 impl PartialOrd for Job {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
@@ -62,21 +59,17 @@ impl PartialOrd for Job {
 }
 #[derive(Debug, Clone, PartialEq)]
 pub enum JobOutcome {
-    Success {
-        result: u64,
-    },
-    Failure {
-        error: u64,
-    },
+    Success { result: u64 },
+    Failure { error: u64 },
     Cancelled,
 }
-
 
 //removed retry_policy struct field from Job to make the retry policy belong to the type of job for simplicity
 //remember to add this later
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RetryPolicy { //a retry policy which has three options, to not retry, a fixed delay between retries, or an exponential backoff
+pub enum RetryPolicy {
+    //a retry policy which has three options, to not retry, a fixed delay between retries, or an exponential backoff
     NoRetry,
     FixedDelay {
         delay_ms: u64,
@@ -90,44 +83,48 @@ pub enum RetryPolicy { //a retry policy which has three options, to not retry, a
     },
 }
 
-
 impl RetryPolicy {
-    pub fn next_delay(&self, retry_count: u64) -> Option<std::time::Duration> { //returns a duration computed
+    pub fn next_delay(&self, retry_count: u64) -> Option<std::time::Duration> {
+        //returns a duration computed
         match self {
-            NoRetry => {
-                return None
-            },
+            NoRetry => return None,
 
-            FixedDelay { delay_ms, max_attempts} => {
+            FixedDelay {
+                delay_ms,
+                max_attempts,
+            } => {
                 if retry_count >= *max_attempts as u64 {
-                    return None
+                    return None;
                 }
 
-                return Some(std::time::Duration::from_millis(((*delay_ms as f64)*rand::random_range(0.75..1.25)) as u64)) //added jitter to fixed delay
-            },
+                return Some(std::time::Duration::from_millis(
+                    ((*delay_ms as f64) * rand::random_range(0.75..1.25)) as u64,
+                )); //added jitter to fixed delay
+            }
 
             ExponentialBackoff {
-                base_ms, 
-                multiplier, 
-                max_attempts, 
-                max_delay_ms } => {
-                    if retry_count >= *max_attempts as u64 {
-                        return None
-                    }
-
-                    let computed_delay = ((*base_ms as f64) * multiplier.powf(retry_count as f64) * rand::random_range(0.75..1.25)) as u64;
-                    //jitter added between a range of 0.75 and 1.25
-
-                    if computed_delay >= *max_delay_ms { //clamp to max_delay_ms
-                        return Some(std::time::Duration::from_millis(*max_delay_ms));
-                    }
-
-                    return Some(std::time::Duration::from_millis(computed_delay))
-                    
+                base_ms,
+                multiplier,
+                max_attempts,
+                max_delay_ms,
+            } => {
+                if retry_count >= *max_attempts as u64 {
+                    return None;
                 }
 
-        }
+                let computed_delay = ((*base_ms as f64)
+                    * multiplier.powf(retry_count as f64)
+                    * rand::random_range(0.75..1.25)) as u64;
+                //jitter added between a range of 0.75 and 1.25
 
+                if computed_delay >= *max_delay_ms {
+                    //clamp to max_delay_ms
+                    return Some(std::time::Duration::from_millis(*max_delay_ms));
+                }
+
+                return Some(std::time::Duration::from_millis(computed_delay));
+            }
+        }
     }
 }
 
@@ -154,7 +151,7 @@ pub enum JobState {
     Abandoned {
         reason: String,
         abandoned_at: u64,
-    }
+    },
 }
 
 //for now i didn't put the specific datatypes in for the fields, as they can be adjusted later based on the actual implementation and requirements of the job processing system.
@@ -169,7 +166,6 @@ pub enum QueueError {
 
 pub struct JobQueue {
     heap: BinaryHeap<Job>,
-
 }
 
 impl JobQueue {
@@ -202,8 +198,6 @@ impl JobQueue {
     pub fn drain(&mut self) -> Vec<Job> {
         self.heap.drain().collect()
     }
-
-
 }
 
 pub fn now_millis() -> u64 {

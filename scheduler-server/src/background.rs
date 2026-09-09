@@ -1,32 +1,28 @@
 //for the functions that run asynchronously in the background, like for observing the retry_queue and popping off when timers expire
 //also for heartbeat detection function as well
 
-use scheduler_core::job_data_structures::{Job, JobState, now_millis};
-use scheduler_core::worker::WorkerId;
-use scheduler_core::state_machine::{JobEvent, determine_reclaim_event, transition};
-use crate::scheduler_state::{CompletedJob, CompletedJobOutcome, QueuedJob, RunningJob, RunningPhase, SchedulerState};
+use crate::scheduler_state::{
+    CompletedJob, CompletedJobOutcome, QueuedJob, RunningJob, RunningPhase, SchedulerState,
+};
 use crate::worker::WorkerState;
-use std::time::Instant;
+use scheduler_core::job_data_structures::{Job, JobState, now_millis};
+use scheduler_core::state_machine::{JobEvent, determine_reclaim_event, transition};
+use scheduler_core::worker::WorkerId;
 use std::collections::{BTreeSet, HashSet};
-use std::sync::{Arc};
+use std::sync::Arc;
+use std::time::Instant;
 
 use parking_lot::Mutex;
-
-
-
-
 
 //spawn these in separate tokio threads
 //do this during initialization of services
 
 pub async fn run_retry_queue_monitor(state: SchedulerState) {
-
     loop {
-
         match retry_deadline_check(state.retry_queue.clone()).await {
             DeadlineResult::DeadlineExpired(job_uuid) => {
                 let recycled_job = state.running_jobs.remove(&job_uuid); //pop it out of running_jobs
-                
+
                 let Some((_, recycled_job)) = recycled_job else {
                     tracing::warn!(
                         job_id = %job_uuid,
@@ -34,7 +30,6 @@ pub async fn run_retry_queue_monitor(state: SchedulerState) {
                     );
                     continue;
                 };
-
 
                 let new_queued_job = QueuedJob {
                     id: job_uuid,
@@ -50,24 +45,22 @@ pub async fn run_retry_queue_monitor(state: SchedulerState) {
                 };
 
                 {
-                let mut job_queue_guard = state.job_queue.lock();
+                    let mut job_queue_guard = state.job_queue.lock();
                     job_queue_guard.insert(new_queued_job);
                 }
-            },
+            }
 
             DeadlineResult::Waiting(deadline) => {
                 tokio::select! {
                     _ = tokio::time::sleep_until(deadline.into()) => {},
                     _ = state.retry_notify.notified() => {},
                 }
-            },
+            }
 
             DeadlineResult::EmptyQueue => {
                 state.retry_notify.notified().await;
-            },
-
+            }
         }
-
     }
 }
 
@@ -77,8 +70,9 @@ pub enum DeadlineResult {
     EmptyQueue,
 }
 
-pub async fn retry_deadline_check(retry_queue: Arc<Mutex<BTreeSet<(Instant, uuid::Uuid)>>>) -> DeadlineResult {
-    
+pub async fn retry_deadline_check(
+    retry_queue: Arc<Mutex<BTreeSet<(Instant, uuid::Uuid)>>>,
+) -> DeadlineResult {
     let now = Instant::now();
     {
         let mut retry_queue_guard = retry_queue.lock();
@@ -92,7 +86,7 @@ pub async fn retry_deadline_check(retry_queue: Arc<Mutex<BTreeSet<(Instant, uuid
         } else {
             return DeadlineResult::EmptyQueue;
         }
-    } 
+    }
 }
 
 //notify_one should be called after inserting into retry_queue everytime
@@ -102,19 +96,18 @@ pub async fn run_death_detector(state: SchedulerState) {
         //possible cases?
         /*
         1. there are workers with an expired TTL, mark it as dead, remove its jobs from WorkerInfo.assigned_jobs and redistribute into job_queue, and pop it out of worker_heartbeat_timer too
-        for each job within the hashset for the worker, increment infra_interruptions 
-        2. sleep until the next duration, race it against 
+        for each job within the hashset for the worker, increment infra_interruptions
+        2. sleep until the next duration, race it against
          */
 
         match worker_heartbeat_deadline_check(state.worker_heartbeat_timer.clone()).await {
             DeadlineResult::DeadlineExpired(worker_uuid) => {
-
                 let mut jobs_to_be_reassigned = HashSet::new();
-                
 
                 if let Some(mut worker_mutref) = state.workers.get_mut(&worker_uuid) {
                     worker_mutref.state = WorkerState::Dead;
-                    jobs_to_be_reassigned = std::mem::replace(&mut worker_mutref.assigned_jobs, HashSet::new());
+                    jobs_to_be_reassigned =
+                        std::mem::replace(&mut worker_mutref.assigned_jobs, HashSet::new());
                     //extract out jobs
                 } else {
                     continue;
@@ -129,13 +122,16 @@ pub async fn run_death_detector(state: SchedulerState) {
 
                 for job_uuid in jobs_to_be_reassigned {
                     if let Some((_, recycled_job)) = state.running_jobs.remove(&job_uuid) {
-
                         //check here if infra_interruptions reached the max cap
-                        //if so, then redistribute it to completed_jobs instead 
-                        
+                        //if so, then redistribute it to completed_jobs instead
+
                         let mut new_queued_job;
 
-                        if let RunningPhase::Executing { worker_id, started_at } = recycled_job.running_phase {
+                        if let RunningPhase::Executing {
+                            worker_id,
+                            started_at,
+                        } = recycled_job.running_phase
+                        {
                             new_queued_job = Job {
                                 id: recycled_job.id,
                                 job_type: recycled_job.job_type.clone(),
@@ -147,10 +143,12 @@ pub async fn run_death_detector(state: SchedulerState) {
                                 requirements: recycled_job.requirements.clone(),
                                 metadata: recycled_job.metadata.clone(),
                                 retry_policy: recycled_job.retry_policy.clone(),
-                                state: JobState::Running { worker_id, started_at },
+                                state: JobState::Running {
+                                    worker_id,
+                                    started_at,
+                                },
                             };
-                            
-                        } else { 
+                        } else {
                             state.running_jobs.insert(recycled_job.id, recycled_job); //reinsert if it its not in the executing phase
                             continue;
                         }
@@ -178,7 +176,7 @@ pub async fn run_death_detector(state: SchedulerState) {
                                     metadata: new_queued_job.metadata,
                                     retry_policy: new_queued_job.retry_policy,
                                 });
-                            },
+                            }
 
                             JobState::DeadLettered { reason } => {
                                 new_deadlettered_jobs.push(CompletedJob {
@@ -195,18 +193,17 @@ pub async fn run_death_detector(state: SchedulerState) {
                                     completed_at: now_millis(),
                                     outcome: CompletedJobOutcome::DeadLettered { reason },
                                 });
-                            },
+                            }
 
                             _ => {
                                 state.running_jobs.insert(recycled_job.id, recycled_job);
                                 continue;
-                            }, //line 208
+                            } //line 208
                         }
-
-                    } else { //line 211
+                    } else {
+                        //line 211
                         continue;
-                    }   
-
+                    }
                 }
 
                 if !new_queued_jobs.is_empty() {
@@ -216,7 +213,6 @@ pub async fn run_death_detector(state: SchedulerState) {
                             job_queue_guard.insert(new_queued_job);
                         }
                     }
-                    
                 }
 
                 if !new_deadlettered_jobs.is_empty() {
@@ -224,28 +220,25 @@ pub async fn run_death_detector(state: SchedulerState) {
                         state.completed_jobs.insert(new_dlq_job.id, new_dlq_job);
                     }
                 }
-
-
-            },
+            }
 
             DeadlineResult::Waiting(deadline) => {
                 tokio::select! {
                     _ = tokio::time::sleep_until(deadline.into()) => {},
                     _ = state.new_worker_deadline_notify.notified() => {},
                 }
-            },
+            }
 
             DeadlineResult::EmptyQueue => {
                 state.new_worker_deadline_notify.notified().await;
-            },
-
+            }
         }
-        
     }
 }
 
-pub async fn worker_heartbeat_deadline_check(worker_heartbeat_timer: Arc<Mutex<BTreeSet<(Instant, WorkerId)>>>) -> DeadlineResult {
-    
+pub async fn worker_heartbeat_deadline_check(
+    worker_heartbeat_timer: Arc<Mutex<BTreeSet<(Instant, WorkerId)>>>,
+) -> DeadlineResult {
     let now = Instant::now();
 
     {
@@ -260,6 +253,5 @@ pub async fn worker_heartbeat_deadline_check(worker_heartbeat_timer: Arc<Mutex<B
         } else {
             return DeadlineResult::EmptyQueue;
         }
-    } 
-    
+    }
 }
