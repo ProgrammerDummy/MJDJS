@@ -13,7 +13,7 @@ use std::{
 };
 
 use parking_lot::Mutex;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 use scheduler_core::proto::{self, JobOutcome};
 use std::net::SocketAddr;
@@ -69,7 +69,7 @@ fn build_result(
 
 //I/O helper functions for retrying for report_result and reconnection with exp backoff for channel connection to gRPC server
 
-async fn connect_with_backoff(addr: SocketAddr) -> WorkerServiceClient<Channel> {
+pub async fn connect_with_backoff(addr: SocketAddr) -> WorkerServiceClient<Channel> {
     //loops and attempts to connect with exponential backoff in retries
     //will not return unless connection is successful
 
@@ -164,8 +164,10 @@ async fn work_loop(
     token_map: Arc<Mutex<HashMap<uuid::Uuid, CancellationToken>>>,
     main_token: &CancellationToken,
     stop_accepting_work: Arc<AtomicBool>,
+    shutting_down: Arc<AtomicBool>,
     registry: Arc<ExecutorRegistry>,
     max_concurrent_jobs: u32,
+    needs_reregister: Arc<Notify>,
 ) {
     let mut idle_polls = 0;
 
@@ -177,7 +179,7 @@ async fn work_loop(
             sleep_timer(idle_polls).await;
         }
 
-        if stop_accepting_work.load(Ordering::Relaxed) {
+        if stop_accepting_work.load(Ordering::Relaxed) || shutting_down.load(Ordering::Relaxed) {
             //load in latest status of stop_accepting_work
             //if its true, then the jobs must drain so dont request any more work but stay alive for jobs to finish
             tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
@@ -213,6 +215,14 @@ async fn work_loop(
                     || status.code() == tonic::Code::DeadlineExceeded
                 {
                     transport_failures += 1;
+                }
+
+                else if status.code() == tonic::Code::FailedPrecondition {
+                    needs_reregister.notify_one();
+                    //for a dead worker, such as one that loses network connection past the TTL
+                    //its jobs will be collected by scheduler and will be marked as dead
+                    //but if it reconnects afterwards itll be a useless worker and FailedPrecondition will be sent in response to request_work
+                    //so reregister it with new uuid instead of resurrectring it
                 }
 
                 if transport_failures > MAX_TRANSPORT_FAILURES {
@@ -271,24 +281,37 @@ pub async fn poll_loop(
     token_map: Arc<Mutex<HashMap<uuid::Uuid, CancellationToken>>>,
     main_token: CancellationToken,
     stop_accepting_work: Arc<AtomicBool>,
+    shutting_down: Arc<AtomicBool>,
     registry: Arc<ExecutorRegistry>,
+    needs_reregister: Arc<Notify>,
 ) {
     let semaphore = Arc::new(Semaphore::new(max_concurrent_jobs as usize));
 
     tokio::select! {
         _ = main_token.cancelled() => {}
         _ = async {
-            loop { //outer connection loop
+            loop { //outer connection loop   
 
                 let client = connect_with_backoff(addr).await;
 
                 work_loop( //inner work loop
                     client, worker_uuid.clone(), semaphore.clone(),
-                    token_map.clone(), &main_token,
-                    stop_accepting_work.clone(), registry.clone(),
+                    token_map.clone(), 
+                    &main_token,
+                    stop_accepting_work.clone(), 
+                    shutting_down.clone(),
+                    registry.clone(),
                     max_concurrent_jobs,
+                    needs_reregister.clone(),
                 ).await;
                 //if the work_loop returns, then the connection died so reconnect
+
+                //unless the shutting_down flag is active
+                //then it means i should stop it
+
+                if shutting_down.load(Ordering::Relaxed) {
+                    break;
+                }
             }
         } => {}
     }
