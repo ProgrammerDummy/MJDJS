@@ -7,6 +7,7 @@ use scheduler_core::job_data_structures::now_millis;
 use proto::HeartbeatPing;
 
 use parking_lot::Mutex;
+use tokio::sync::Notify;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -16,7 +17,7 @@ pub async fn send_heartbeats(
     addr: SocketAddr,
     worker_id: Arc<Mutex<uuid::Uuid>>,
     stop_accepting_work: Arc<AtomicBool>,
-    new_registration_needed: Arc<AtomicBool>,
+    new_registration_needed: Arc<Notify>,
 ) {
     //needs to open the bidirectional stream for heartbeat RPC
     //fire a HeartbeatPing every 5 seconds
@@ -84,7 +85,7 @@ pub async fn send_heartbeats(
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    if let Err(e) = tx.send(HeartbeatPing { worker_id: worker_id.clone(), sent_at: now_millis() }).await {
+                    if let Err(_e) = tx.send(HeartbeatPing { worker_id: worker_id.clone(), sent_at: now_millis() }).await {
 
                         //server receiving end is gone
 
@@ -132,8 +133,8 @@ pub async fn send_heartbeats(
                         Ok(None) => {
                             consecutive_nones += 1;
                             //signal to scheduler that new registration is needed for this worker
-                            if(consecutive_nones >= 2) {
-                                new_registration_needed.store(true, Ordering::Relaxed);
+                            if consecutive_nones >= 2 {
+                                new_registration_needed.notify_one();
                             }
                             break;
                             //stream was closed gracefully by the server
