@@ -215,9 +215,7 @@ async fn work_loop(
                     || status.code() == tonic::Code::DeadlineExceeded
                 {
                     transport_failures += 1;
-                }
-
-                else if status.code() == tonic::Code::FailedPrecondition {
+                } else if status.code() == tonic::Code::FailedPrecondition {
                     needs_reregister.notify_one();
                     //for a dead worker, such as one that loses network connection past the TTL
                     //its jobs will be collected by scheduler and will be marked as dead
@@ -290,15 +288,15 @@ pub async fn poll_loop(
     tokio::select! {
         _ = main_token.cancelled() => {}
         _ = async {
-            loop { //outer connection loop   
+            loop { //outer connection loop
 
                 let client = connect_with_backoff(addr).await;
 
                 work_loop( //inner work loop
                     client, worker_uuid.clone(), semaphore.clone(),
-                    token_map.clone(), 
+                    token_map.clone(),
                     &main_token,
-                    stop_accepting_work.clone(), 
+                    stop_accepting_work.clone(),
                     shutting_down.clone(),
                     registry.clone(),
                     max_concurrent_jobs,

@@ -7,9 +7,9 @@ use scheduler_core::job_data_structures::now_millis;
 use proto::HeartbeatPing;
 
 use parking_lot::Mutex;
-use tokio::sync::Notify;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::Notify;
 
 const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
