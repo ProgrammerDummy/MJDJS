@@ -27,10 +27,16 @@ const NEXT_HEARTBEAT_DEADLINE: std::time::Duration = std::time::Duration::from_s
 
 pub struct MyWorkerService {
     pub scheduler_state: SchedulerState, //copy SchedulerState over from MySchedulerService during initialization
-                                         //safe to copy since all fields are Arc wrapped
+    //safe to copy since all fields are Arc wrapped
 }
 
-impl MyWorkerService {}
+impl MyWorkerService {
+    pub fn new(scheduler_state: SchedulerState) -> Self {
+        MyWorkerService {
+            scheduler_state,
+        }
+    }
+}
 
 async fn fullside_bind_spawn_connect_for_tests() -> (
     proto::scheduler_service_client::SchedulerServiceClient<tonic::transport::Channel>,
