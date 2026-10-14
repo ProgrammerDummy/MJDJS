@@ -27,6 +27,12 @@ impl MySchedulerService {
             scheduler_state: SchedulerState::new(),
         }
     }
+
+    pub fn from_state(state: SchedulerState) -> Self {
+        MySchedulerService {
+            scheduler_state: state
+        }
+    }
 }
 
 impl MySchedulerService {
