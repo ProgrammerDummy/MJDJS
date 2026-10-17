@@ -240,3 +240,9 @@ async fn failure_retries_then_requeues() {
     let requeued = queued.iter().find(|j| j.id == uuid).expect("job requeued");
     assert_eq!(requeued.retry_count, 1);
 }
+
+#[tokio::test] 
+
+async fn test_death_detector() {
+    todo!();
+}
