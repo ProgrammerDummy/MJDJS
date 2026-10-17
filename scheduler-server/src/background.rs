@@ -10,6 +10,7 @@ use scheduler_core::state_machine::{JobEvent, determine_reclaim_event, transitio
 use scheduler_core::worker::WorkerId;
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use parking_lot::Mutex;
@@ -158,7 +159,7 @@ pub async fn run_death_detector(state: SchedulerState) {
                         if let Err(e) = transition(&mut new_queued_job, next) {
                             tracing::warn!(
                                 job_id = %&new_queued_job.id,
-                                "transition for job retrieved from lost worker failed"
+                                "transition for job retrieved from lost worker failed, will be deadlettered"
                             );
                         }
 
@@ -196,12 +197,26 @@ pub async fn run_death_detector(state: SchedulerState) {
                             }
 
                             _ => {
-                                state.running_jobs.insert(recycled_job.id, recycled_job);
-                                continue;
-                            } //line 208
+                                    new_deadlettered_jobs.push(CompletedJob {
+                                        id: new_queued_job.id,
+                                        job_type: new_queued_job.job_type,
+                                        payload: new_queued_job.payload,
+                                        priority: new_queued_job.priority,
+                                        created_at: new_queued_job.created_at,
+                                        retry_count: new_queued_job.retry_count,
+                                        infra_interruptions: new_queued_job.infra_interruptions,
+                                        requirements: new_queued_job.requirements,
+                                        metadata: new_queued_job.metadata,
+                                        retry_policy: new_queued_job.retry_policy,
+                                        completed_at: now_millis(),
+                                        outcome: CompletedJobOutcome::DeadLettered { 
+                                            reason: "transition failed during lost worker event".to_string()
+                                        },
+                                    });
+                            } 
                         }
                     } else {
-                        //line 211
+                        
                         continue;
                     }
                 }
@@ -218,6 +233,7 @@ pub async fn run_death_detector(state: SchedulerState) {
                 if !new_deadlettered_jobs.is_empty() {
                     for new_dlq_job in new_deadlettered_jobs {
                         state.completed_jobs.insert(new_dlq_job.id, new_dlq_job);
+                        
                     }
                 }
             }
