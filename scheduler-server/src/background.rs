@@ -8,6 +8,7 @@ use crate::worker::WorkerState;
 use scheduler_core::job_data_structures::{Job, JobState, now_millis};
 use scheduler_core::state_machine::{JobEvent, determine_reclaim_event, transition};
 use scheduler_core::worker::WorkerId;
+use tracing::warn;
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -150,6 +151,10 @@ pub async fn run_death_detector(state: SchedulerState) {
                                 },
                             };
                         } else {
+                            warn!(
+                                job_id = %&recycled_job.id,
+                                "RunningPhase of job was in Retrying phase during assigned_job removal of Worker Lost event, currently only referenced by retry_queue"
+                            );
                             state.running_jobs.insert(recycled_job.id, recycled_job); //reinsert if it its not in the executing phase
                             continue;
                         }
