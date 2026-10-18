@@ -1,4 +1,3 @@
-use core::time;
 use std::{
     collections::{HashMap, HashSet},
     sync::atomic::Ordering::SeqCst,
@@ -18,7 +17,7 @@ use uuid::Uuid;
 
 use crate::{
     scheduler_state::{
-        CompletedJob, CompletedJobOutcome, QueuedJob, RunningJob, RunningPhase, SchedulerState,
+        CompletedJob, CompletedJobOutcome, RunningJob, RunningPhase, SchedulerState,
     },
     worker::{WorkerInfo, WorkerState},
 };
@@ -152,7 +151,7 @@ impl WorkerService for MyWorkerService {
 
         let job_uuid = match uuid::Uuid::from_slice(&result.job_id) {
             Ok(uuid) => uuid,
-            Err(e) => {
+            Err(_e) => {
                 return Err(Status::invalid_argument(
                     "invalid job uuid was entered when attempting to report_result",
                 ));
@@ -161,7 +160,7 @@ impl WorkerService for MyWorkerService {
 
         let worker_uuid = match uuid::Uuid::from_slice(&result.worker_id) {
             Ok(uuid) => uuid,
-            Err(e) => {
+            Err(_e) => {
                 return Err(Status::invalid_argument(
                     "invalid worker uuid was entered when attempting to report_result",
                 ));
@@ -188,7 +187,7 @@ impl WorkerService for MyWorkerService {
                                     match running_job.running_phase {
                                         RunningPhase::Executing {
                                             worker_id,
-                                            started_at,
+                                            started_at: _,
                                         } => {
                                             if worker_id != worker_uuid {
                                                 return Err(Status::invalid_argument(
@@ -460,7 +459,7 @@ impl WorkerService for MyWorkerService {
                                     match running_job.running_phase {
                                         RunningPhase::Executing {
                                             worker_id,
-                                            started_at,
+                                            started_at: _,
                                         } => {
                                             if worker_id != worker_uuid {
                                                 return Err(Status::internal(
@@ -582,7 +581,7 @@ impl WorkerService for MyWorkerService {
 
         let job_requesting_worker_id = match Uuid::from_slice(&job_requesting_worker_id) {
             Ok(uuid) => uuid,
-            Err(e) => {
+            Err(_e) => {
                 return Err(Status::invalid_argument(
                     "invalid worker uuid used to request job",
                 ));
@@ -590,7 +589,7 @@ impl WorkerService for MyWorkerService {
         };
 
         let mut worker_capabilities: HashMap<String, String> = HashMap::new();
-        let mut worker_job_types: Vec<String>;
+        let worker_job_types: Vec<String>;
 
         if let Some(mut worker) = self
             .scheduler_state

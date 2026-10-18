@@ -5,7 +5,7 @@ mod worker;
 mod worker_service;
 mod integration_test;
 
-use scheduler_core::proto::{scheduler_service_server::SchedulerServiceServer, worker_service_server::{WorkerService, WorkerServiceServer}};
+use scheduler_core::proto::{scheduler_service_server::SchedulerServiceServer, worker_service_server::WorkerServiceServer};
 
 use crate::{service::MySchedulerService, worker_service::MyWorkerService};
 

@@ -121,7 +121,7 @@ async fn main() {
 
                     //cancel all the jobs
 
-                    for (_, cancel_token) in &mut *token_map_guard {
+                    for cancel_token in (*token_map_guard).values_mut() {
                         cancel_token.cancel();
                     }
 

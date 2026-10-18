@@ -1,14 +1,11 @@
 use futures::stream::BoxStream;
-use scheduler_core::conversion::{ConversionError, job_state_to_proto, proto_to_job_status};
+use scheduler_core::conversion::{ConversionError, job_state_to_proto};
 use scheduler_core::job_data_structures::{Job, JobState, RetryPolicy};
 use scheduler_core::proto::{self, scheduler_service_server::SchedulerService};
-use scheduler_core::proto::{JobStatus, SubmitJobResponse};
-use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tonic::{Request, Response, Status};
-use uuid;
 
 use parking_lot::Mutex;
 
@@ -104,9 +101,9 @@ impl MySchedulerService {
                     return Ok(JobState::Queued);
                 }
 
-                return Err(tonic::Status::not_found(
+                Err(tonic::Status::not_found(
                     "job was not found in MySchedulerService",
-                ));
+                ))
             }
         }
     }
@@ -176,7 +173,7 @@ impl SchedulerService for MySchedulerService {
                 //this is assuming that no duplicates will exist between job_queue, running_jobs, and completed_jobs at a time
                 //should be ensured during migrations between data structures
 
-                let mut job_state = self.scan_lists_for_job_status(job_uuid);
+                let job_state = self.scan_lists_for_job_status(job_uuid);
 
                 if let Err(e) = job_state {
                     return Err(e);
@@ -186,7 +183,7 @@ impl SchedulerService for MySchedulerService {
                     //safe to unwrap here
                     Ok(proto_job_status) => return Ok(tonic::Response::new(proto_job_status)),
 
-                    Err(e) => {
+                    Err(_e) => {
                         return Err(tonic::Status::internal("invalid job entered the system")); //this shouldn't occur due to the entrypoint having bounds, if this happens something has gone very wrong
                     }
                 }
@@ -201,14 +198,14 @@ impl SchedulerService for MySchedulerService {
 
     async fn cancel_job(
         &self,
-        request: Request<proto::JobIdRequest>,
+        _request: Request<proto::JobIdRequest>,
     ) -> Result<Response<()>, Status> {
         Err(Status::unimplemented("cancel_job not yet implemented"))
     }
 
     async fn requeue_from_dlq(
         &self,
-        request: Request<proto::JobIdRequest>,
+        _request: Request<proto::JobIdRequest>,
     ) -> Result<Response<()>, Status> {
         Err(Status::unimplemented(
             "requeue_from_dlq not yet implemented",
@@ -217,7 +214,7 @@ impl SchedulerService for MySchedulerService {
 
     async fn create_template(
         &self,
-        request: Request<proto::Template>,
+        _request: Request<proto::Template>,
     ) -> Result<Response<proto::TemplateResponse>, Status> {
         Err(Status::unimplemented("create_template not yet implemented"))
     }
@@ -228,14 +225,14 @@ impl SchedulerService for MySchedulerService {
 
     async fn list_jobs(
         &self,
-        request: Request<proto::ListRequest>,
+        _request: Request<proto::ListRequest>,
     ) -> Result<Response<Self::ListJobsStream>, Status> {
         Err(Status::unimplemented("list_jobs not yet implemented"))
     }
 
     async fn list_dead_lettered(
         &self,
-        request: Request<proto::ListRequest>,
+        _request: Request<proto::ListRequest>,
     ) -> Result<Response<Self::ListDeadLetteredStream>, Status> {
         Err(Status::unimplemented(
             "list_dead_lettered not yet implemented",
@@ -249,26 +246,26 @@ fn validate_retry_policy(policy: &RetryPolicy) -> Result<(), ConversionError> {
     match policy {
         RetryPolicy::FixedDelay {
             delay_ms,
-            max_attempts,
+            max_attempts: _,
         } => {
             if *delay_ms < MAX_DELAY_MS {
                 return Ok(());
             }
 
-            return Err(ConversionError::MaxDurationExceeded);
+            Err(ConversionError::MaxDurationExceeded)
         }
 
         RetryPolicy::ExponentialBackoff {
             base_ms,
-            multiplier,
-            max_attempts,
+            multiplier: _,
+            max_attempts: _,
             max_delay_ms,
         } => {
             if *base_ms < MAX_DELAY_MS && *max_delay_ms < MAX_DELAY_MS {
                 return Ok(());
             }
 
-            return Err(ConversionError::MaxDurationExceeded);
+            Err(ConversionError::MaxDurationExceeded)
         }
 
         RetryPolicy::NoRetry => Ok(()),
@@ -313,6 +310,9 @@ async fn bind_spawn_connect_for_tests() -> (
 
 #[tokio::test]
 async fn job_submission_success() {
+
+    use std::collections::HashMap;
+
     let (mut client, clone_check) = bind_spawn_connect_for_tests().await;
 
     let job = Job {
@@ -368,6 +368,8 @@ async fn job_submission_success() {
 
 #[tokio::test]
 async fn job_submission_failure_invalid_retry_policy() {
+    use std::collections::HashMap;
+
     let (mut client, _clone_check) = bind_spawn_connect_for_tests().await;
 
     let job = Job {
@@ -401,6 +403,11 @@ async fn job_submission_failure_invalid_retry_policy() {
 
 #[tokio::test]
 async fn get_job_status_success() {
+
+    use scheduler_core::conversion::proto_to_job_status;
+
+    use std::collections::HashMap;
+
     let (mut client, _clone_check) = bind_spawn_connect_for_tests().await;
 
     let job = Job {

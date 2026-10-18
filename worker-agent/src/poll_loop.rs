@@ -15,7 +15,7 @@ use std::{
 use parking_lot::Mutex;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
-use scheduler_core::proto::{self, JobOutcome};
+use scheduler_core::proto::{self};
 use std::net::SocketAddr;
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, transport::Channel};

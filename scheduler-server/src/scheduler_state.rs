@@ -1,13 +1,12 @@
 use crate::worker::WorkerInfo;
-use scheduler_core::job_data_structures::{JobState, RetryPolicy};
+use scheduler_core::job_data_structures::RetryPolicy;
 use scheduler_core::worker::WorkerId;
 use tokio::sync::Notify;
 
-use uuid;
 
 use dashmap::DashMap;
 use std::collections::HashMap;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 

@@ -2,16 +2,15 @@
 //also for heartbeat detection function as well
 
 use crate::scheduler_state::{
-    CompletedJob, CompletedJobOutcome, QueuedJob, RunningJob, RunningPhase, SchedulerState,
+    CompletedJob, CompletedJobOutcome, QueuedJob, RunningPhase, SchedulerState,
 };
 use crate::worker::WorkerState;
 use scheduler_core::job_data_structures::{Job, JobState, now_millis};
-use scheduler_core::state_machine::{JobEvent, determine_reclaim_event, transition};
+use scheduler_core::state_machine::{determine_reclaim_event, transition};
 use scheduler_core::worker::WorkerId;
 use tracing::warn;
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use parking_lot::Mutex;
@@ -81,12 +80,12 @@ pub async fn retry_deadline_check(
         if let Some(&(timeout, job_uuid)) = retry_queue_guard.first() {
             if timeout <= now {
                 retry_queue_guard.pop_first();
-                return DeadlineResult::DeadlineExpired(job_uuid);
+                DeadlineResult::DeadlineExpired(job_uuid)
             } else {
-                return DeadlineResult::Waiting(timeout);
+                DeadlineResult::Waiting(timeout)
             }
         } else {
-            return DeadlineResult::EmptyQueue;
+            DeadlineResult::EmptyQueue
         }
     }
 }
@@ -109,7 +108,7 @@ pub async fn run_death_detector(state: SchedulerState) {
                 if let Some(mut worker_mutref) = state.workers.get_mut(&worker_uuid) {
                     worker_mutref.state = WorkerState::Dead;
                     jobs_to_be_reassigned =
-                        std::mem::replace(&mut worker_mutref.assigned_jobs, HashSet::new());
+                        std::mem::take(&mut worker_mutref.assigned_jobs);
                     //extract out jobs
                 } else {
                     continue;
@@ -161,7 +160,7 @@ pub async fn run_death_detector(state: SchedulerState) {
 
                         let next = determine_reclaim_event(&new_queued_job);
 
-                        if let Err(e) = transition(&mut new_queued_job, next) {
+                        if let Err(_e) = transition(&mut new_queued_job, next) {
                             tracing::warn!(
                                 job_id = %&new_queued_job.id,
                                 "transition for job retrieved from lost worker failed, will be deadlettered"
@@ -267,12 +266,12 @@ pub async fn worker_heartbeat_deadline_check(
         if let Some(&(deadline, worker_uuid)) = heartbeat_timer_guard.first() {
             if deadline <= now {
                 heartbeat_timer_guard.pop_first();
-                return DeadlineResult::DeadlineExpired(worker_uuid);
+                DeadlineResult::DeadlineExpired(worker_uuid)
             } else {
-                return DeadlineResult::Waiting(deadline);
+                DeadlineResult::Waiting(deadline)
             }
         } else {
-            return DeadlineResult::EmptyQueue;
+            DeadlineResult::EmptyQueue
         }
     }
 }

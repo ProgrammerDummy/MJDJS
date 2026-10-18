@@ -36,7 +36,7 @@ pub async fn send_heartbeats(
 
         let displayable_worker_id = {
             let guard = worker_id.lock();
-            guard.clone()
+            *guard
         };
 
         let worker_id = { worker_id.lock().as_bytes().to_vec() };
@@ -47,7 +47,7 @@ pub async fn send_heartbeats(
             .await
         {
             Ok(channel) => channel,
-            Err(e) => {
+            Err(_e) => {
                 tracing::warn!(
                     worker_id = %displayable_worker_id,
                     "heartbeat could not connect to scheduler server, retrying"
