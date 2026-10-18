@@ -117,6 +117,7 @@ pub struct SchedulerState {
     pub total_dead_lettered: Arc<AtomicU64>,
     pub retry_notify: Arc<Notify>,
     pub new_worker_deadline_notify: Arc<Notify>,
+    pub heartbeat_deadline: std::time::Duration,
     //chose to wrap each field with Arc and mutex/dashmap so that only necessary components can clone the arc handle rather than having access to entire struct
 
     //the fields that use btreesets could be changed to bibtreemaps to accomplish the goal of preventing collisions AND
@@ -126,7 +127,7 @@ pub struct SchedulerState {
     //for a linear scan, its probably likely that if worker count gets real fatty then performance costs incur at heavier scales
 }
 
-impl SchedulerState {
+impl SchedulerState {   
     pub fn new() -> Self {
         SchedulerState {
             job_queue: Arc::new(Mutex::new(BTreeSet::new())),
@@ -141,6 +142,25 @@ impl SchedulerState {
             total_dead_lettered: Arc::new(0.into()),
             retry_notify: Arc::new(Notify::new()),
             new_worker_deadline_notify: Arc::new(Notify::new()),
+            heartbeat_deadline: std::time::Duration::from_secs(15),
+        }
+    }
+
+    pub fn with_heartbeat_deadline(heartbeat_deadline: std::time::Duration) -> Self {
+        SchedulerState {
+            job_queue: Arc::new(Mutex::new(BTreeSet::new())),
+            running_jobs: Arc::new(DashMap::new()),
+            completed_jobs: Arc::new(DashMap::new()),
+            workers: Arc::new(DashMap::new()),
+            retry_queue: Arc::new(Mutex::new(BTreeSet::new())),
+            worker_heartbeat_timer: Arc::new(Mutex::new(BTreeSet::new())),
+            total_submitted: Arc::new(0.into()),
+            total_completed: Arc::new(0.into()),
+            total_failed: Arc::new(0.into()),
+            total_dead_lettered: Arc::new(0.into()),
+            retry_notify: Arc::new(Notify::new()),
+            new_worker_deadline_notify: Arc::new(Notify::new()),
+            heartbeat_deadline,
         }
     }
 }
