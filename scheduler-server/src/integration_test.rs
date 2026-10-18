@@ -15,6 +15,7 @@ use tonic::transport::Channel;
 use crate::background::{run_death_detector, run_retry_queue_monitor};
 use crate::scheduler_state::SchedulerState;
 use crate::service::MySchedulerService;
+use crate::worker::WorkerState;
 use crate::worker_service::MyWorkerService;
 
 /// Spins up a full server (both services + both background tasks) on a random
@@ -28,7 +29,7 @@ async fn spawn_full_server() -> (
     let addr = listener.local_addr().unwrap();
     let incoming = tonic::transport::server::TcpIncoming::from(listener);
 
-    let state = SchedulerState::new();
+    let state = SchedulerState::with_heartbeat_deadline(std::time::Duration::from_millis(500));
 
     let scheduler_service = MySchedulerService::from_state(state.clone());
     let worker_service = MyWorkerService::new(state.clone());
@@ -244,5 +245,66 @@ async fn failure_retries_then_requeues() {
 #[tokio::test] 
 
 async fn test_death_detector() {
-    todo!();
+    let (mut sched, mut worker, state) = spawn_full_server().await;
+
+    let worker_id = worker
+        .register(tonic::Request::new(test_worker(&["sleep"], 1)))
+        .await
+        .unwrap()
+        .into_inner()
+        .worker_id;
+
+    let job_id = sched
+        .submit_job(tonic::Request::new(test_job(
+            "sleep", 
+            500, 
+            RetryPolicy::FixedDelay { 
+                delay_ms: 200, 
+                max_attempts: 5 
+                }
+            )))
+        .await
+        .unwrap()
+        .into_inner()
+        .id;
+
+    worker.request_work(tonic::Request::new(
+        proto::AssignedWorkerId { 
+            worker_id: worker_id.clone() 
+        }))
+        .await
+        .unwrap();
+
+    let status = status_of(&mut sched, &job_id).await;
+
+    match status {
+        JobState::Running { .. } => {},
+        _ => {
+            panic!("supposed to be Running");
+        }
+    }
+
+    //make sleep with no heartbeat to trigger death_detector
+
+    tokio::time::sleep(state.heartbeat_deadline + std::time::Duration::from_millis(500)).await;
+
+    let status = status_of(&mut sched, &job_id).await;
+
+    assert_eq!(status, JobState::Queued);
+
+    {
+        let mut job_queue_guard = state.job_queue.lock();
+        let test_job = job_queue_guard.pop_first().unwrap();
+        assert_eq!(test_job.infra_interruptions, 1);
+        assert_eq!(test_job.retry_count, 0);
+  
+    }
+
+    {
+        assert_eq!(state.workers.get(&uuid::Uuid::from_bytes(worker_id.as_slice().try_into().unwrap())).unwrap().state, WorkerState::Dead);
+    }
+
+
+
+
 }
