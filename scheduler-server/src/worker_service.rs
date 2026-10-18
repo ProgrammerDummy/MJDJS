@@ -23,8 +23,6 @@ use crate::{
     worker::{WorkerInfo, WorkerState},
 };
 
-const NEXT_HEARTBEAT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
-
 pub struct MyWorkerService {
     pub scheduler_state: SchedulerState, //copy SchedulerState over from MySchedulerService during initialization
     //safe to copy since all fields are Arc wrapped
@@ -116,7 +114,7 @@ impl WorkerService for MyWorkerService {
 
         {
             let mut guard = self.scheduler_state.worker_heartbeat_timer.lock();
-            guard.insert((now + NEXT_HEARTBEAT_DEADLINE, new_worker_id));
+            guard.insert((now + self.scheduler_state.heartbeat_deadline, new_worker_id));
         }
 
         let new_worker = WorkerInfo {
@@ -263,6 +261,10 @@ impl WorkerService for MyWorkerService {
 
                                     return Ok(Response::new(()));
                                 }
+
+                                else {
+                                    return Err(Status::internal("None was returned for removal of job in Completed branch during report_result, race condition possibly"));
+                                }
                             }
 
                             proto::job_outcome::Outcome::Failure(proto::job_outcome::Failure {
@@ -325,7 +327,9 @@ impl WorkerService for MyWorkerService {
                                                 "job was not found within WorkerInfo.assigned_jobs",
                                             ));
                                         }
+
                                         worker.assigned_jobs.remove(&job_uuid);
+
                                     } else {
                                         return Err(Status::not_found(format!(
                                             "worker with id: {} was not found in worker pool",
@@ -527,6 +531,11 @@ impl WorkerService for MyWorkerService {
 
                                     return Ok(Response::new(()));
                                 }
+
+                                else {
+                                    return Err(Status::internal("None was returned for removal of job in Cancelled branch during report_result, race condition possibly"));
+                                }
+
                             }
                         }
                     }
@@ -544,6 +553,9 @@ impl WorkerService for MyWorkerService {
             }
         }
 
+
+
+
         //free job_id from worker with worker_id working job pool
 
         /*
@@ -557,7 +569,7 @@ impl WorkerService for MyWorkerService {
 
          */
 
-        Err(Status::unimplemented("report_result not yet implemented"))
+
     }
 
     async fn request_work(
@@ -738,6 +750,8 @@ impl WorkerService for MyWorkerService {
 
         //on main function thread, pass the receiver stream to the caller of the RPC
 
+        let max_heartbeat_deadline = self.scheduler_state.heartbeat_deadline;
+
         tokio::spawn(async move {
             loop {
                 match incoming_heartbeat_ping_stream.message().await {
@@ -770,7 +784,7 @@ impl WorkerService for MyWorkerService {
                                 guard.remove(&(old_instant, worker_uuid));
                             } //find and replace old Instant with new one at now + 15s
 
-                            guard.insert((now + NEXT_HEARTBEAT_DEADLINE, worker_uuid));
+                            guard.insert((now + max_heartbeat_deadline, worker_uuid));
                         }
 
                         worker_deadline_notify.notify_one();
