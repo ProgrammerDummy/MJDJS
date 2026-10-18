@@ -16,7 +16,7 @@ pub struct WorkerInfo {
     pub state: WorkerState,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum WorkerState {
     Active,
     Dead,
