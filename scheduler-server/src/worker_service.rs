@@ -130,13 +130,14 @@ impl MyWorkerService {
         //drop read lock to access write lock on same shard of dashmap
         drop(running_job);
 
+        self.release_from_worker(worker_uuid, job_uuid)?;
+        
         let Some((_, running_job)) = self.scheduler_state.running_jobs.remove(&job_uuid) else {
             return Err(Status::internal(
                 "None was returned for removal of job in Completed branch during report_result, race condition possibly",
             ));
         };
 
-        self.release_from_worker(worker_uuid, job_uuid)?;
 
         let job_id = running_job.id;
         self.scheduler_state
@@ -778,6 +779,8 @@ mod tests {
 
             if let Some(worker) = f.state.workers.get(&Uuid::from_slice(&f.worker_id).unwrap()) {
                 assert!(worker.assigned_jobs.is_empty());
+            } else {
+                panic!("worker uuid missing from workers in scheduler_state");
             }
         }
     }
@@ -812,6 +815,8 @@ mod tests {
 
             if let Some(worker) = f.state.workers.get(&Uuid::from_slice(&f.worker_id).unwrap()) {
                 assert!(worker.assigned_jobs.is_empty());
+            } else {
+                panic!("worker uuid missing from workers in scheduler_state")
             }
         }
     }
