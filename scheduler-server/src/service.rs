@@ -34,6 +34,8 @@ impl MySchedulerService {
 
 impl MySchedulerService {
     fn scan_lists_for_job_status(&self, requested_id: uuid::Uuid) -> Result<JobState, Status> {
+
+        
         //look for running_jobs first
 
         if let Some(running_job) = self.scheduler_state.running_jobs.get(&requested_id) {
@@ -48,6 +50,11 @@ impl MySchedulerService {
                 });
             }
 
+            if let RunningPhase::Retrying = running_job.running_phase {
+
+                //since RunningPhase::Retrying doesnt hold any info, search within retry_queue
+                //but might not be in retry_queue if this accessed at the window 
+            } 
             //if RunningPhase::Retrying
             //warning for the future: if a RunningJob is within running_job but somehow not within retry_queue for some reason, the returned value of this function will be tonic::Status::not_found because it'll fall all the way through
 
