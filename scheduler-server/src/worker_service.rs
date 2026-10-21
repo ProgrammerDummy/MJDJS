@@ -91,6 +91,9 @@ fn no_work_available() -> Response<proto::RequestWorkResponse> {
 impl MyWorkerService {
     ///Clears the slot the finished job is occupying in the worker's assigned_jobs allowing it to request for more jobs if previously full
     fn release_from_worker(&self, worker_uuid: WorkerId, job_uuid: Uuid) -> Result<(), Status> {
+        //locking sequence:
+        //workers --> drop(workers)
+
         let Some(mut worker) = self.scheduler_state.workers.get_mut(&worker_uuid) else {
             return Err(Status::not_found(format!(
                 "worker with id: {worker_uuid} was not found in worker pool"
@@ -119,6 +122,9 @@ impl MyWorkerService {
         worker_uuid: WorkerId,
         outcome: CompletedJobOutcome,
     ) -> Result<(), Status> {
+        //locking sequence: 
+        //running_jobs --> drop(running_jobs) --> workers --> drop(workers) --> completed_jobs
+
         let Some(running_job) = self.scheduler_state.running_jobs.get(&job_uuid) else {
             return Err(Status::not_found(
                 "job uuid did not exist within running_jobs",
@@ -157,6 +163,12 @@ impl MyWorkerService {
         worker_uuid: WorkerId,
         error: u64,
     ) -> Result<(), Status> {
+        //locking sequence: (for retrying branch)
+        //running_jobs --> workers --> drop(workers) --> retry_queue
+
+        //locking sequence: (for deadlettered branch)
+        //running_jobs --> workers --> drop(workers) --> completed_jobs
+
         let Some(mut running_job) = self.scheduler_state.running_jobs.get_mut(&job_uuid) else {
             return Err(Status::not_found(
                 "job uuid did not exist within running_jobs",
@@ -214,6 +226,7 @@ impl MyWorkerService {
 
             JobState::DeadLettered { reason } => {
                 //must release before dead_letter() calls remove() on the same key to avoid deadlock
+                running_job.retry_count = staging_job.retry_count;
                 drop(running_job);
                 self.dead_letter(job_uuid, reason)
             }
@@ -359,6 +372,11 @@ impl WorkerService for MyWorkerService {
         &self,
         request: Request<proto::AssignedWorkerId>,
     ) -> Result<Response<proto::RequestWorkResponse>, Status> {
+        //locking sequence:
+        //workers --> job_queue --> running_jobs
+
+        //this will be my standard locking sequence
+
         let worker_uuid = parse_uuid(
             &request.into_inner().worker_id,
             "invalid worker uuid used to request job",
