@@ -105,10 +105,10 @@ pub async fn run_death_detector(state: SchedulerState) {
             DeadlineResult::DeadlineExpired(worker_uuid) => {
                 let mut jobs_to_be_reassigned = HashSet::new();
 
-                if let Some(mut worker_mutref) = state.workers.get_mut(&worker_uuid) {
-                    worker_mutref.state = WorkerState::Dead;
+                if let Some(mut worker_mutref) = state.workers.remove(&worker_uuid) {
+                    worker_mutref.1.state = WorkerState::Dead;
                     jobs_to_be_reassigned =
-                        std::mem::take(&mut worker_mutref.assigned_jobs);
+                        std::mem::take(&mut worker_mutref.1.assigned_jobs);
                     //extract out jobs
                 } else {
                     continue;
