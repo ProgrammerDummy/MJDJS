@@ -103,7 +103,7 @@ async fn status_of(
 
 //tests begin here
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn full_lifecycle_success() {
     let (mut sched, mut worker, state) = spawn_full_server().await;
 
@@ -180,7 +180,7 @@ async fn full_lifecycle_success() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn failure_retries_then_requeues() {
     let (mut sched, mut worker, state) = spawn_full_server().await;
 
@@ -242,7 +242,7 @@ async fn failure_retries_then_requeues() {
     assert_eq!(requeued.retry_count, 1);
 }
 
-#[tokio::test] 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)] 
 
 async fn test_death_detector() {
     let (mut sched, mut worker, state) = spawn_full_server().await;

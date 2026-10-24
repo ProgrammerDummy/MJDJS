@@ -90,26 +90,7 @@ fn no_work_available() -> Response<proto::RequestWorkResponse> {
 
 impl MyWorkerService {
     ///Clears the slot the finished job is occupying in the worker's assigned_jobs allowing it to request for more jobs if previously full
-    fn release_from_worker(&self, worker_uuid: WorkerId, job_uuid: Uuid) -> Result<(), Status> {
-        //locking sequence:
-        //workers --> drop(workers)
-
-        let Some(mut worker) = self.scheduler_state.workers.get_mut(&worker_uuid) else {
-            return Err(Status::not_found(format!(
-                "worker with id: {worker_uuid} was not found in worker pool"
-            )));
-        };
-
-        if !worker.assigned_jobs.contains(&job_uuid) {
-            tracing::warn!(
-                job_id = %job_uuid,
-                worker_id = %worker_uuid,
-                "job present in running_jobs but missing from worker's assigned_jobs"
-            );
-            return Err(Status::not_found(
-                "job was not found within WorkerInfo.assigned_jobs",
-            ));
-        }
+    fn release_from_worker(&self, worker: &mut WorkerInfo, job_uuid: Uuid) -> Result<(), Status> {
 
         worker.assigned_jobs.remove(&job_uuid);
         Ok(())
@@ -136,7 +117,25 @@ impl MyWorkerService {
         //drop read lock to access write lock on same shard of dashmap
         drop(running_job);
 
-        self.release_from_worker(worker_uuid, job_uuid)?;
+        let Some(mut worker) = self.scheduler_state.workers.get_mut(&worker_uuid) else {
+            return Err(Status::not_found(format!(
+                "worker with id: {worker_uuid} was not found in worker pool"
+            )));
+        };
+
+        if !worker.assigned_jobs.contains(&job_uuid) {
+            tracing::warn!(
+                job_id = %job_uuid,
+                worker_id = %worker_uuid,
+                "job present in running_jobs but missing from worker's assigned_jobs"
+            );
+            return Err(Status::not_found(
+                "job was not found within WorkerInfo.assigned_jobs",
+            ));
+        }
+
+
+        self.release_from_worker(&mut worker, job_uuid)?;
         
         let Some((_, running_job)) = self.scheduler_state.running_jobs.remove(&job_uuid) else {
             return Err(Status::internal(
@@ -164,10 +163,27 @@ impl MyWorkerService {
         error: u64,
     ) -> Result<(), Status> {
         //locking sequence: (for retrying branch)
-        //running_jobs --> workers --> drop(workers) --> retry_queue
+        //workers --> running_jobs --> drop(workers) --> retry_queue
 
         //locking sequence: (for deadlettered branch)
-        //running_jobs --> workers --> drop(workers) --> completed_jobs
+        //workers --> running_jobs --> drop(workers) --> completed_jobs
+
+        let Some(mut worker) = self.scheduler_state.workers.get_mut(&worker_uuid) else {
+            return Err(Status::not_found(format!(
+                "worker with id: {worker_uuid} was not found in worker pool"
+            )));
+        };
+
+        if !worker.assigned_jobs.contains(&job_uuid) {
+            tracing::warn!(
+                job_id = %job_uuid,
+                worker_id = %worker_uuid,
+                "job present in running_jobs but missing from worker's assigned_jobs"
+            );
+            return Err(Status::not_found(
+                "job was not found within WorkerInfo.assigned_jobs",
+            ));
+        }
 
         let Some(mut running_job) = self.scheduler_state.running_jobs.get_mut(&job_uuid) else {
             return Err(Status::not_found(
@@ -177,7 +193,7 @@ impl MyWorkerService {
 
         let started_at = verify_executing_phase(&running_job.running_phase, worker_uuid)?;
 
-        self.release_from_worker(worker_uuid, job_uuid)?;
+        self.release_from_worker(&mut worker, job_uuid)?;
 
         let mut staging_job = Job {
             id: running_job.id,
@@ -209,6 +225,8 @@ impl MyWorkerService {
         //deadlettered jobs count as failed, so increment regardless
         self.scheduler_state.total_failed.fetch_add(1, SeqCst);
 
+        drop(worker);
+
         match staging_job.state {
             JobState::Retrying { retry_after } => {
                 running_job.retry_count = staging_job.retry_count;
@@ -236,6 +254,13 @@ impl MyWorkerService {
             )),
         }
     }
+
+
+    /*
+    
+
+     */
+
 
     /// Move a job out of `running_jobs` into `completed_jobs` as dead-lettered.
     /// Any guard on `job_uuid` must be dropped/released first.
@@ -728,7 +753,7 @@ mod tests {
 
     /// Covers submit -> register -> dispatch -> report success, i.e. the whole green path
     /// including capability matching and slot release.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn report_result_success() {
         let mut f = submit_register_dispatch(RetryPolicy::NoRetry).await;
 
@@ -767,7 +792,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn report_result_failure_to_retry() {
         let mut f = submit_register_dispatch(RetryPolicy::FixedDelay {
             delay_ms: 100,
@@ -803,9 +828,9 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn report_result_failure_to_dlq() {
-        // NoRetry means determine_next_event dead-letters on the first failure.
+        //NoRetry means determine_next_event dead-letters on the first failure.
         let mut f = submit_register_dispatch(RetryPolicy::NoRetry).await;
 
         let report = job_result(

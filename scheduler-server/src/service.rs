@@ -52,7 +52,12 @@ impl MySchedulerService {
 
             if let RunningPhase::Retrying = running_job.running_phase {
 
-                //since RunningPhase::Retrying doesnt hold any info, search within retry_queue
+                return Ok(JobState::Retrying { 
+                    retry_after: std::time::Duration::ZERO, 
+                });
+
+
+                //since RunningPhase::Retrying doesnt hold any info, i could search within retry_queue
                 //but might not be in retry_queue if this accessed at the window 
             } 
             //if RunningPhase::Retrying
@@ -315,7 +320,7 @@ async fn bind_spawn_connect_for_tests() -> (
     )
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn job_submission_success() {
 
     use std::collections::HashMap;
@@ -373,7 +378,7 @@ async fn job_submission_success() {
      */
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn job_submission_failure_invalid_retry_policy() {
     use std::collections::HashMap;
 
@@ -408,7 +413,7 @@ async fn job_submission_failure_invalid_retry_policy() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn get_job_status_success() {
 
     use scheduler_core::conversion::proto_to_job_status;
@@ -460,7 +465,7 @@ async fn get_job_status_success() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn get_job_status_not_found() {
     let (mut client, _clone_check) = bind_spawn_connect_for_tests().await;
 
@@ -485,7 +490,7 @@ async fn get_job_status_not_found() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn get_job_status_invalid_id() {
     let (mut client, _clone_check) = bind_spawn_connect_for_tests().await;
 
