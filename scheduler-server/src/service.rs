@@ -39,45 +39,45 @@ impl MySchedulerService {
         //look for running_jobs first
 
         if let Some(running_job) = self.scheduler_state.running_jobs.get(&requested_id) {
-            if let RunningPhase::Executing {
-                worker_id,
-                started_at,
-            } = running_job.running_phase
-            {
-                return Ok(JobState::Running {
-                    worker_id,
-                    started_at,
-                });
+            
+            match running_job.running_phase {
+                RunningPhase::Executing { worker_id, started_at} => {
+                    return Ok(JobState::Running {
+                        worker_id,
+                        started_at,
+                    });
+                }
+
+                RunningPhase::Retrying {} => {
+
+                    let retry_queue_guard = self.scheduler_state.retry_queue.lock();
+                    if let Some(timeout_until) = retry_queue_guard
+                        .iter()
+                        .find(|(_, id)| *id == requested_id)
+                        .map(|(timeout_until, _)| timeout_until)
+                    {
+                        //O(n) time, could speed up with BiBiTreeMap?
+
+                        return Ok(JobState::Retrying {
+                            retry_after: timeout_until
+                                .saturating_duration_since(std::time::Instant::now()),
+                        });
+                        
+                    } else {
+                        return Ok(JobState::Retrying { 
+                            retry_after: std::time::Duration::ZERO, 
+                        });
+                    }
+                    
+                    
+                    //since RunningPhase::Retrying doesnt hold any info, i could search within retry_queue
+                    //but might not be in retry_queue if this accessed at the window 
+                }
             }
-
-            if let RunningPhase::Retrying = running_job.running_phase {
-
-                return Ok(JobState::Retrying { 
-                    retry_after: std::time::Duration::ZERO, 
-                });
-
-
-                //since RunningPhase::Retrying doesnt hold any info, i could search within retry_queue
-                //but might not be in retry_queue if this accessed at the window 
-            } 
+            
             //if RunningPhase::Retrying
             //warning for the future: if a RunningJob is within running_job but somehow not within retry_queue for some reason, the returned value of this function will be tonic::Status::not_found because it'll fall all the way through
 
-            {
-                let retry_queue_guard = self.scheduler_state.retry_queue.lock();
-                if let Some(timeout_until) = retry_queue_guard
-                    .iter()
-                    .find(|(_, id)| *id == requested_id)
-                    .map(|(timeout_until, _)| timeout_until)
-                {
-                    //O(n) time, could speed up with BiBiTreeMap?
-
-                    return Ok(JobState::Retrying {
-                        retry_after: timeout_until
-                            .saturating_duration_since(std::time::Instant::now()),
-                    });
-                }
-            }
         }
 
         //look for completed_jobs next

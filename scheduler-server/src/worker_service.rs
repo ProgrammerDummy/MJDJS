@@ -92,7 +92,17 @@ impl MyWorkerService {
     ///Clears the slot the finished job is occupying in the worker's assigned_jobs allowing it to request for more jobs if previously full
     fn release_from_worker(&self, worker: &mut WorkerInfo, job_uuid: Uuid) -> Result<(), Status> {
 
-        worker.assigned_jobs.remove(&job_uuid);
+        if !worker.assigned_jobs.remove(&job_uuid) {
+            tracing::warn!(
+                job_id = %job_uuid,
+                worker_id = %&worker.id,
+                "job present in running_jobs but missing from worker's assigned_jobs"
+            );
+            
+            return Err(Status::not_found(
+                "job was not found within WorkerInfo.assigned_jobs",
+            ));
+        }
         Ok(())
     }
 
@@ -104,7 +114,7 @@ impl MyWorkerService {
         outcome: CompletedJobOutcome,
     ) -> Result<(), Status> {
         //locking sequence: 
-        //running_jobs --> drop(running_jobs) --> workers --> drop(workers) --> completed_jobs
+        //running_jobs --> drop(running_jobs) --> workers --> completed_jobs
 
         let Some(running_job) = self.scheduler_state.running_jobs.get(&job_uuid) else {
             return Err(Status::not_found(
@@ -122,18 +132,6 @@ impl MyWorkerService {
                 "worker with id: {worker_uuid} was not found in worker pool"
             )));
         };
-
-        if !worker.assigned_jobs.contains(&job_uuid) {
-            tracing::warn!(
-                job_id = %job_uuid,
-                worker_id = %worker_uuid,
-                "job present in running_jobs but missing from worker's assigned_jobs"
-            );
-            return Err(Status::not_found(
-                "job was not found within WorkerInfo.assigned_jobs",
-            ));
-        }
-
 
         self.release_from_worker(&mut worker, job_uuid)?;
         
@@ -174,16 +172,6 @@ impl MyWorkerService {
             )));
         };
 
-        if !worker.assigned_jobs.contains(&job_uuid) {
-            tracing::warn!(
-                job_id = %job_uuid,
-                worker_id = %worker_uuid,
-                "job present in running_jobs but missing from worker's assigned_jobs"
-            );
-            return Err(Status::not_found(
-                "job was not found within WorkerInfo.assigned_jobs",
-            ));
-        }
 
         let Some(mut running_job) = self.scheduler_state.running_jobs.get_mut(&job_uuid) else {
             return Err(Status::not_found(
@@ -192,8 +180,6 @@ impl MyWorkerService {
         };
 
         let started_at = verify_executing_phase(&running_job.running_phase, worker_uuid)?;
-
-        self.release_from_worker(&mut worker, job_uuid)?;
 
         let mut staging_job = Job {
             id: running_job.id,
@@ -221,6 +207,8 @@ impl MyWorkerService {
 
         transition(&mut staging_job, next)
             .map_err(|e| Status::internal(format!("invalid transition: {e:?}")))?;
+
+        self.release_from_worker(&mut worker, job_uuid)?;
 
         //deadlettered jobs count as failed, so increment regardless
         self.scheduler_state.total_failed.fetch_add(1, SeqCst);
@@ -421,7 +409,7 @@ impl WorkerService for MyWorkerService {
             //draining allows for workers to finish current jobs while not taking any new jobs
             WorkerState::Draining => return Ok(no_work_available()),
 
-            WorkerState::Dead => {
+            WorkerState::Dead => { //unreachable code now?
                 return Err(Status::failed_precondition(
                     "work requesting worker is dead",
                 ));
