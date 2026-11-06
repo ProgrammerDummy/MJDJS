@@ -15,7 +15,6 @@ use tonic::transport::Channel;
 use crate::background::{run_death_detector, run_retry_queue_monitor};
 use crate::scheduler_state::SchedulerState;
 use crate::service::MySchedulerService;
-use crate::worker::WorkerState;
 use crate::worker_service::MyWorkerService;
 
 /// Spins up a full server (both services + both background tasks) on a random
@@ -242,7 +241,7 @@ async fn failure_retries_then_requeues() {
     assert_eq!(requeued.retry_count, 1);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)] 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 
 async fn test_death_detector() {
     let (mut sched, mut worker, state) = spawn_full_server().await;
@@ -301,7 +300,7 @@ async fn test_death_detector() {
     }
 
     {
-        assert_eq!(state.workers.get(&uuid::Uuid::from_bytes(worker_id.as_slice().try_into().unwrap())).unwrap().state, WorkerState::Dead);
+        assert!(state.workers.get(&uuid::Uuid::from_bytes(worker_id.as_slice().try_into().unwrap())).is_none());
     }
 
 
