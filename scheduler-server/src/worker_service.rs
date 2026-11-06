@@ -409,12 +409,14 @@ impl WorkerService for MyWorkerService {
             //draining allows for workers to finish current jobs while not taking any new jobs
             WorkerState::Draining => return Ok(no_work_available()),
 
-            WorkerState::Dead => { //unreachable code now?
+            WorkerState::Dead => { 
+                //unreachable code now, since workers would be removed from mapping entirely
                 return Err(Status::failed_precondition(
                     "work requesting worker is dead",
                 ));
             }
         }
+
 
         if worker.max_concurrent_jobs <= worker.assigned_jobs.len() as u32 {
             return Err(Status::resource_exhausted(format!(
@@ -541,6 +543,18 @@ impl WorkerService for MyWorkerService {
                 //using monotonic clocks, not wall clocks due to drift/jumps/unreliability in time across separate machines
                 let now = std::time::Instant::now();
 
+                if let Some(mut worker) = workers.get_mut(&worker_uuid) {
+                    worker.last_heartbeat_at = now;
+                } else {
+                    let _ = tx
+                        .send(Err(Status::not_found(
+                            "invalid worker uuid present in workers",
+                        )))
+                        .await;
+                    break;
+                }
+
+
                 //key is (deadline, worker_id), so to renew TTL, the old pair must be removed and replaced, 
                 //due to no in place updates.
                 {
@@ -562,16 +576,6 @@ impl WorkerService for MyWorkerService {
                 //task immediately block on the lock we still own.
                 deadline_notify.notify_one();
 
-                if let Some(mut worker) = workers.get_mut(&worker_uuid) {
-                    worker.last_heartbeat_at = now;
-                } else {
-                    let _ = tx
-                        .send(Err(Status::internal(
-                            "invalid worker uuid present in workers",
-                        )))
-                        .await;
-                    break;
-                }
 
                 let ack = HeartbeatControl {
                     directive: Some(proto::heartbeat_control::Directive::Ack(proto::Ack {})),
