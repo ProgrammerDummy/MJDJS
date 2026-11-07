@@ -453,7 +453,7 @@ impl WorkerService for MyWorkerService {
                 job_type: job.job_type.clone(),
                 payload: job.payload,
                 priority: job.priority,
-                created_at: job.created_at,
+                created_at: job.created_at,  
                 retry_count: job.retry_count,
                 infra_interruptions: job.infra_interruptions,
                 running_phase: RunningPhase::Executing {

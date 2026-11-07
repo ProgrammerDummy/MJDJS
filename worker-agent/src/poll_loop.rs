@@ -94,7 +94,7 @@ pub async fn connect_with_backoff(addr: SocketAddr) -> WorkerServiceClient<Chann
 
 /// Retries transport failures; gives up on semantic rejections
 /// (NOT_FOUND, FAILED_PRECONDITION, INVALID_ARGUMENT).
-async fn   report_with_retry(client: &mut WorkerServiceClient<Channel>, result: proto::JobResult) {
+async fn report_with_retry(client: &mut WorkerServiceClient<Channel>, result: proto::JobResult) {
     let mut retry_attempts = 0u32;
 
     const MAX_REPORT_ATTEMPTS: u32 = 5;
