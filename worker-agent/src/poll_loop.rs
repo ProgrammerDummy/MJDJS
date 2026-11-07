@@ -94,7 +94,7 @@ pub async fn connect_with_backoff(addr: SocketAddr) -> WorkerServiceClient<Chann
 
 /// Retries transport failures; gives up on semantic rejections
 /// (NOT_FOUND, FAILED_PRECONDITION, INVALID_ARGUMENT).
-async fn report_with_retry(client: &mut WorkerServiceClient<Channel>, result: proto::JobResult) {
+async fn   report_with_retry(client: &mut WorkerServiceClient<Channel>, result: proto::JobResult) {
     let mut retry_attempts = 0u32;
 
     const MAX_REPORT_ATTEMPTS: u32 = 5;
@@ -216,7 +216,7 @@ async fn work_loop(
                 {
                     transport_failures += 1;
                 } else if status.code() == tonic::Code::FailedPrecondition || status.code() == tonic::Code::NotFound {
-                    //possible fix: branch condition on tonic::Code::NotFound?
+                    //possible fix: branch condition on tonic::Code::NotFound? --> applied
 
                     needs_reregister.notify_one();
                     //for a dead worker, such as one that loses network connection past the TTL
