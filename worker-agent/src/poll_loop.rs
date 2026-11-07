@@ -215,7 +215,9 @@ async fn work_loop(
                     || status.code() == tonic::Code::DeadlineExceeded
                 {
                     transport_failures += 1;
-                } else if status.code() == tonic::Code::FailedPrecondition {
+                } else if status.code() == tonic::Code::FailedPrecondition || status.code() == tonic::Code::NotFound {
+                    //possible fix: branch condition on tonic::Code::NotFound?
+
                     needs_reregister.notify_one();
                     //for a dead worker, such as one that loses network connection past the TTL
                     //its jobs will be collected by scheduler and will be marked as dead
