@@ -244,12 +244,6 @@ impl MyWorkerService {
     }
 
 
-    /*
-    
-
-     */
-
-
     /// Move a job out of `running_jobs` into `completed_jobs` as dead-lettered.
     /// Any guard on `job_uuid` must be dropped/released first.
     fn dead_letter(&self, job_uuid: Uuid, reason: String) -> Result<(), Status> {
@@ -349,7 +343,7 @@ impl WorkerService for MyWorkerService {
             .outcome
             .ok_or_else(|| Status::invalid_argument("no variant present within JobOutcome"))?;
 
-        match outcome {
+        match outcome {   
             proto::job_outcome::Outcome::Success(proto::job_outcome::Success { result }) => {
                 self.complete_job(
                     job_uuid,

@@ -103,7 +103,7 @@ pub async fn run_death_detector(state: SchedulerState) {
 
         match worker_heartbeat_deadline_check(state.worker_heartbeat_timer.clone()).await {
             DeadlineResult::DeadlineExpired(worker_uuid) => {
-                let mut jobs_to_be_reassigned = HashSet::new();
+                let jobs_to_be_reassigned : HashSet<uuid::Uuid>;
 
                 if let Some(mut worker_mutref) = state.workers.remove(&worker_uuid) {
                     worker_mutref.1.state = WorkerState::Dead;
