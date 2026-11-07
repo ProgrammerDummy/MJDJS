@@ -143,7 +143,15 @@ pub async fn send_heartbeats(
                             //so registration was stale, and new registration needed
                         }
 
+
                         Err(e) => {
+                            if e.code() == tonic::Code::NotFound {
+                                consecutive_nones += 1;
+                                //signal to scheduler that new registration is needed for this worker
+                                new_registration_needed.notify_one();
+                                break;
+                            }
+
                             //stream/transport broke, reconnect
                             consecutive_nones = 0;
                             tracing::warn!("transport layer broke for worker: {displayable_worker_id} with status: {e}");
