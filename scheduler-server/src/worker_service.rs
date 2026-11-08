@@ -114,7 +114,14 @@ impl MyWorkerService {
         outcome: CompletedJobOutcome,
     ) -> Result<(), Status> {
         //locking sequence: 
-        //running_jobs --> drop(running_jobs) --> workers --> completed_jobs
+        //workers --> running_jobs --> drop(running_jobs) --> completed_jobs
+
+        let Some(mut worker) = self.scheduler_state.workers.get_mut(&worker_uuid) else {
+            return Err(Status::not_found(format!(
+                "worker with id: {worker_uuid} was not found in worker pool"
+            )));
+        };
+
 
         let Some(running_job) = self.scheduler_state.running_jobs.get(&job_uuid) else {
             return Err(Status::not_found(
@@ -126,12 +133,6 @@ impl MyWorkerService {
 
         //drop read lock to access write lock on same shard of dashmap
         drop(running_job);
-
-        let Some(mut worker) = self.scheduler_state.workers.get_mut(&worker_uuid) else {
-            return Err(Status::not_found(format!(
-                "worker with id: {worker_uuid} was not found in worker pool"
-            )));
-        };
 
         self.release_from_worker(&mut worker, job_uuid)?;
         
