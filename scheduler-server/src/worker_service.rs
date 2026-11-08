@@ -832,7 +832,7 @@ mod tests {
 
         // NOTE (preserved from the original): same vacuous-pass hazard as above.
         if let Some(job_ref) = f.state.completed_jobs.get(&job_uuid) {
-            assert_eq!(job_ref.retry_count, 0);
+            assert_eq!(job_ref.retry_count, 1);
             assert_eq!(job_ref.job_type, "test".to_string());
             assert_eq!(f.state.total_dead_lettered.load(SeqCst), 1);
             assert_eq!(
