@@ -48,7 +48,7 @@ impl MySchedulerService {
                     });
                 }
 
-                RunningPhase::Retrying {} => {
+                RunningPhase::Retrying => {
 
                     let retry_queue_guard = self.scheduler_state.retry_queue.lock();
                     if let Some(timeout_until) = retry_queue_guard
@@ -176,6 +176,21 @@ impl SchedulerService for MySchedulerService {
         &self,
         request: Request<proto::JobIdRequest>,
     ) -> Result<Response<proto::JobStatus>, Status> {
+
+        /*
+        note:
+        as of now, this can briefly return NotFound for a job that exists
+        this is if under transition during request_work, where the job is taken out of job_queue but not yet inserted 
+        into running_jobs
+
+        or 
+
+        when the retry monitor removes from running_jobs prior to inserting into job_queue 
+
+        i will fix these LATER!!!!
+         */
+
+
         let job_id_request = request.into_inner();
 
         let job_id_request = uuid::Uuid::from_slice(job_id_request.id.as_slice());
