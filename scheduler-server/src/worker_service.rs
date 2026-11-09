@@ -1,4 +1,4 @@
-use std::{collections::HashSet, sync::atomic::Ordering::SeqCst};
+use std::{collections::HashSet, sync::atomic::Ordering::{self, SeqCst}};
 
 use futures::stream::BoxStream;
 use scheduler_core::{
@@ -38,17 +38,25 @@ fn parse_uuid(raw: &[u8], message: &'static str) -> Result<Uuid, Status> {
 /// the retrying_queue. Any job in the retrying_queue only has ownership via the retrying_queue, so if a worker is still
 /// able to access it, it means an error occured in report_result and it is stale.
 /// Returns `started_at` so the failure path can rebuild the staging `Job` without re-matching.
-fn verify_executing_phase(phase: &RunningPhase, sender: WorkerId) -> Result<u64, Status> {
+fn verify_executing_phase(phase: &RunningPhase, sender: WorkerId, reported_dispatch_token: u64) -> Result<u64, Status> {
     match *phase {
         RunningPhase::Executing {
             worker_id,
             started_at,
+            dispatch_token, 
         } => {
             if worker_id != sender {
                 return Err(Status::invalid_argument(
                     "message is stale or inaccurate, worker id does not match sender",
                 ));
             }
+
+            if reported_dispatch_token != dispatch_token {
+                return Err(Status::invalid_argument(
+                    "message is stale or inaccurate, received dispatch token does not match job's assigned dispatch token",
+                ));
+            }
+            
             Ok(started_at)
         }
 
@@ -112,9 +120,11 @@ impl MyWorkerService {
         job_uuid: Uuid,
         worker_uuid: WorkerId,
         outcome: CompletedJobOutcome,
+        reported_dispatch_token: u64,
     ) -> Result<(), Status> {
         //locking sequence: 
         //workers --> running_jobs --> drop(running_jobs) --> completed_jobs
+
 
         let Some(mut worker) = self.scheduler_state.workers.get_mut(&worker_uuid) else {
             return Err(Status::not_found(format!(
@@ -129,7 +139,7 @@ impl MyWorkerService {
             ));
         };
 
-        verify_executing_phase(&running_job.running_phase, worker_uuid)?;
+        verify_executing_phase(&running_job.running_phase, worker_uuid, reported_dispatch_token)?;
 
         //drop read lock to access write lock on same shard of dashmap
         drop(running_job);
@@ -160,6 +170,7 @@ impl MyWorkerService {
         job_uuid: Uuid,
         worker_uuid: WorkerId,
         error: u64,
+        reported_dispatch_token: u64
     ) -> Result<(), Status> {
         //locking sequence: (for retrying branch)
         //workers --> running_jobs --> drop(workers) --> retry_queue
@@ -180,7 +191,7 @@ impl MyWorkerService {
             ));
         };
 
-        let started_at = verify_executing_phase(&running_job.running_phase, worker_uuid)?;
+        let started_at = verify_executing_phase(&running_job.running_phase, worker_uuid, reported_dispatch_token)?;
 
         let mut staging_job = Job {
             id: running_job.id,
@@ -189,6 +200,7 @@ impl MyWorkerService {
             priority: running_job.priority,
             retry_count: running_job.retry_count,
             infra_interruptions: running_job.infra_interruptions,
+            dispatch_token: 0, //staging job only feeds the state machine, the token is not read here
             created_at: running_job.created_at,
             state: JobState::Running {
                 worker_id: worker_uuid,
@@ -324,21 +336,21 @@ impl WorkerService for MyWorkerService {
         &self,
         request: Request<proto::JobResult>,
     ) -> Result<Response<()>, Status> {
-        let result = request.into_inner();
+        let job_result = request.into_inner();
 
         //check uuids of job and worker
         let job_uuid = parse_uuid(
-            &result.job_id,
+            &job_result.job_id,
             "invalid job uuid was entered when attempting to report_result",
         )?;
         let worker_uuid = parse_uuid(
-            &result.worker_id,
+            &job_result.worker_id,
             "invalid worker uuid was entered when attempting to report_result",
         )?;
 
         //proto3 wraps every message field in Option and every oneof in a second Option
         //peel off here before accessing logic section
-        let outcome = result
+        let outcome = job_result
             .job_outcome
             .ok_or_else(|| Status::invalid_argument("no JobOutcome was sent"))?
             .outcome
@@ -350,12 +362,13 @@ impl WorkerService for MyWorkerService {
                     job_uuid,
                     worker_uuid,
                     CompletedJobOutcome::Succeeded { result },
+                    job_result.dispatch_token,
                 )?;
                 self.scheduler_state.total_completed.fetch_add(1, SeqCst);
             }
 
             proto::job_outcome::Outcome::Failure(proto::job_outcome::Failure { error }) => {
-                self.handle_failure(job_uuid, worker_uuid, error)?;
+                self.handle_failure(job_uuid, worker_uuid, error, job_result.dispatch_token)?;
             }
 
             proto::job_outcome::Outcome::Cancelled(proto::job_outcome::Cancelled {}) => {
@@ -365,6 +378,7 @@ impl WorkerService for MyWorkerService {
                     CompletedJobOutcome::Abandoned {
                         reason: "job was canceled".to_string(),
                     },
+                    job_result.dispatch_token
                 )?;
             }
         }
@@ -403,13 +417,6 @@ impl WorkerService for MyWorkerService {
 
             //draining allows for workers to finish current jobs while not taking any new jobs
             WorkerState::Draining => return Ok(no_work_available()),
-
-            WorkerState::Dead => { 
-                //unreachable code now, since workers would be removed from mapping entirely
-                return Err(Status::failed_precondition(
-                    "work requesting worker is dead",
-                ));
-            }
         }
 
 
@@ -447,6 +454,8 @@ impl WorkerService for MyWorkerService {
 
         let now = now_millis();
 
+        let dispatch_token: u64 = self.scheduler_state.next_dispatch_token.fetch_add(1, Ordering::Relaxed);
+
         self.scheduler_state.running_jobs.insert(
             job.id,
             RunningJob {
@@ -460,6 +469,7 @@ impl WorkerService for MyWorkerService {
                 running_phase: RunningPhase::Executing {
                     worker_id: worker_uuid,
                     started_at: now,
+                    dispatch_token,
                 },
                 requirements: job.requirements.clone(),
                 metadata: job.metadata.clone(),
@@ -476,6 +486,7 @@ impl WorkerService for MyWorkerService {
             priority: job.priority,
             retry_count: job.retry_count,
             infra_interruptions: job.infra_interruptions,
+            dispatch_token,
             created_at: job.created_at,
             state: JobState::Running {
                 worker_id: worker_uuid,
@@ -665,6 +676,7 @@ mod tests {
             priority: 1,
             retry_count: 0,
             infra_interruptions: 0,
+            dispatch_token: 0,
             created_at: 0,
             state: JobState::Queued,
             retry_policy,
@@ -735,6 +747,7 @@ mod tests {
             job_outcome: Some(proto::JobOutcome {
                 outcome: Some(outcome),
             }),
+            dispatch_token: f.job.dispatch_token,
         })
     }
 
@@ -849,5 +862,316 @@ mod tests {
                 panic!("worker uuid missing from workers in scheduler_state")
             }
         }
+    }
+
+
+    // dispatch token tests
+
+    /// Same as `job_result`, but with an explicit dispatch token instead of the fixture's.
+    fn job_result_with_token(
+        f: &Fixture,
+        outcome: proto::job_outcome::Outcome,
+        dispatch_token: u64,
+    ) -> Request<proto::JobResult> {
+        Request::new(proto::JobResult {
+            job_id: f.job.id.clone(),
+            worker_id: f.worker_id.clone(),
+            job_outcome: Some(proto::JobOutcome {
+                outcome: Some(outcome),
+            }),
+            dispatch_token,
+        })
+    }
+
+    /// The job must still be exactly where dispatch left it: Executing on this worker under
+    /// the dispatched token, holding its slot, not completed, not retrying, no counters moved.
+    fn assert_still_dispatched(f: &Fixture) {
+        let job_uuid = Uuid::from_slice(&f.job.id).unwrap();
+        let worker_uuid = Uuid::from_slice(&f.worker_id).unwrap();
+
+        {
+            let running = f
+                .state
+                .running_jobs
+                .get(&job_uuid)
+                .expect("job left running_jobs");
+
+            match running.running_phase {
+                RunningPhase::Executing {
+                    worker_id,
+                    dispatch_token,
+                    ..
+                } => {
+                    assert_eq!(worker_id, worker_uuid);
+                    assert_eq!(dispatch_token, f.job.dispatch_token);
+                }
+                RunningPhase::Retrying => panic!("job was moved to Retrying"),
+            }
+            assert_eq!(running.retry_count, 0, "a failure was counted");
+        } //drop the running_jobs guard before touching workers
+
+        {
+            let worker = f.state.workers.get(&worker_uuid).expect("worker missing");
+            assert!(
+                worker.assigned_jobs.contains(&job_uuid),
+                "the worker's slot was released"
+            );
+        }
+
+        assert!(!f.state.completed_jobs.contains_key(&job_uuid));
+        assert!(f.state.retry_queue.lock().is_empty());
+        assert_eq!(f.state.total_completed.load(SeqCst), 0);
+        assert_eq!(f.state.total_failed.load(SeqCst), 0);
+        assert_eq!(f.state.total_dead_lettered.load(SeqCst), 0);
+    }
+
+    /// Success and Cancelled reports (the complete_job path) carrying a token other than the
+    /// current dispatch's are rejected and change nothing. The genuine report still lands after.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn report_result_stale_token_rejected_on_complete_path() {
+        let mut f = submit_register_dispatch(RetryPolicy::NoRetry).await;
+        assert_ne!(f.job.dispatch_token, 0, "dispatch must mint a real token");
+
+        let stale_tokens = [0, f.job.dispatch_token + 1];
+
+        for stale_token in stale_tokens {
+            for outcome in [
+                proto::job_outcome::Outcome::Success(proto::job_outcome::Success { result: 1 }),
+                proto::job_outcome::Outcome::Cancelled(proto::job_outcome::Cancelled {}),
+            ] {
+                let err = f
+                    .worker_client
+                    .report_result(job_result_with_token(&f, outcome, stale_token))
+                    .await
+                    .expect_err("report with a stale dispatch token was accepted");
+                assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+                assert_still_dispatched(&f);
+            }
+        }
+
+        //the rejections must not have damaged anything: the genuine report is still accepted
+        let genuine = job_result(
+            &f,
+            proto::job_outcome::Outcome::Success(proto::job_outcome::Success { result: 1 }),
+        );
+        f.worker_client
+            .report_result(genuine)
+            .await
+            .expect("genuine report rejected after stale ones");
+
+        let job_uuid = Uuid::from_slice(&f.job.id).unwrap();
+        assert_eq!(
+            f.state
+                .completed_jobs
+                .get(&job_uuid)
+                .expect("job not in completed_jobs")
+                .outcome,
+            CompletedJobOutcome::Succeeded { result: 1 }
+        );
+    }
+
+    /// A Failure report (the handle_failure path) carrying a stale token is rejected and changes
+    /// nothing: no retry_count increment, no Retrying, no retry_queue entry, slot still held.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn report_result_stale_token_rejected_on_failure_path() {
+        let mut f = submit_register_dispatch(RetryPolicy::FixedDelay {
+            delay_ms: 100,
+            max_attempts: 3,
+        })
+        .await;
+
+        for stale_token in [0, f.job.dispatch_token + 1] {
+            let err = f
+                .worker_client
+                .report_result(job_result_with_token(
+                    &f,
+                    proto::job_outcome::Outcome::Failure(proto::job_outcome::Failure { error: 1 }),
+                    stale_token,
+                ))
+                .await
+                .expect_err("failure report with a stale dispatch token was accepted");
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+            assert_still_dispatched(&f);
+        }
+    }
+
+    /// Every dispatch gets its own nonzero token, and the token stored in RunningPhase is the
+    /// one that was sent to the worker.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn request_work_mints_a_distinct_token_per_dispatch() {
+        let (mut scheduler_client, mut worker_client, state) = spawn_server().await;
+
+        const JOBS: usize = 3;
+
+        for _ in 0..JOBS {
+            let job = Job {
+                id: Uuid::now_v7(),
+                job_type: "test".to_string(),
+                payload: 0,
+                priority: 1,
+                retry_count: 0,
+                infra_interruptions: 0,
+                dispatch_token: 0,
+                created_at: 0,
+                state: JobState::Queued,
+                retry_policy: RetryPolicy::NoRetry,
+                requirements: HashMap::new(),
+                metadata: HashMap::new(),
+            };
+            scheduler_client
+                .submit_job(Request::new(proto::Job::try_from(job).unwrap()))
+                .await
+                .expect("submit_job failed");
+        }
+
+        let worker_id = worker_client
+            .register(Request::new(proto::Worker {
+                tags: HashMap::new(),
+                capabilities: HashMap::new(),
+                hostname: "test".to_string(),
+                job_types_supported: vec!["test".to_string()],
+                max_concurrent_jobs: JOBS as u32,
+            }))
+            .await
+            .expect("registration failed")
+            .into_inner()
+            .worker_id;
+
+        let mut tokens = HashSet::new();
+
+        for _ in 0..JOBS {
+            let response = worker_client
+                .request_work(Request::new(proto::AssignedWorkerId {
+                    worker_id: worker_id.clone(),
+                }))
+                .await
+                .expect("request_work failed")
+                .into_inner();
+
+            let job = match response.result {
+                Some(proto::request_work_response::Result::Job(job)) => job,
+                other => panic!("expected a job, got {other:?}"),
+            };
+
+            assert_ne!(job.dispatch_token, 0, "dispatch must mint a real token");
+            assert!(
+                tokens.insert(job.dispatch_token),
+                "token {} was handed out twice",
+                job.dispatch_token
+            );
+
+            let job_uuid = Uuid::from_slice(&job.id).unwrap();
+            let running = state.running_jobs.get(&job_uuid).expect("job not running");
+            match running.running_phase {
+                RunningPhase::Executing { dispatch_token, .. } => {
+                    assert_eq!(dispatch_token, job.dispatch_token)
+                }
+                RunningPhase::Retrying => panic!("freshly dispatched job is Retrying"),
+            }
+        }
+    }
+
+    /// The bug the token exists for: attempt 1 fails, its report is retried by the worker after
+    /// the job has been re-dispatched to the SAME worker as attempt 2. The retried report must be
+    /// rejected without touching attempt 2, and attempt 2's own result must still be accepted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn report_result_rejects_earlier_attempt_after_redispatch_to_same_worker() {
+        let mut f = submit_register_dispatch(RetryPolicy::FixedDelay {
+            delay_ms: 50,
+            max_attempts: 3,
+        })
+        .await;
+
+        let job_uuid = Uuid::from_slice(&f.job.id).unwrap();
+        let attempt_1_token = f.job.dispatch_token;
+
+        //the fixture does not spawn the retry monitor; this test needs the requeue
+        tokio::spawn(crate::background::run_retry_queue_monitor(f.state.clone()));
+
+        let attempt_1_failure =
+            proto::job_outcome::Outcome::Failure(proto::job_outcome::Failure { error: 1 });
+
+        //attempt 1 fails -> Retrying -> requeued after ~50ms
+        f.worker_client
+            .report_result(job_result(&f, attempt_1_failure.clone()))
+            .await
+            .expect("attempt 1's failure report was rejected");
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if f.state.job_queue.lock().iter().any(|job| job.id == job_uuid) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("job was never requeued after its retry delay");
+
+        //attempt 2: the same worker gets the same job back
+        let response = f
+            .worker_client
+            .request_work(Request::new(proto::AssignedWorkerId {
+                worker_id: f.worker_id.clone(),
+            }))
+            .await
+            .expect("request_work failed")
+            .into_inner();
+
+        let attempt_2 = match response.result {
+            Some(proto::request_work_response::Result::Job(job)) => job,
+            other => panic!("expected the job back, got {other:?}"),
+        };
+        assert_eq!(attempt_2.id, f.job.id, "a different job was dispatched");
+        assert_ne!(
+            attempt_2.dispatch_token, attempt_1_token,
+            "re-dispatch must mint a new token"
+        );
+
+        //attempt 1's report arrives again (the worker retrying after a lost response)
+        let err = f
+            .worker_client
+            .report_result(job_result_with_token(&f, attempt_1_failure, attempt_1_token))
+            .await
+            .expect_err("attempt 1's stale report was applied to attempt 2");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        //attempt 2 is untouched
+        {
+            let running = f
+                .state
+                .running_jobs
+                .get(&job_uuid)
+                .expect("attempt 2 left running_jobs");
+            match running.running_phase {
+                RunningPhase::Executing { dispatch_token, .. } => {
+                    assert_eq!(dispatch_token, attempt_2.dispatch_token)
+                }
+                RunningPhase::Retrying => panic!("the stale report moved attempt 2 to Retrying"),
+            }
+            assert_eq!(running.retry_count, 1, "the stale report counted a second failure");
+        }
+        assert_eq!(f.state.total_failed.load(SeqCst), 1);
+
+        //attempt 2's own result lands
+        f.worker_client
+            .report_result(job_result_with_token(
+                &f,
+                proto::job_outcome::Outcome::Success(proto::job_outcome::Success { result: 7 }),
+                attempt_2.dispatch_token,
+            ))
+            .await
+            .expect("attempt 2's genuine report was rejected");
+
+        assert_eq!(
+            f.state
+                .completed_jobs
+                .get(&job_uuid)
+                .expect("job not in completed_jobs")
+                .outcome,
+            CompletedJobOutcome::Succeeded { result: 7 }
+        );
     }
 }
