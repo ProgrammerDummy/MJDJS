@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::Instant;
 
 use scheduler_core::worker::WorkerId;
@@ -9,11 +9,19 @@ pub struct WorkerInfo {
     pub hostname: String,
     pub job_types_supported: Vec<String>,
     pub max_concurrent_jobs: u32,
-    pub assigned_jobs: HashSet<uuid::Uuid>,
+    pub assigned_jobs: HashMap<uuid::Uuid, AssignedJob>, //job_id -> the dispatch this worker holds
     pub last_heartbeat_at: Instant,
     pub capabilities: HashMap<String, String>,
     pub tags: HashMap<String, String>,
     pub state: WorkerState,
+}
+
+/// One dispatch held by a worker, as the scheduler sees it.
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub struct AssignedJob {
+    pub dispatch_token: u64,
+    /// consecutive heartbeats that arrived without listing this dispatch
+    pub missed_heartbeats: u32,
 }
 
 #[derive(Debug, PartialEq)]

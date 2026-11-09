@@ -59,11 +59,13 @@ fn build_result(
     job_id: Vec<u8>,
     worker_id: uuid::Uuid,
     outcome: proto::JobOutcome,
+    dispatch_token: u64,
 ) -> proto::JobResult {
     proto::JobResult {
         job_id,
         worker_id: worker_id.as_bytes().to_vec(),
         job_outcome: Some(outcome),
+        dispatch_token, //echo of the token the job was dispatched with
     }
 }
 
@@ -145,12 +147,13 @@ async fn run_job(
     _permit: OwnedSemaphorePermit, // held for the task's lifetime, dropped on return
 ) {
     let job_id = job.id.clone();
+    let dispatch_token = job.dispatch_token;
     let exec_result = executor.execute(job.payload, cancel).await;
 
     let worker_id = *worker_uuid.lock();
     report_with_retry(
         &mut client,
-        build_result(job_id, worker_id, outcome_from(exec_result)),
+        build_result(job_id, worker_id, outcome_from(exec_result), dispatch_token),
     )
     .await;
 
@@ -251,7 +254,7 @@ async fn work_loop(
         let Some(executor) = registry.get(&job.job_type) else {
             let worker_id = *worker_uuid.lock();
             let outcome = outcome_from(Err(JobError::NoExecutor));
-            report_with_retry(&mut client, build_result(job.id, worker_id, outcome)).await;
+            report_with_retry(&mut client, build_result(job.id, worker_id, outcome, job.dispatch_token)).await;
             idle_polls += 1;
             continue;
         };
