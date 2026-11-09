@@ -3,13 +3,18 @@ use scheduler_core::conversion::{ConversionError, job_state_to_proto};
 use scheduler_core::job_data_structures::{Job, JobState, RetryPolicy};
 use scheduler_core::proto::{self, scheduler_service_server::SchedulerService};
 use std::convert::TryFrom;
+#[cfg(test)]
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tonic::{Request, Response, Status};
 
+#[cfg(test)]
 use parking_lot::Mutex;
 
+//only used by the test helper bind_spawn_connect_for_tests
+#[cfg(test)]
 use scheduler_core::proto::scheduler_service_client;
+#[cfg(test)]
 use scheduler_core::proto::scheduler_service_server::SchedulerServiceServer;
 
 use crate::scheduler_state::{CompletedJobOutcome, QueuedJob, RunningPhase, SchedulerState};
@@ -25,6 +30,7 @@ impl MySchedulerService {
         }
     }
 
+    #[cfg(test)]
     pub fn from_state(state: SchedulerState) -> Self {
         MySchedulerService {
             scheduler_state: state
@@ -41,7 +47,7 @@ impl MySchedulerService {
         if let Some(running_job) = self.scheduler_state.running_jobs.get(&requested_id) {
             
             match running_job.running_phase {
-                RunningPhase::Executing { worker_id, started_at} => {
+                RunningPhase::Executing { worker_id, started_at, .. } => {
                     return Ok(JobState::Running {
                         worker_id,
                         started_at,
@@ -74,9 +80,6 @@ impl MySchedulerService {
                     //but might not be in retry_queue if this accessed at the window 
                 }
             }
-            
-            //if RunningPhase::Retrying
-            //warning for the future: if a RunningJob is within running_job but somehow not within retry_queue for some reason, the returned value of this function will be tonic::Status::not_found because it'll fall all the way through
 
         }
 
@@ -302,6 +305,7 @@ fn validate_retry_policy(policy: &RetryPolicy) -> Result<(), ConversionError> {
 }
 
 //`Mutex<RawMutex, BTreeSet<QueuedJob>>` and `std::sync::Mutex<BTreeSet<QueuedJob>>`
+#[cfg(test)]
 async fn bind_spawn_connect_for_tests() -> (
     scheduler_service_client::SchedulerServiceClient<tonic::transport::Channel>,
     Arc<Mutex<std::collections::BTreeSet<QueuedJob>>>,
@@ -349,6 +353,7 @@ async fn job_submission_success() {
         priority: 1,
         retry_count: 0,
         infra_interruptions: 0,
+        dispatch_token: 0,
         created_at: 0,
         state: JobState::Queued,
         retry_policy: RetryPolicy::NoRetry,
@@ -406,6 +411,7 @@ async fn job_submission_failure_invalid_retry_policy() {
         priority: 1,
         retry_count: 0,
         infra_interruptions: 0,
+        dispatch_token: 0,
         created_at: 0,
         state: JobState::Queued,
         retry_policy: RetryPolicy::FixedDelay {
@@ -419,7 +425,7 @@ async fn job_submission_failure_invalid_retry_policy() {
     let job = tonic::Request::new(proto::Job::try_from(job).unwrap());
 
     match client.submit_job(job).await {
-        Ok(dum) => {
+        Ok(_) => {
             panic!("this test was expected to fail with InvalidArgument");
         }
         Err(status) => {
@@ -444,6 +450,7 @@ async fn get_job_status_success() {
         priority: 1,
         retry_count: 0,
         infra_interruptions: 0,
+        dispatch_token: 0,
         created_at: 0,
         state: JobState::Queued,
         retry_policy: RetryPolicy::NoRetry,

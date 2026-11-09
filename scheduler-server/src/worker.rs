@@ -19,6 +19,5 @@ pub struct WorkerInfo {
 #[derive(Debug, PartialEq)]
 pub enum WorkerState {
     Active,
-    Dead,
     Draining,
 }

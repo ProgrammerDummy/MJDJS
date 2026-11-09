@@ -4,7 +4,6 @@
 use crate::scheduler_state::{
     CompletedJob, CompletedJobOutcome, QueuedJob, RunningPhase, SchedulerState,
 };
-use crate::worker::WorkerState;
 use scheduler_core::job_data_structures::{Job, JobState, now_millis};
 use scheduler_core::state_machine::{determine_reclaim_event, transition};
 use scheduler_core::worker::WorkerId;
@@ -103,16 +102,12 @@ pub async fn run_death_detector(state: SchedulerState) {
 
         match worker_heartbeat_deadline_check(state.worker_heartbeat_timer.clone()).await {
             DeadlineResult::DeadlineExpired(worker_uuid) => {
-                let jobs_to_be_reassigned : HashSet<uuid::Uuid>;
-
-                if let Some(mut worker_mutref) = state.workers.remove(&worker_uuid) {
-                    worker_mutref.1.state = WorkerState::Dead;
-                    jobs_to_be_reassigned =
-                        std::mem::take(&mut worker_mutref.1.assigned_jobs);
-                    //extract out jobs
-                } else {
+                //the worker is removed outright, a returning worker must re-register under a new id
+                let Some((_, removed_worker)) = state.workers.remove(&worker_uuid) else {
                     continue;
-                }
+                };
+
+                let jobs_to_be_reassigned: HashSet<uuid::Uuid> = removed_worker.assigned_jobs;
 
                 if jobs_to_be_reassigned.is_empty() {
                     continue;
@@ -131,6 +126,7 @@ pub async fn run_death_detector(state: SchedulerState) {
                         if let RunningPhase::Executing {
                             worker_id,
                             started_at,
+                            dispatch_token,
                         } = recycled_job.running_phase
                         {
                             new_queued_job = Job {
@@ -141,6 +137,7 @@ pub async fn run_death_detector(state: SchedulerState) {
                                 created_at: recycled_job.created_at,
                                 retry_count: recycled_job.retry_count,
                                 infra_interruptions: recycled_job.infra_interruptions,
+                                dispatch_token,
                                 requirements: recycled_job.requirements.clone(),
                                 metadata: recycled_job.metadata.clone(),
                                 retry_policy: recycled_job.retry_policy.clone(),

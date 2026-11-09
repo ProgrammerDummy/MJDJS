@@ -81,6 +81,7 @@ pub enum RunningPhase {
     Executing {
         worker_id: WorkerId,
         started_at: u64,
+        dispatch_token: u64,
     },
     Retrying,
 }
@@ -114,6 +115,7 @@ pub struct SchedulerState {
     pub total_completed: Arc<AtomicU64>,
     pub total_failed: Arc<AtomicU64>,
     pub total_dead_lettered: Arc<AtomicU64>,
+    pub next_dispatch_token: Arc<AtomicU64>, //source of Job.dispatch_token, one value per dispatch
     pub retry_notify: Arc<Notify>,
     pub new_worker_deadline_notify: Arc<Notify>,
     pub heartbeat_deadline: std::time::Duration,
@@ -139,12 +141,14 @@ impl SchedulerState {
             total_completed: Arc::new(0.into()),
             total_failed: Arc::new(0.into()),
             total_dead_lettered: Arc::new(0.into()),
+            next_dispatch_token: Arc::new(1.into()), //starts at 1 so 0 can mean "not dispatched"
             retry_notify: Arc::new(Notify::new()),
             new_worker_deadline_notify: Arc::new(Notify::new()),
             heartbeat_deadline: std::time::Duration::from_secs(15),
         }
     }
 
+    #[cfg(test)]
     pub fn with_heartbeat_deadline(heartbeat_deadline: std::time::Duration) -> Self {
         SchedulerState {
             job_queue: Arc::new(Mutex::new(BTreeSet::new())),
@@ -157,6 +161,7 @@ impl SchedulerState {
             total_completed: Arc::new(0.into()),
             total_failed: Arc::new(0.into()),
             total_dead_lettered: Arc::new(0.into()),
+            next_dispatch_token: Arc::new(1.into()),
             retry_notify: Arc::new(Notify::new()),
             new_worker_deadline_notify: Arc::new(Notify::new()),
             heartbeat_deadline,
