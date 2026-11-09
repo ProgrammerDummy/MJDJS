@@ -17,6 +17,8 @@ pub struct Job {
     pub priority: u64,
     pub retry_count: u64,
     pub infra_interruptions: u64,
+    ///given by the scheduler on each dispatch; 0 when not dispatched.
+    pub dispatch_token: u64,
     pub created_at: u64,
     pub state: JobState,
     pub retry_policy: RetryPolicy,
@@ -46,6 +48,7 @@ impl Job {
             created_at: now_millis(),
             retry_count: 0,
             infra_interruptions: 0,
+            dispatch_token: 0, //only the scheduler mints tokens, never the client
             ..self
         }
     }
@@ -153,8 +156,6 @@ pub enum JobState {
         abandoned_at: u64,
     },
 }
-
-//for now i didn't put the specific datatypes in for the fields, as they can be adjusted later based on the actual implementation and requirements of the job processing system.
 
 #[derive(Error, Debug, PartialEq, Eq)]
 pub enum QueueError {
