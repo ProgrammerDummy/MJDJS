@@ -66,6 +66,7 @@ fn test_job(job_type: &str, payload: u64, retry_policy: RetryPolicy) -> proto::J
         priority: 1,
         retry_count: 0,
         infra_interruptions: 0,
+        dispatch_token: 0,
         created_at: 0,
         state: JobState::Queued,
         retry_policy,
@@ -158,6 +159,7 @@ async fn full_lifecycle_success() {
                     proto::job_outcome::Success { result: 42 },
                 )),
             }),
+            dispatch_token: dispatched.dispatch_token,
         }))
         .await
         .unwrap();
@@ -204,12 +206,18 @@ async fn failure_retries_then_requeues() {
         .into_inner()
         .id;
 
-    worker
+    let dispatched = match worker
         .request_work(tonic::Request::new(proto::AssignedWorkerId {
             worker_id: worker_id.clone(),
         }))
         .await
-        .unwrap();
+        .unwrap()
+        .into_inner()
+        .result
+    {
+        Some(proto::request_work_response::Result::Job(j)) => j,
+        other => panic!("expected a job, got {other:?}"),
+    };
 
     worker
         .report_result(tonic::Request::new(proto::JobResult {
@@ -220,6 +228,7 @@ async fn failure_retries_then_requeues() {
                     proto::job_outcome::Failure { error: 7 },
                 )),
             }),
+            dispatch_token: dispatched.dispatch_token,
         }))
         .await
         .unwrap();
