@@ -1,11 +1,8 @@
-use std::{collections::HashSet, sync::atomic::Ordering::{self, SeqCst}};
+use std::{collections::HashMap, sync::atomic::Ordering::{self, SeqCst}};
 
 use futures::stream::BoxStream;
 use scheduler_core::{
-    job_data_structures::{Job, JobState, now_millis},
-    proto::{self, HeartbeatControl, worker_service_server::WorkerService},
-    state_machine::{JobEvent, determine_next_event, transition},
-    worker::WorkerId,
+    job_data_structures::{Job, JobState, now_millis}, proto::{self, ActiveJob, CancelJob, HeartbeatControl, HeartbeatPing, heartbeat_control::Directive, worker_service_server::WorkerService}, state_machine::{JobEvent, determine_next_event, transition}, worker::WorkerId,
 };
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
@@ -14,7 +11,7 @@ use crate::{
     scheduler_state::{
         CompletedJob, CompletedJobOutcome, RunningJob, RunningPhase, SchedulerState,
     },
-    worker::{WorkerInfo, WorkerState},
+    worker::{AssignedJob, WorkerInfo, WorkerState},
 };
 
 pub struct MyWorkerService {
@@ -100,7 +97,7 @@ impl MyWorkerService {
     ///Clears the slot the finished job is occupying in the worker's assigned_jobs allowing it to request for more jobs if previously full
     fn release_from_worker(&self, worker: &mut WorkerInfo, job_uuid: Uuid) -> Result<(), Status> {
 
-        if !worker.assigned_jobs.remove(&job_uuid) {
+        if worker.assigned_jobs.remove(&job_uuid).is_none() {
             tracing::warn!(
                 job_id = %job_uuid,
                 worker_id = %&worker.id,
@@ -315,7 +312,7 @@ impl WorkerService for MyWorkerService {
                 hostname: registered_worker.hostname,
                 job_types_supported: registered_worker.job_types_supported,
                 max_concurrent_jobs: registered_worker.max_concurrent_jobs,
-                assigned_jobs: HashSet::new(),
+                assigned_jobs: HashMap::new(),
                 last_heartbeat_at: now,
                 capabilities: registered_worker.capabilities,
                 tags: registered_worker.tags,
@@ -477,7 +474,13 @@ impl WorkerService for MyWorkerService {
             },
         );
 
-        worker.assigned_jobs.insert(job.id);
+        worker.assigned_jobs.insert(
+            job.id,
+            AssignedJob {
+                dispatch_token,
+                missed_heartbeats: 0,
+            },
+        );
 
         let dispatched = Job {
             id: job.id,
@@ -520,10 +523,9 @@ impl WorkerService for MyWorkerService {
         let (tx, rx) = tokio::sync::mpsc::channel(16);
 
         
-        let workers = self.scheduler_state.workers.clone();
-        let heartbeat_timer = self.scheduler_state.worker_heartbeat_timer.clone();
-        let deadline_notify = self.scheduler_state.new_worker_deadline_notify.clone();
-        let heartbeat_deadline = self.scheduler_state.heartbeat_deadline;
+        //the spawned task outlives this call, so it takes its own handle. SchedulerState is all Arcs,
+        //so this clone is cheap, and it gives reconciliation access to running_jobs and job_queue for reclaims.
+        let state = self.scheduler_state.clone();
 
         tokio::spawn(async move {
             loop {
@@ -549,7 +551,7 @@ impl WorkerService for MyWorkerService {
                 //using monotonic clocks, not wall clocks due to drift/jumps/unreliability in time across separate machines
                 let now = std::time::Instant::now();
 
-                if let Some(mut worker) = workers.get_mut(&worker_uuid) {
+                if let Some(mut worker) = state.workers.get_mut(&worker_uuid) {
                     worker.last_heartbeat_at = now;
                 } else {
                     let _ = tx
@@ -564,7 +566,7 @@ impl WorkerService for MyWorkerService {
                 //key is (deadline, worker_id), so to renew TTL, the old pair must be removed and replaced, 
                 //due to no in place updates.
                 {
-                    let mut guard = heartbeat_timer.lock();
+                    let mut guard = state.worker_heartbeat_timer.lock();
 
                     let old_deadline = guard
                         .iter()
@@ -575,12 +577,41 @@ impl WorkerService for MyWorkerService {
                         guard.remove(&(old_deadline, worker_uuid));
                     }
 
-                    guard.insert((now + heartbeat_deadline, worker_uuid));
+                    guard.insert((now + state.heartbeat_deadline, worker_uuid));
                 }
 
                 //only after the guard is dropped: notifying while holding it makes the woken
                 //task immediately block on the lock we still own.
-                deadline_notify.notify_one();
+                state.new_worker_deadline_notify.notify_one();
+                
+                //compare with ping.active_jobs with the worker's assigned_jobs to possibly reconciliate inconsistencies in jobs
+
+                if let Some(mut worker) = state.workers.get_mut(&worker_uuid) {
+                    let jobs_taken_back = unreported_job_reconciliation(ping, &mut worker.assigned_jobs);
+
+                    if !jobs_taken_back.is_empty() {
+
+                        //send back CancelJob directive for jobs who's heartbeat threshold has passed 
+                        //let cancel_jobs = create_cancel_jobs(jobs_taken_back);
+
+                        for job in jobs_taken_back {
+                            if tx.send(Ok(job)).await.is_err() {
+                                break;
+                            }
+                        }
+                        
+                        continue;
+                    }
+
+                } else {
+                    let _ = tx
+                        .send(Err(Status::not_found(
+                            "invalid worker uuid present in workers",
+                        )))
+                        .await;
+                    break;
+                }
+                
 
 
                 let ack = HeartbeatControl {
@@ -591,7 +622,9 @@ impl WorkerService for MyWorkerService {
                 if tx.send(Ok(ack)).await.is_err() {
                     break;
                 }
+                
             }
+            
         });
 
         let output_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
@@ -599,14 +632,48 @@ impl WorkerService for MyWorkerService {
     }
 }
 
+/// A helper function to check jobs returned by worker HeartbeatPings. Checks reported active_jobs against the worker's assigned_jobs, 
+/// increments missed_heartbeats, and returns a vector of CancelJobs for the scheduler to relinquish control of. 
+/// If empty, it means that no jobs are to be cancelled. 
+/// Used by worker_service.rs: heartbeat RPC
+pub fn unreported_job_reconciliation(ping: HeartbeatPing, assigned_jobs: &mut HashMap<Uuid, AssignedJob>) -> Vec<HeartbeatControl> {
+    
+    let mut cancel_jobs : Vec<HeartbeatControl> = vec![];
+
+    for id_job_pair in assigned_jobs {
+        let dummy = ActiveJob {
+            job_id: id_job_pair.0.as_bytes().to_vec(),
+            dispatch_token: id_job_pair.1.dispatch_token,
+        };
+
+        if !ping.active_jobs.contains(&dummy) {
+
+            if id_job_pair.1.missed_heartbeats >= 1 {
+                cancel_jobs.push(HeartbeatControl {
+                    directive: Some(Directive::CancelJob(CancelJob { 
+                        job_id: id_job_pair.0.as_bytes().to_vec(), 
+                        dispatch_token: id_job_pair.1.dispatch_token, 
+                        reason: 2, 
+                    }))
+                });
+            } else {
+                id_job_pair.1.missed_heartbeats += 1;
+            }
+        }
+
+    }
+
+    cancel_jobs
+    
+}
 
 //tests start here
 
-#[cfg(test)]
+#[cfg(test)]   
 mod tests {
     use super::*;
     use scheduler_core::job_data_structures::RetryPolicy;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use tonic::transport::Channel;
 
     type SchedulerClient = proto::scheduler_service_client::SchedulerServiceClient<Channel>;
@@ -913,7 +980,7 @@ mod tests {
         {
             let worker = f.state.workers.get(&worker_uuid).expect("worker missing");
             assert!(
-                worker.assigned_jobs.contains(&job_uuid),
+                worker.assigned_jobs.contains_key(&job_uuid),
                 "the worker's slot was released"
             );
         }
@@ -1095,7 +1162,7 @@ mod tests {
 
         //attempt 1 fails -> Retrying -> requeued after ~50ms
         f.worker_client
-            .report_result(job_result(&f, attempt_1_failure.clone()))
+            .report_result(job_result(&f, attempt_1_failure))
             .await
             .expect("attempt 1's failure report was rejected");
 
@@ -1173,5 +1240,77 @@ mod tests {
                 .outcome,
             CompletedJobOutcome::Succeeded { result: 7 }
         );
+    }
+
+    //heartbeat stream harness (for reconciliation tests)
+
+    /// Opens a heartbeat stream the way a worker would. Push pings into the returned sender;
+    /// read the scheduler's control messages from the returned stream.
+    async fn open_heartbeat(
+        worker_client: &mut WorkerClient,
+    ) -> (
+        tokio::sync::mpsc::Sender<proto::HeartbeatPing>,
+        tonic::Streaming<proto::HeartbeatControl>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let controls = worker_client
+            .heartbeat(tokio_stream::wrappers::ReceiverStream::new(rx))
+            .await
+            .expect("heartbeat RPC failed")
+            .into_inner();
+        (tx, controls)
+    }
+
+    /// A ping from `worker_id` claiming to hold exactly `active_jobs`.
+    fn ping(worker_id: &[u8], active_jobs: Vec<proto::ActiveJob>) -> proto::HeartbeatPing {
+        proto::HeartbeatPing {
+            worker_id: worker_id.to_vec(),
+            sent_at: 0,
+            active_jobs,
+        }
+    }
+
+    /// The (job_id, dispatch_token) entry a worker would list for a dispatched job.
+    fn active(job: &proto::Job) -> proto::ActiveJob {
+        proto::ActiveJob {
+            job_id: job.id.clone(),
+            dispatch_token: job.dispatch_token,
+        }
+    }
+
+    /// The next directive the scheduler sends. Panics if nothing arrives within 2s, the stream
+    /// errors or closes, or the message has no directive.
+    async fn next_directive(
+        controls: &mut tonic::Streaming<proto::HeartbeatControl>,
+    ) -> proto::heartbeat_control::Directive {
+        tokio::time::timeout(std::time::Duration::from_secs(2), controls.message())
+            .await
+            .expect("no control message within 2s")
+            .expect("heartbeat stream errored")
+            .expect("heartbeat stream closed")
+            .directive
+            .expect("control message carried no directive")
+    }
+
+    /// Harness smoke test: a ping that lists the worker's one dispatch, with the right token,
+    /// is acknowledged and leaves the dispatch exactly as it was.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn heartbeat_acks_a_ping_listing_its_dispatch() {
+        let mut f = submit_register_dispatch(RetryPolicy::NoRetry).await;
+        let (tx, mut controls) = open_heartbeat(&mut f.worker_client).await;
+
+        tx.send(ping(&f.worker_id, vec![active(&f.job)]))
+            .await
+            .expect("ping not sent");
+
+        assert!(
+            matches!(
+                next_directive(&mut controls).await,
+                proto::heartbeat_control::Directive::Ack(_)
+            ),
+            "expected an Ack"
+        );
+
+        assert_still_dispatched(&f);
     }
 }

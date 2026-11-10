@@ -8,7 +8,7 @@ use scheduler_core::job_data_structures::{Job, JobState, now_millis};
 use scheduler_core::state_machine::{determine_reclaim_event, transition};
 use scheduler_core::worker::WorkerId;
 use tracing::warn;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -107,7 +107,7 @@ pub async fn run_death_detector(state: SchedulerState) {
                     continue;
                 };
 
-                let jobs_to_be_reassigned: HashSet<uuid::Uuid> = removed_worker.assigned_jobs;
+                let jobs_to_be_reassigned = removed_worker.assigned_jobs;
 
                 if jobs_to_be_reassigned.is_empty() {
                     continue;
@@ -116,7 +116,7 @@ pub async fn run_death_detector(state: SchedulerState) {
                 let mut new_queued_jobs = vec![];
                 let mut new_deadlettered_jobs = vec![];
 
-                for job_uuid in jobs_to_be_reassigned {
+                for job_uuid in jobs_to_be_reassigned.into_keys() {
                     if let Some((_, recycled_job)) = state.running_jobs.remove(&job_uuid) {
                         //check here if infra_interruptions reached the max cap
                         //if so, then redistribute it to completed_jobs instead
