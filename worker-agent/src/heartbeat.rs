@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use scheduler_core::proto;
+use scheduler_core::proto::{self, ActiveJob, CancelReason};
 
 use scheduler_core::job_data_structures::now_millis;
 
@@ -11,6 +11,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;
 
+use crate::poll_loop::TokenMap;
+
 const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub async fn send_heartbeats(
@@ -18,6 +20,7 @@ pub async fn send_heartbeats(
     worker_id: Arc<Mutex<uuid::Uuid>>,
     stop_accepting_work: Arc<AtomicBool>,
     new_registration_needed: Arc<Notify>,
+    token_map: TokenMap, //read to build active_jobs, and to find the dispatch a CancelJob targets
 ) {
     //needs to open the bidirectional stream for heartbeat RPC
     //fire a HeartbeatPing every 5 seconds
@@ -85,7 +88,30 @@ pub async fn send_heartbeats(
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    if let Err(_e) = tx.send(HeartbeatPing { worker_id: worker_id.clone(), sent_at: now_millis() }).await {
+                    if let Err(_e) = tx.send(HeartbeatPing {
+                        worker_id: worker_id.clone(),
+                        sent_at: now_millis(),
+                        active_jobs: {
+                            //building ActiveJob vector from token_map
+
+                            let token_map_guard = token_map.lock();
+                            
+                            let owned_keys : Vec<(uuid::Uuid, u64)> = token_map_guard.keys().copied().collect();
+
+                            let mut active_jobs_vec = vec![];
+
+                            for (job_uuid, token) in owned_keys {
+             
+                                active_jobs_vec.push(ActiveJob {
+                                    job_id: job_uuid.clone().as_bytes().to_vec(), 
+                                    dispatch_token: token,
+                                });
+                            }
+
+                            active_jobs_vec
+
+                        }, 
+                    }).await {
 
                         //server receiving end is gone
 
@@ -115,6 +141,57 @@ pub async fn send_heartbeats(
 
                                     //this flag should be shared with the request work worker-side handler, if set then stop requesting
                                     //within 15 seconds should drain
+                                },
+
+                                proto::HeartbeatControl {
+                                    directive: Some(proto::heartbeat_control::Directive::CancelJob(cancel)),
+                                } => {
+                                    //looks up (job_id, dispatch_token) in token_map and for CancelReason::Revoked
+                                    //sets the revoked flag first, then cancels. CancelReason::User cancels without the flag.
+
+                                    {
+                                        let mut token_map_guard = token_map.lock();
+
+                                        let Ok(job_id) = uuid::Uuid::from_slice(&cancel.job_id) else {
+                                            tracing::warn!("uuid conversion failed during CancelJob handling at worker: {displayable_worker_id}");
+                                            continue;
+                                        };
+
+                                        let dispatch_token = cancel.dispatch_token;
+
+                                        if let Some(entry) = token_map_guard.get_mut(&(job_id, dispatch_token)) {
+                                            match cancel.reason {
+                                                0 => {
+                                                    //unspecified reason for cancellation
+                                                    entry.0.cancel();
+                                                },
+
+                                                1 => {
+                                                    //user requested cancellation
+                                                    entry.0.cancel();
+                                                },
+
+                                                2 => {
+                                                    //reconciliation from scheduler caused cancellation
+                                                    entry.1.store(true, Ordering::SeqCst);
+                                                    entry.0.cancel();
+                                                },
+
+                                                _ => {
+                                                    //an error occurred
+                                                    tracing::warn!("an unexpected cancel reason code was found at worker: {displayable_worker_id}");
+                                                }
+                                                
+                                            }
+                                        } else {
+                                            tracing::warn!("cancel_job failed to locate entry for token_map at worker: {displayable_worker_id}");
+                                            continue;
+                                        };
+
+
+                                    }
+
+                                    tracing::warn!("CancelJob directive received by worker: {displayable_worker_id} but not yet handled");
                                 },
 
                                 proto::HeartbeatControl {
