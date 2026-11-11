@@ -56,7 +56,7 @@ pub fn determine_next_event(job: &Job) -> JobEvent {
     }
 }
 
-const MAX_INFRA_INTERRUPTIONS: u64 = 5;
+pub const MAX_INFRA_INTERRUPTIONS: u64 = 5;
 
 pub fn determine_reclaim_event(job: &Job) -> JobEvent {
     if job.infra_interruptions >= MAX_INFRA_INTERRUPTIONS {
