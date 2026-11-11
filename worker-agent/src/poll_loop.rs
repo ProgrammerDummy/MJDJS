@@ -26,6 +26,14 @@ use std::sync::atomic::Ordering;
 use crate::executor::{ExecutorRegistry, JobError, JobExecutor};
 use crate::heartbeat::sleep_timer;
 
+/// Every dispatch this worker holds, keyed by (job_id, dispatch_token) so two dispatches of the
+/// same job can coexist without overwriting each other. The value is the dispatch's cancellation
+/// token and its "revoked" flag: whoever cancels because the lease was lost (CancelJob REVOKED,
+/// re-registration) sets the flag *before* cancelling, so run_job knows not to report.
+pub type TokenMap = Arc<Mutex<HashMap<(uuid::Uuid, u64), (CancellationToken, Arc<AtomicBool>)>>>;
+
+//note for future: maybe I can do a dashmap here instead of a hashmap?
+
 const DRAIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 const MAX_TRANSPORT_FAILURES: u32 = 5;
@@ -142,29 +150,48 @@ async fn run_job(
     executor: Arc<dyn JobExecutor>,
     cancel: CancellationToken,
     mut client: WorkerServiceClient<Channel>,
-    worker_uuid: Arc<Mutex<uuid::Uuid>>,
-    token_map: Arc<Mutex<HashMap<uuid::Uuid, CancellationToken>>>,
+    worker_uuid: uuid::Uuid,
+    token_map: TokenMap,
     _permit: OwnedSemaphorePermit, // held for the task's lifetime, dropped on return
 ) {
     let job_id = job.id.clone();
     let dispatch_token = job.dispatch_token;
     let exec_result = executor.execute(job.payload, cancel).await;
 
-    let worker_id = *worker_uuid.lock();
-    report_with_retry(
-        &mut client,
-        build_result(job_id, worker_id, outcome_from(exec_result), dispatch_token),
-    )
-    .await;
+    //if this dispatch's revoked flag is set, skip the report
+    //regardless of flag's state, the removal from token_map below must still happen
 
-    token_map.lock().remove(&job_uuid);
+    let report_skip = {
+        let token_map_guard = token_map.lock();
+        match token_map_guard.get(&(job_uuid, dispatch_token)) {
+            Some((_, skip_report_flag)) => {
+            skip_report_flag.load(Ordering::SeqCst)
+            }
+
+            None => {
+                tracing::warn!("job unable to be found during run_job at worker: {worker_uuid}");
+                false
+            }
+        }
+    };
+
+    if !report_skip {
+        report_with_retry(
+            &mut client,
+            build_result(job_id, worker_uuid, outcome_from(exec_result), dispatch_token),
+        )
+        .await;
+    }
+
+    //removed only after the report finishes, so a heartbeat can never omit a dispatch whose report is in flight
+    token_map.lock().remove(&(job_uuid, dispatch_token));
 } //spawned separately and detached
 
 async fn work_loop(
     mut client: WorkerServiceClient<Channel>,
     worker_uuid: Arc<Mutex<uuid::Uuid>>,
     semaphore: Arc<Semaphore>,
-    token_map: Arc<Mutex<HashMap<uuid::Uuid, CancellationToken>>>,
+    token_map: TokenMap,
     main_token: &CancellationToken,
     stop_accepting_work: Arc<AtomicBool>,
     shutting_down: Arc<AtomicBool>,
@@ -262,7 +289,10 @@ async fn work_loop(
         idle_polls = 0;
 
         let cancel = main_token.child_token();
-        token_map.lock().insert(job_uuid, cancel.clone());
+        token_map.lock().insert(
+            (job_uuid, job.dispatch_token),
+            (cancel.clone(), Arc::new(AtomicBool::new(false))),
+        );
 
         tokio::spawn(run_job(
             job,
@@ -270,7 +300,7 @@ async fn work_loop(
             executor,
             cancel,
             client.clone(),
-            worker_uuid.clone(),
+            worker_uuid.lock().clone(),
             token_map.clone(),
             permit,
         ));
@@ -281,7 +311,7 @@ pub async fn poll_loop(
     addr: SocketAddr,
     worker_uuid: Arc<Mutex<uuid::Uuid>>,
     max_concurrent_jobs: u32,
-    token_map: Arc<Mutex<HashMap<uuid::Uuid, CancellationToken>>>,
+    token_map: TokenMap,
     main_token: CancellationToken,
     stop_accepting_work: Arc<AtomicBool>,
     shutting_down: Arc<AtomicBool>,
