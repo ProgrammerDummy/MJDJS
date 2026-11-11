@@ -20,7 +20,7 @@ use executor::{AlwaysFailJob, ExecutorRegistry, SleepJob};
 use tokio_util::sync::CancellationToken;
 
 use crate::heartbeat::{send_heartbeats, sleep_timer};
-use crate::poll_loop::{connect_with_backoff, poll_loop};
+use crate::poll_loop::{TokenMap, connect_with_backoff, poll_loop};
 
 pub fn cached_hostname() -> &'static str {
     static HOSTNAME: OnceLock<String> = OnceLock::new();
@@ -74,8 +74,7 @@ async fn main() {
     };
 
     let worker_uuid = Arc::new(Mutex::new(worker_id));
-    let token_map: Arc<Mutex<HashMap<uuid::Uuid, CancellationToken>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let token_map: TokenMap = Arc::new(Mutex::new(HashMap::new()));
     let main_token = CancellationToken::new();
     let stop_accepting_work = Arc::new(AtomicBool::new(false));
     let shutting_down = Arc::new(AtomicBool::new(false));
@@ -88,10 +87,11 @@ async fn main() {
         worker_uuid.clone(),
         stop_accepting_work.clone(),
         needs_reregister.clone(),
+        token_map.clone(),
     ));
 
     let work_handle = tokio::spawn(poll_loop(
-        args.scheduler_addr,
+        args.scheduler_addr,  
         worker_uuid.clone(),
         args.max_concurrent_jobs,
         token_map.clone(),
@@ -117,11 +117,12 @@ async fn main() {
                 //so just cancel all of them
 
                 {
-                    let mut token_map_guard = token_map.lock();
+                    let token_map_guard = token_map.lock();
 
-                    //cancel all the jobs
-
-                    for cancel_token in (*token_map_guard).values_mut() {
+                    //during reregistration, the worker loses its lease on all jobs so
+                    //revoke flag is set and all jobs are cancelled
+                    for (cancel_token, revoked) in token_map_guard.values() {
+                        revoked.store(true, Ordering::SeqCst);
                         cancel_token.cancel();
                     }
 
