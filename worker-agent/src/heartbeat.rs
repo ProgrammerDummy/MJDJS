@@ -160,28 +160,21 @@ pub async fn send_heartbeats(
                                         let dispatch_token = cancel.dispatch_token;
 
                                         if let Some(entry) = token_map_guard.get_mut(&(job_id, dispatch_token)) {
-                                            match cancel.reason {
-                                                0 => {
-                                                    //unspecified reason for cancellation
+                                            //reason() is prost's typed getter: it returns the CancelReason enum, and
+                                            //maps any number this worker doesn't recognise to Unspecified
+                                            match cancel.reason() {
+                                                CancelReason::User => {
+                                                    //user requested cancellation: flag stays false, so run_job reports Cancelled
                                                     entry.0.cancel();
                                                 },
 
-                                                1 => {
-                                                    //user requested cancellation
-                                                    entry.0.cancel();
-                                                },
-
-                                                2 => {
-                                                    //reconciliation from scheduler caused cancellation
+                                                //Revoked: the scheduler took the job back, so report nothing.
+                                                //Unspecified is treated the same way. Reporting Cancelled is terminal,
+                                                //while staying silent lets the scheduler reclaim the job, which can be undone.
+                                                CancelReason::Revoked | CancelReason::Unspecified => {
                                                     entry.1.store(true, Ordering::SeqCst);
                                                     entry.0.cancel();
                                                 },
-
-                                                _ => {
-                                                    //an error occurred
-                                                    tracing::warn!("an unexpected cancel reason code was found at worker: {displayable_worker_id}");
-                                                }
-                                                
                                             }
                                         } else {
                                             tracing::warn!("cancel_job failed to locate entry for token_map at worker: {displayable_worker_id}");
@@ -191,7 +184,6 @@ pub async fn send_heartbeats(
 
                                     }
 
-                                    tracing::warn!("CancelJob directive received by worker: {displayable_worker_id} but not yet handled");
                                 },
 
                                 proto::HeartbeatControl {
