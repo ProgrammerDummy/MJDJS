@@ -279,7 +279,6 @@ async fn work_loop(
         };
 
         let Some(executor) = registry.get(&job.job_type) else {
-            let worker_id = *worker_uuid.lock();
             let outcome = outcome_from(Err(JobError::NoExecutor));
             report_with_retry(&mut client, build_result(job.id, worker_id, outcome, job.dispatch_token)).await;
             idle_polls += 1;
@@ -300,7 +299,7 @@ async fn work_loop(
             executor,
             cancel,
             client.clone(),
-            worker_uuid.lock().clone(),
+            worker_id,
             token_map.clone(),
             permit,
         ));
