@@ -1,17 +1,17 @@
 use std::{collections::HashMap, sync::atomic::Ordering::{self, SeqCst}};
 
+use dashmap::mapref::one::RefMut;
 use futures::stream::BoxStream;
 use scheduler_core::{
-    job_data_structures::{Job, JobState, now_millis}, proto::{self, ActiveJob, CancelJob, HeartbeatControl, HeartbeatPing, heartbeat_control::Directive, worker_service_server::WorkerService}, state_machine::{JobEvent, determine_next_event, transition}, worker::WorkerId,
+    job_data_structures::{Job, JobState, now_millis}, proto::{self, ActiveJob, CancelJob, CancelReason, HeartbeatControl, HeartbeatPing, heartbeat_control::Directive, worker_service_server::WorkerService}, state_machine::{JobEvent, determine_next_event, transition}, worker::WorkerId,
 };
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
 use crate::{
-    scheduler_state::{
+    background::{ReclaimOutcome::{self, DeadLettered, NotExecuting, Requeued}, reclaim_job}, scheduler_state::{
         CompletedJob, CompletedJobOutcome, RunningJob, RunningPhase, SchedulerState,
-    },
-    worker::{AssignedJob, WorkerInfo, WorkerState},
+    }, worker::{AssignedJob, WorkerInfo, WorkerState},
 };
 
 pub struct MyWorkerService {
@@ -586,23 +586,15 @@ impl WorkerService for MyWorkerService {
                 
                 //compare with ping.active_jobs with the worker's assigned_jobs to possibly reconciliate inconsistencies in jobs
 
-                if let Some(mut worker) = state.workers.get_mut(&worker_uuid) {
-                    let jobs_taken_back = unreported_job_reconciliation(ping, &mut worker.assigned_jobs);
+                let jobs_taken_back : Vec<(Uuid, u64)>;
+                let jobs_to_revoke : Vec<(Uuid, u64)>;
 
-                    if !jobs_taken_back.is_empty() {
-
-                        //send back CancelJob directive for jobs who's heartbeat threshold has passed 
-                        //let cancel_jobs = create_cancel_jobs(jobs_taken_back);
-
-                        for job in jobs_taken_back {
-                            if tx.send(Ok(job)).await.is_err() {
-                                break;
-                            }
-                        }
-                        
-                        continue;
+                if let Some(worker) = state.workers.get_mut(&worker_uuid) {
+                    {
+                        //assigned_jobs is accessed wtihin unreported_job_reconciliation_comparison
+                        //assigned_job(job_id) is removed within the method, and it is later reclaimed at line 621 by removing from running_jobs
+                        (jobs_taken_back, jobs_to_revoke) = unreported_job_reconciliation_comparison(ping, worker);
                     }
-
                 } else {
                     let _ = tx
                         .send(Err(Status::not_found(
@@ -612,12 +604,82 @@ impl WorkerService for MyWorkerService {
                     break;
                 }
                 
-
-
                 let ack = HeartbeatControl {
                     directive: Some(proto::heartbeat_control::Directive::Ack(proto::Ack {})),
                 };
 
+                //needs to remove job from assigned_job, running_job, and requeue/dlq
+
+                if !jobs_taken_back.is_empty() {
+
+                    //send back CancelJob directive for jobs who's heartbeat threshold has passed 
+                    //let cancel_jobs = create_cancel_jobs(jobs_taken_back);
+
+                    for job in jobs_taken_back {
+                        let reclaim_outcome : ReclaimOutcome;
+
+                        if let Some(recycled_job) = state.running_jobs.remove(&job.0) {
+                            
+                            if recycled_job.1.running_phase == RunningPhase::Retrying {
+                                let _  = state.running_jobs.insert(recycled_job.1.id, recycled_job.1.clone());
+                            }
+
+                            reclaim_outcome = reclaim_job(recycled_job.1);
+  
+                            match reclaim_outcome {
+                                Requeued(queued_job) => {
+                                    //reinsert into job_queue
+
+                                    let mut job_queue_guard = state.job_queue.lock();
+                                    let _ = job_queue_guard.insert(queued_job);
+                                
+                                }
+
+                                DeadLettered(dlq_job) => {
+                                    //insert into dlq and increment atomic
+
+                                    let _ = state.completed_jobs.insert(dlq_job.id, dlq_job);
+                                    state.total_dead_lettered.fetch_add(1, Ordering::Relaxed);
+
+                                }
+
+                                NotExecuting(running_job) => {
+                                    //put it back in running_jobs, job was retrying
+
+                                    let _ = state.running_jobs.insert(running_job.id, running_job);
+                                }
+                            }
+
+                        } else {
+                            let warning_job_id = job.0;
+                            tracing::warn!("job was not found within running_jobs for job_id: {warning_job_id}");
+                        }
+
+                        if tx.send(Ok(build_cancel_job(job.0, job.1, CancelReason::Revoked as i32))).await.is_err() {
+                            break;
+                        }
+                    }
+
+                }
+
+                if !jobs_to_revoke.is_empty() {
+
+                    //send back CancelJob directive for jobs who's heartbeat threshold has passed 
+                    //let cancel_jobs = create_cancel_jobs(jobs_taken_back);
+
+                    for job in jobs_to_revoke {
+                        if tx.send(Ok(build_cancel_job(job.0, job.1, CancelReason::Revoked as i32))).await.is_err() {
+                            break;
+                        }
+                    }
+
+                    if tx.send(Ok(ack.clone())).await.is_err() {
+                        break;
+                    }
+
+                }
+
+                
                 //Err here means the worker's receive half is gone, nothing left to serve.
                 if tx.send(Ok(ack)).await.is_err() {
                     break;
@@ -633,14 +695,20 @@ impl WorkerService for MyWorkerService {
 }
 
 /// A helper function to check jobs returned by worker HeartbeatPings. Checks reported active_jobs against the worker's assigned_jobs, 
-/// increments missed_heartbeats, and returns a vector of CancelJobs for the scheduler to relinquish control of. 
-/// If empty, it means that no jobs are to be cancelled. 
+/// increments missed_heartbeats, and returns a tuple of vectors of (job_uuid, dispatch tokens) for the scheduler to relinquish control of. 
+/// If empty, it means that no jobs are to be cancelled.   
 /// Used by worker_service.rs: heartbeat RPC
-pub fn unreported_job_reconciliation(ping: HeartbeatPing, assigned_jobs: &mut HashMap<Uuid, AssignedJob>) -> Vec<HeartbeatControl> {
+pub fn unreported_job_reconciliation_comparison(
+    ping: HeartbeatPing, 
+    mut worker: RefMut<Uuid, WorkerInfo>,
+) -> (Vec<(Uuid, u64)>, Vec<(Uuid, u64)>) {
     
-    let mut cancel_jobs : Vec<HeartbeatControl> = vec![];
+    let worker_id = worker.id;
 
-    for id_job_pair in assigned_jobs {
+    let mut cancel_jobs = vec![];
+
+    for id_job_pair in &mut worker.assigned_jobs {
+
         let dummy = ActiveJob {
             job_id: id_job_pair.0.as_bytes().to_vec(),
             dispatch_token: id_job_pair.1.dispatch_token,
@@ -649,22 +717,68 @@ pub fn unreported_job_reconciliation(ping: HeartbeatPing, assigned_jobs: &mut Ha
         if !ping.active_jobs.contains(&dummy) {
 
             if id_job_pair.1.missed_heartbeats >= 1 {
-                cancel_jobs.push(HeartbeatControl {
-                    directive: Some(Directive::CancelJob(CancelJob { 
-                        job_id: id_job_pair.0.as_bytes().to_vec(), 
-                        dispatch_token: id_job_pair.1.dispatch_token, 
-                        reason: 2, 
-                    }))
-                });
+                cancel_jobs.push((*id_job_pair.0, id_job_pair.1.dispatch_token));
+
             } else {
                 id_job_pair.1.missed_heartbeats += 1;
             }
+        } else {
+            //reset missed heartbeats   
+            id_job_pair.1.missed_heartbeats = 0;
         }
-
+    
     }
 
-    cancel_jobs
+    //check for any jobs the worker might be holding that the scheduler does not know about to revoke
+
+    let mut jobs_to_revoke= vec![];
+
+    for jobs in ping.active_jobs {
+
+        match uuid::Uuid::from_slice(&jobs.job_id) {
+            Ok(job_id) => {
+
+                if let Some(assigned_job) = worker.assigned_jobs.get(&job_id) {
+                    if jobs.dispatch_token != assigned_job.dispatch_token {
+                        jobs_to_revoke.push((job_id, jobs.dispatch_token));
+                    }
+
+                } else {
+                    jobs_to_revoke.push((job_id, jobs.dispatch_token));
+                }
+
+            }
+
+            Err(_) => {
+                //probably should log error here
+                tracing::warn!("malformed job id detected at worker: {worker_id}");
+                continue;
+            }
+        }
+        
+    }
+
+
+    for id_token_pair in &cancel_jobs {
+        let _ = worker.assigned_jobs.remove(&id_token_pair.0);
+    }
+
+
+    (cancel_jobs, jobs_to_revoke)
     
+}
+
+
+pub fn build_cancel_job(id: Uuid, token: u64, reason: i32) -> HeartbeatControl {
+    
+    HeartbeatControl {
+        directive: Some(Directive::CancelJob(CancelJob { 
+            job_id: id.as_bytes().to_vec(), 
+            dispatch_token: token, 
+            reason,
+        }))
+    }
+
 }
 
 //tests start here
@@ -679,6 +793,7 @@ mod tests {
     type SchedulerClient = proto::scheduler_service_client::SchedulerServiceClient<Channel>;
     type WorkerClient = proto::worker_service_client::WorkerServiceClient<Channel>;
 
+    const MAX_INFRA_INTERRUPTIONS : u64 = 5;
     /// Everything a report_result test needs after setup has run.
     struct Fixture {
         worker_client: WorkerClient,
@@ -1242,6 +1357,10 @@ mod tests {
         );
     }
 
+
+
+
+
     //heartbeat stream harness (for reconciliation tests)
 
     /// Opens a heartbeat stream the way a worker would. Push pings into the returned sender;
@@ -1292,6 +1411,99 @@ mod tests {
             .expect("control message carried no directive")
     }
 
+    /// One ping's complete reply: reads control messages up to and including the Ack that closes
+    /// the reply, and returns every directive that came before it, in order.
+    ///
+    /// Relies on the heartbeat contract that every ping is answered with exactly one Ack, sent
+    /// last. That is what lets a test prove "this ping produced nothing else" without waiting on
+    /// a timeout. If the server ever sends two Acks for one ping, the second is left in the
+    /// stream and the next call returns early with an empty Vec, so a test that suddenly sees
+    /// nothing where it expected a cancel should suspect a doubled Ack first.
+    ///
+    /// Panics if any message takes longer than 2s, or the stream errors or closes.
+    async fn directives_until_ack(
+        controls: &mut tonic::Streaming<proto::HeartbeatControl>,
+    ) -> Vec<proto::heartbeat_control::Directive> {
+        let mut directives = Vec::new();
+
+        loop {
+            match next_directive(controls).await {
+                proto::heartbeat_control::Directive::Ack(_) => return directives,
+                other => directives.push(other),
+            }
+        }
+    }
+
+    /// The CancelJob directives in a reply, as (job_id, dispatch_token, reason) so a test can
+    /// compare the whole set with one assert_eq!. Panics on any directive that is not a
+    /// CancelJob, so an unexpected directive fails the test instead of being filtered away.
+    fn cancels_in(
+        directives: &[proto::heartbeat_control::Directive],
+    ) -> Vec<(Uuid, u64, CancelReason)> {
+        directives
+            .iter()
+            .map(|directive| match directive {
+                proto::heartbeat_control::Directive::CancelJob(cancel) => (
+                    Uuid::from_slice(&cancel.job_id).expect("CancelJob carried a malformed job id"),
+                    cancel.dispatch_token,
+                    cancel.reason(),
+                ),
+                other => panic!("expected only CancelJob directives, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// Harness smoke test: a ping listing the worker's one dispatch with the right token gets a
+    /// reply containing nothing but the closing Ack.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn heartbeat_reply_to_a_healthy_ping_is_only_an_ack() {
+        let mut f = submit_register_dispatch(RetryPolicy::NoRetry).await;
+        let (tx, mut controls) = open_heartbeat(&mut f.worker_client).await;
+
+        for _ in 0..3 {
+            tx.send(ping(&f.worker_id, vec![active(&f.job)]))
+                .await
+                .expect("ping not sent");
+
+            let reply = directives_until_ack(&mut controls).await;
+            assert!(reply.is_empty(), "healthy ping produced directives: {reply:?}");
+        }
+
+        assert_still_dispatched(&f);
+    }
+
+    /// Harness smoke test: a ping listing a dispatch the scheduler never handed out gets a reply
+    /// of exactly one Revoked CancelJob for it, closed by a single Ack, and the next healthy
+    /// ping's reply starts cleanly (nothing left over from the previous one).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn heartbeat_reply_reads_a_revoke_then_realigns() {
+        let mut f = submit_register_dispatch(RetryPolicy::NoRetry).await;
+        let (tx, mut controls) = open_heartbeat(&mut f.worker_client).await;
+
+        let unknown_job = Uuid::now_v7();
+        let unknown = proto::ActiveJob {
+            job_id: unknown_job.as_bytes().to_vec(),
+            dispatch_token: 999,
+        };
+
+        tx.send(ping(&f.worker_id, vec![active(&f.job), unknown]))
+            .await
+            .expect("ping not sent");
+
+        let reply = directives_until_ack(&mut controls).await;
+        assert_eq!(
+            cancels_in(&reply),
+            vec![(unknown_job, 999, CancelReason::Revoked)]
+        );
+
+        tx.send(ping(&f.worker_id, vec![active(&f.job)]))
+            .await
+            .expect("ping not sent");
+        assert!(directives_until_ack(&mut controls).await.is_empty());
+
+        assert_still_dispatched(&f);
+    }
+
     /// Harness smoke test: a ping that lists the worker's one dispatch, with the right token,
     /// is acknowledged and leaves the dispatch exactly as it was.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1313,4 +1525,226 @@ mod tests {
 
         assert_still_dispatched(&f);
     }
+
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reconciliation_no_reports_test() {
+        let mut f = submit_register_dispatch(RetryPolicy::NoRetry).await;
+        let (tx, mut controls) = open_heartbeat(&mut f.worker_client).await;
+        
+        let job_id = uuid::Uuid::from_slice(&f.job.id).unwrap();
+
+        tx.send(ping(&f.worker_id, vec![]))
+            .await
+            .expect("ping not sent");
+
+        assert!(
+            matches!(
+                next_directive(&mut controls).await,
+                proto::heartbeat_control::Directive::Ack(_)
+            ),
+            "expected an Ack"
+        );
+
+        tx.send(ping(&f.worker_id, vec![]))
+            .await
+            .expect("ping not sent");
+
+        
+        let reply = directives_until_ack(&mut controls).await;
+        assert_eq!(cancels_in(&reply), vec![(job_id, f.job.dispatch_token, CancelReason::Revoked)]);
+
+        {
+            let worker = f.state.workers.get(&uuid::Uuid::from_slice(&f.worker_id).unwrap()).unwrap();
+            assert!(worker.assigned_jobs.is_empty());
+        }
+
+        {
+            assert!(f.state.running_jobs.is_empty());
+        }
+
+        {
+            let job_queue_guard = f.state.job_queue.lock();
+            let job_id = uuid::Uuid::from_slice(&f.job.id).unwrap();
+
+            let job = job_queue_guard.iter().find(|queued| queued.id == job_id).unwrap();
+
+            assert_eq!(job.infra_interruptions, 1);
+        }
+
+    }
+
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reset_test() {
+
+        //miss, send in correct heartbeatPing, then miss and check missed_heartbeat count
+
+        let mut f = submit_register_dispatch(RetryPolicy::NoRetry).await;
+        let (tx, mut controls) = open_heartbeat(&mut f.worker_client).await;
+       
+        let job_id = uuid::Uuid::from_slice(&f.job.id).unwrap();
+        let worker_id = uuid::Uuid::from_slice(&f.worker_id).unwrap();
+
+        tx.send(ping(&f.worker_id, vec![]))
+            .await
+            .expect("ping not sent");
+
+        let reply = directives_until_ack(&mut controls).await;
+        assert_eq!(cancels_in(&reply), vec![]);
+
+        {
+            let _ = f.state.running_jobs.get(&job_id).unwrap();
+
+            let worker = f.state.workers.get(&worker_id).unwrap();
+
+            let assigned_job = worker.assigned_jobs.get(&job_id).unwrap();
+
+            assert_eq!(assigned_job.missed_heartbeats, 1);
+        }
+
+        tx.send(ping(&f.worker_id, vec![active(&f.job)]))
+            .await
+            .expect("ping not sent");  
+
+        let reply = directives_until_ack(&mut controls).await;
+        assert_eq!(cancels_in(&reply), vec![]);
+
+        {
+            let _ = f.state.running_jobs.get(&job_id).unwrap();
+
+            let worker = f.state.workers.get(&worker_id).unwrap();
+
+            let assigned_job = worker.assigned_jobs.get(&job_id).unwrap();
+
+            assert_eq!(assigned_job.missed_heartbeats, 0);
+        }
+
+        tx.send(ping(&f.worker_id, vec![]))
+            .await
+            .expect("ping not sent");
+
+        let reply = directives_until_ack(&mut controls).await;
+        assert_eq!(cancels_in(&reply), vec![]);
+
+        {
+            let _ = f.state.running_jobs.get(&job_id).unwrap();
+
+            let worker = f.state.workers.get(&worker_id).unwrap();
+
+            let assigned_job = worker.assigned_jobs.get(&job_id).unwrap();
+
+            assert_eq!(assigned_job.missed_heartbeats, 1);
+        }
+
+        //tried breaking the code at line 731, test failed as expected upon changing
+
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unknown_dispatch_test() {
+        let mut f = submit_register_dispatch(RetryPolicy::NoRetry).await;
+        let (tx, mut controls) = open_heartbeat(&mut f.worker_client).await;
+
+        let job_id = uuid::Uuid::from_slice(&f.job.id).unwrap();
+        let worker_id = uuid::Uuid::from_slice(&f.worker_id).unwrap();
+
+        let job = Job {
+            id: Uuid::now_v7(),
+            job_type: "test".to_string(),
+            payload: 0,
+            priority: 1,
+            retry_count: 0,
+            infra_interruptions: 0,
+            dispatch_token: 100,
+            created_at: 0,
+            state: JobState::Queued,
+            retry_policy: RetryPolicy::NoRetry,
+            requirements: HashMap::new(),
+            metadata: HashMap::new(),
+        };
+
+        let unknown_job_id = job.id;
+        let unknown_job_dispatch_token = job.dispatch_token.clone();
+        
+        let proto_job = proto::Job::try_from(job).unwrap();
+
+        
+        tx.send(ping(&f.worker_id, vec![active(&proto_job)]))
+            .await
+            .expect("ping not sent");
+
+        let reply = directives_until_ack(&mut controls).await;
+        assert_eq!(cancels_in(&reply), vec![(unknown_job_id, unknown_job_dispatch_token, CancelReason::Revoked)]);
+
+        {
+            let worker = f.state.workers.get(&worker_id).unwrap();
+            let original_job = worker.assigned_jobs.get(&job_id).unwrap();
+
+            assert_eq!(original_job.missed_heartbeats, 1);
+        }
+
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mixed_case_test() {
+        let mut f = submit_register_dispatch(RetryPolicy::NoRetry).await;
+        let (tx, mut controls) = open_heartbeat(&mut f.worker_client).await;
+
+        let job_id = uuid::Uuid::from_slice(&f.job.id).unwrap();
+
+        let old = proto::ActiveJob { job_id: f.job.id.clone(), dispatch_token: f.job.dispatch_token - 1 };
+
+        tx.send(ping(&f.worker_id, vec![old, active(&f.job)])).await.unwrap();
+
+        let reply = directives_until_ack(&mut controls).await;
+
+        assert_eq!(cancels_in(&reply), vec![(job_id, f.job.dispatch_token - 1, CancelReason::Revoked)]);
+
+        assert_still_dispatched(&f);
+
+
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dlq_test() {
+        let mut f = submit_register_dispatch(RetryPolicy::NoRetry).await;
+        let (tx, mut controls) = open_heartbeat(&mut f.worker_client).await;
+
+        let job_id = uuid::Uuid::from_slice(&f.job.id).unwrap();
+
+        f.state.running_jobs.get_mut(&job_id).unwrap().infra_interruptions = MAX_INFRA_INTERRUPTIONS;
+
+
+
+        tx.send(ping(&f.worker_id, vec![]))
+            .await
+            .expect("ping not sent");
+
+        assert!(
+            matches!(
+                next_directive(&mut controls).await,
+                proto::heartbeat_control::Directive::Ack(_)
+            ),
+            "expected an Ack"
+        );
+
+        tx.send(ping(&f.worker_id, vec![]))
+            .await
+            .expect("ping not sent");
+
+        let reply = directives_until_ack(&mut controls).await;
+        assert_eq!(cancels_in(&reply), vec![(job_id, f.job.dispatch_token, CancelReason::Revoked)]);
+
+        {
+            assert_eq!(f.state.total_dead_lettered.load(Ordering::Relaxed), 1);
+            
+            let dlq_job = f.state.completed_jobs.get(&job_id).unwrap();
+
+            assert_eq!(dlq_job.outcome, CompletedJobOutcome::DeadLettered { reason: "exceeded infrastructure interruption cap, treated as a poison pill".to_string() });
+        }
+
+
+    }
+
 }
