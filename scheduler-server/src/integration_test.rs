@@ -1,6 +1,7 @@
 #![cfg(test)]
 
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use scheduler_core::job_data_structures::{Job, JobState, RetryPolicy};
@@ -10,10 +11,11 @@ use scheduler_core::proto::{
     worker_service_client::WorkerServiceClient,
     worker_service_server::WorkerServiceServer,
 };
+use scheduler_core::state_machine::MAX_INFRA_INTERRUPTIONS;
 use tonic::transport::Channel;
 
 use crate::background::{run_death_detector, run_retry_queue_monitor};
-use crate::scheduler_state::SchedulerState;
+use crate::scheduler_state::{QueuedJob, SchedulerState};
 use crate::service::MySchedulerService;
 use crate::worker_service::MyWorkerService;
 
@@ -262,15 +264,19 @@ async fn test_death_detector() {
         .into_inner()
         .worker_id;
 
-    let job_id = sched
-        .submit_job(tonic::Request::new(test_job(
+        
+    let test_job = test_job(
             "sleep", 
             500, 
             RetryPolicy::FixedDelay { 
                 delay_ms: 200, 
                 max_attempts: 5 
-                }
-            )))
+            }
+    );
+
+
+    let job_id = sched
+        .submit_job(tonic::Request::new(test_job))
         .await
         .unwrap()
         .into_inner()
@@ -305,6 +311,103 @@ async fn test_death_detector() {
         let test_job = job_queue_guard.pop_first().unwrap();
         assert_eq!(test_job.infra_interruptions, 1);
         assert_eq!(test_job.retry_count, 0);
+  
+    }
+
+    {
+        assert!(state.workers.get(&uuid::Uuid::from_bytes(worker_id.as_slice().try_into().unwrap())).is_none());
+    }
+
+
+
+
+}
+
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+
+async fn test_death_detector_dlq() {
+    let (mut sched, mut worker, state) = spawn_full_server().await;
+
+    let worker_id = worker
+        .register(tonic::Request::new(test_worker(&["sleep"], 1)))
+        .await
+        .unwrap()
+        .into_inner()
+        .worker_id;
+
+
+    let test_job = test_job(
+            "sleep", 
+            500, 
+            RetryPolicy::FixedDelay { 
+                delay_ms: 200, 
+                max_attempts: 5 
+            }
+    );
+
+    //submit_job calls Job::new_submitted() internally, which overwrites the uuid, state, created_at, retry_count, dispatch_token (to 0)
+    //and most importantly the infra_interruptions, so injecting a custom value must be done after submit_job is finished
+
+    let job_id = sched
+        .submit_job(tonic::Request::new(test_job))
+        .await
+        .unwrap()
+        .into_inner()
+        .id;
+
+    let job_uuid = uuid::Uuid::from_slice(&job_id).unwrap();
+
+
+    {
+        let mut job_queue_guard = state.job_queue.lock();
+
+        assert_eq!(job_queue_guard.len(), 1);
+
+        let mut job_in_queue = job_queue_guard.pop_first().unwrap();
+    
+        job_in_queue.infra_interruptions = MAX_INFRA_INTERRUPTIONS;
+
+        let _ = job_queue_guard.insert(job_in_queue);
+        
+    }
+    
+
+
+    worker.request_work(tonic::Request::new(
+        proto::AssignedWorkerId { 
+            worker_id: worker_id.clone() 
+        }))
+        .await
+        .unwrap();
+
+    let status = status_of(&mut sched, &job_id).await;
+
+    match status {
+        JobState::Running { .. } => {},
+        _ => {
+            panic!("supposed to be Running");
+        }
+    }
+
+    //make sleep with no heartbeat to trigger death_detector
+
+    tokio::time::sleep(state.heartbeat_deadline + std::time::Duration::from_millis(500)).await;
+
+    let status = status_of(&mut sched, &job_id).await;
+
+    assert_eq!(status, JobState::DeadLettered { reason: "exceeded infrastructure interruption cap, treated as a poison pill".to_string() });
+
+
+    {
+        assert_eq!(state.total_dead_lettered.load(Ordering::SeqCst), 1);
+        assert_eq!(state.total_completed.load(Ordering::SeqCst), 0);
+
+        let dlq_job = state.completed_jobs.get(&job_uuid).unwrap();
+
+        assert_eq!(dlq_job.infra_interruptions, MAX_INFRA_INTERRUPTIONS);
+        assert_eq!(job_uuid, dlq_job.id);
+
   
     }
 
