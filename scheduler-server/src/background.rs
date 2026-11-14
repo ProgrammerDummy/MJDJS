@@ -10,6 +10,7 @@ use scheduler_core::worker::WorkerId;
 use tracing::warn;
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use parking_lot::Mutex;
@@ -152,7 +153,7 @@ pub async fn run_death_detector(state: SchedulerState) {
                 if !new_deadlettered_jobs.is_empty() {
                     for new_dlq_job in new_deadlettered_jobs {
                         state.completed_jobs.insert(new_dlq_job.id, new_dlq_job);
-                        
+                        state.total_dead_lettered.fetch_add(1, Ordering::SeqCst);
                     }
                 }
             }
