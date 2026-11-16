@@ -21,6 +21,7 @@ pub async fn send_heartbeats(
     stop_accepting_work: Arc<AtomicBool>,
     new_registration_needed: Arc<Notify>,
     token_map: TokenMap, //read to build active_jobs, and to find the dispatch a CancelJob targets
+    undergoing_reregistration: Arc<Mutex<AtomicBool>>
 ) {
     //needs to open the bidirectional stream for heartbeat RPC
     //fire a HeartbeatPing every 5 seconds
@@ -42,7 +43,7 @@ pub async fn send_heartbeats(
             *guard
         };
 
-        let worker_id = { worker_id.lock().as_bytes().to_vec() };
+        let worker_id_bytes = { displayable_worker_id.as_bytes().to_vec() };
 
         let channel = match tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
             .unwrap()
@@ -89,7 +90,7 @@ pub async fn send_heartbeats(
             tokio::select! {
                 _ = interval.tick() => {
                     if let Err(_e) = tx.send(HeartbeatPing {
-                        worker_id: worker_id.clone(),
+                        worker_id: worker_id_bytes.clone(),
                         sent_at: now_millis(),
                         active_jobs: {
                             //building ActiveJob vector from token_map
@@ -203,7 +204,24 @@ pub async fn send_heartbeats(
                             consecutive_nones += 1;
                             //signal to scheduler that new registration is needed for this worker
                             if consecutive_nones >= 2 {
-                                new_registration_needed.notify_one();
+
+                                {
+                                    let guard = undergoing_reregistration.lock();
+                                    //skip the new_registration_needed.notify_one() since the its being reregistered already
+                                    if guard.load(Ordering::Relaxed) {
+                                        break;
+                                    }
+                                }
+
+                                {
+                                    let possibly_changed_worker_id = *worker_id.lock();
+
+                                    //if the current worker id is not the same as the one currently held in scope, then a reregistration has occured
+                                    //so dont signal for a new one, just update the held id on next loop
+                                    if possibly_changed_worker_id == displayable_worker_id {
+                                        new_registration_needed.notify_one();
+                                    }
+                                }
                             }
                             break;
                             //stream was closed gracefully by the server

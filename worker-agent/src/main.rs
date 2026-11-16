@@ -1,6 +1,8 @@
 mod executor;
 mod heartbeat;
 mod poll_loop;
+#[cfg(test)]
+mod test_support;
 
 use parking_lot::Mutex;
 use scheduler_core::proto;
@@ -80,6 +82,8 @@ async fn main() {
     let shutting_down = Arc::new(AtomicBool::new(false));
     let needs_reregister = Arc::new(Notify::new());
 
+    let undergoing_reregistration = Arc::new(Mutex::new(AtomicBool::new(false)));
+
     //spawn tasks with clone and wait for reregistration or user shutdown
 
     tokio::spawn(send_heartbeats(
@@ -88,6 +92,7 @@ async fn main() {
         stop_accepting_work.clone(),
         needs_reregister.clone(),
         token_map.clone(),
+        undergoing_reregistration.clone(),
     ));
 
     let work_handle = tokio::spawn(poll_loop(
@@ -100,6 +105,7 @@ async fn main() {
         shutting_down.clone(),
         registry.clone(),
         needs_reregister.clone(),
+        undergoing_reregistration.clone(),
     ));
 
     loop {
@@ -115,6 +121,14 @@ async fn main() {
 
                 //in the case where the needs_reregistration signal is called, the jobs that will finish will not be accepted by scheduler server
                 //so just cancel all of them
+
+                //lock ordering: token_map --> drop(token_map) --> undergoing_reregistration (set true) --> drop(undergoing_reregistration)
+                //then register RPC call, undergoing_reregistration
+
+                {
+                    let guard = undergoing_reregistration.lock();
+                    guard.store(true, Ordering::SeqCst);
+                }
 
                 {
                     let token_map_guard = token_map.lock();
@@ -142,6 +156,11 @@ async fn main() {
                     let mut guard = worker_uuid.lock();
                     *guard = new_worker_id;
                 }
+
+                {
+                    let guard = undergoing_reregistration.lock();
+                    guard.store(false, Ordering::SeqCst);
+                }
             }
 
 
@@ -153,8 +172,22 @@ async fn main() {
         _ = work_handle => {
 
         }
-
+   
         _ = tokio::time::sleep(tokio::time::Duration::from_secs(30)) => {
+
+
+            {
+                let token_map_guard = token_map.lock();
+
+                //during a forced shutdown, since the user isnt explicitly cancelling jobs, but rather shutting the worker machine down
+                //it will count as a lost lease, and will not report anything, and the death detector will reclaim the jobs after heartbeats stop
+                for (_cancel_token, revoked) in token_map_guard.values() {
+                    revoked.store(true, Ordering::SeqCst);
+                }
+
+            }
+
+            
             main_token.cancel();
             //force a shutdown if taking too long
         }

@@ -103,7 +103,7 @@ pub async fn connect_with_backoff(addr: SocketAddr) -> WorkerServiceClient<Chann
 }
 
 /// Retries transport failures; gives up on semantic rejections
-/// (NOT_FOUND, FAILED_PRECONDITION, INVALID_ARGUMENT).
+/// (NOT_FOUND, INVALID_ARGUMENT).
 async fn report_with_retry(client: &mut WorkerServiceClient<Channel>, result: proto::JobResult) {
     let mut retry_attempts = 0u32;
 
@@ -198,6 +198,7 @@ async fn work_loop(
     registry: Arc<ExecutorRegistry>,
     max_concurrent_jobs: u32,
     needs_reregister: Arc<Notify>,
+    undergoing_reregistration: Arc<Mutex<AtomicBool>>,
 ) {
     let mut idle_polls = 0;
 
@@ -238,20 +239,33 @@ async fn work_loop(
             }
 
             Err(status) => {
-                //FAILED_PRECONDITION here means stale registration
+                //NotFound here means stale registration
                 //heartbeat.rs should fix this by itself so backoff for now regardless of what kind of error
                 if status.code() == tonic::Code::Unknown
                     || status.code() == tonic::Code::Unavailable
                     || status.code() == tonic::Code::DeadlineExceeded
                 {
                     transport_failures += 1;
-                } else if status.code() == tonic::Code::FailedPrecondition || status.code() == tonic::Code::NotFound {
+                } else if status.code() == tonic::Code::NotFound {
                     //possible fix: branch condition on tonic::Code::NotFound? --> applied
 
-                    needs_reregister.notify_one();
+                    {
+                        let guard = undergoing_reregistration.lock();
+                        if guard.load(Ordering::Relaxed) {
+                            idle_polls += 1;
+                            continue;
+                        }
+                    }
+
+                    {
+                        let possibly_changed_worker_id = *worker_uuid.lock();
+                        if possibly_changed_worker_id == worker_id {
+                            needs_reregister.notify_one();
+                        }
+                    }
                     //for a dead worker, such as one that loses network connection past the TTL
                     //its jobs will be collected by scheduler and will be marked as dead
-                    //but if it reconnects afterwards itll be a useless worker and FailedPrecondition will be sent in response to request_work
+                    //but if it reconnects afterwards itll be a useless worker and NotFound will be sent in response to request_work
                     //so reregister it with new uuid instead of resurrectring it
                 }
 
@@ -316,6 +330,7 @@ pub async fn poll_loop(
     shutting_down: Arc<AtomicBool>,
     registry: Arc<ExecutorRegistry>,
     needs_reregister: Arc<Notify>,
+    undergoing_reregistration: Arc<Mutex<AtomicBool>>,
 ) {
     let semaphore = Arc::new(Semaphore::new(max_concurrent_jobs as usize));
 
@@ -335,6 +350,7 @@ pub async fn poll_loop(
                     registry.clone(),
                     max_concurrent_jobs,
                     needs_reregister.clone(),
+                    undergoing_reregistration.clone(),
                 ).await;
                 //if the work_loop returns, then the connection died so reconnect
 
