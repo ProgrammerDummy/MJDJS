@@ -9,7 +9,7 @@ use proto::HeartbeatPing;
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, mpsc::Sender};
 
 use crate::poll_loop::TokenMap;
 
@@ -19,9 +19,8 @@ pub async fn send_heartbeats(
     addr: SocketAddr,
     worker_id: Arc<Mutex<uuid::Uuid>>,
     stop_accepting_work: Arc<AtomicBool>,
-    new_registration_needed: Arc<Notify>,
     token_map: TokenMap, //read to build active_jobs, and to find the dispatch a CancelJob targets
-    undergoing_reregistration: Arc<Mutex<AtomicBool>>
+    reg_tx: Sender<uuid::Uuid>,
 ) {
     //needs to open the bidirectional stream for heartbeat RPC
     //fire a HeartbeatPing every 5 seconds
@@ -204,22 +203,11 @@ pub async fn send_heartbeats(
                             consecutive_nones += 1;
                             //signal to scheduler that new registration is needed for this worker
                             if consecutive_nones >= 2 {
+                                match reg_tx.try_send(displayable_worker_id) {
+                                    Ok(_) => {}
 
-                                {
-                                    let guard = undergoing_reregistration.lock();
-                                    //skip the new_registration_needed.notify_one() since the its being reregistered already
-                                    if guard.load(Ordering::Relaxed) {
+                                    Err(_) => {
                                         break;
-                                    }
-                                }
-
-                                {
-                                    let possibly_changed_worker_id = *worker_id.lock();
-
-                                    //if the current worker id is not the same as the one currently held in scope, then a reregistration has occured
-                                    //so dont signal for a new one, just update the held id on next loop
-                                    if possibly_changed_worker_id == displayable_worker_id {
-                                        new_registration_needed.notify_one();
                                     }
                                 }
                             }
@@ -235,7 +223,8 @@ pub async fn send_heartbeats(
                             if e.code() == tonic::Code::NotFound {
                                 consecutive_nones += 1;
                                 //signal to scheduler that new registration is needed for this worker
-                                new_registration_needed.notify_one();
+                                let _ = reg_tx.try_send(displayable_worker_id);
+
                                 break;
                             }
 

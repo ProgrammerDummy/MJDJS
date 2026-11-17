@@ -80,9 +80,10 @@ async fn main() {
     let main_token = CancellationToken::new();
     let stop_accepting_work = Arc::new(AtomicBool::new(false));
     let shutting_down = Arc::new(AtomicBool::new(false));
-    let needs_reregister = Arc::new(Notify::new());
 
-    let undergoing_reregistration = Arc::new(Mutex::new(AtomicBool::new(false)));
+
+    let (reg_tx, mut reg_rx) = tokio::sync::mpsc::channel::<uuid::Uuid>(16);
+
 
     //spawn tasks with clone and wait for reregistration or user shutdown
 
@@ -90,9 +91,8 @@ async fn main() {
         args.scheduler_addr,
         worker_uuid.clone(),
         stop_accepting_work.clone(),
-        needs_reregister.clone(),
         token_map.clone(),
-        undergoing_reregistration.clone(),
+        reg_tx.clone(),
     ));
 
     let work_handle = tokio::spawn(poll_loop(
@@ -104,9 +104,10 @@ async fn main() {
         stop_accepting_work.clone(),
         shutting_down.clone(),
         registry.clone(),
-        needs_reregister.clone(),
-        undergoing_reregistration.clone(),
+        reg_tx.clone(),
     ));
+
+
 
     loop {
         tokio::select! {
@@ -117,50 +118,44 @@ async fn main() {
                 break;
             }
 
-            _ = needs_reregister.notified() => {
+            Some(received_uuid) = reg_rx.recv() => {
 
                 //in the case where the needs_reregistration signal is called, the jobs that will finish will not be accepted by scheduler server
                 //so just cancel all of them
+                if received_uuid == *worker_uuid.lock() {
 
-                //lock ordering: token_map --> drop(token_map) --> undergoing_reregistration (set true) --> drop(undergoing_reregistration)
-                //then register RPC call, undergoing_reregistration
+                    {
+                        let token_map_guard = token_map.lock();
 
-                {
-                    let guard = undergoing_reregistration.lock();
-                    guard.store(true, Ordering::SeqCst);
-                }
+                        //during reregistration, the worker loses its lease on all jobs so
+                        //revoke flag is set and all jobs are cancelled
+                        for (cancel_token, revoked) in token_map_guard.values() {
+                            revoked.store(true, Ordering::SeqCst);
+                            cancel_token.cancel();
+                        }
 
-                {
-                    let token_map_guard = token_map.lock();
 
-                    //during reregistration, the worker loses its lease on all jobs so
-                    //revoke flag is set and all jobs are cancelled
-                    for (cancel_token, revoked) in token_map_guard.values() {
-                        revoked.store(true, Ordering::SeqCst);
-                        cancel_token.cancel();
                     }
 
+                    let new_worker_id = match register_with_retry(&args, &registry).await {
+                        Some(id) => id,
+                        None => {
+                            //if it returned a None, then it means that the worker can't register
+                            //already logged wtihin register_with_retry if it is returning None, so exit
+                            return;
+                        }
+                    };
 
-                }
-
-                let new_worker_id = match register_with_retry(&args, &registry).await {
-                    Some(id) => id,
-                    None => {
-                        //if it returned a None, then it means that the worker can't register
-                        //already logged wtihin register_with_retry if it is returning None, so exit
-                        return;
+                    {
+                        let mut guard = worker_uuid.lock();
+                        *guard = new_worker_id;
                     }
-                };
-
-                {
-                    let mut guard = worker_uuid.lock();
-                    *guard = new_worker_id;
                 }
 
-                {
-                    let guard = undergoing_reregistration.lock();
-                    guard.store(false, Ordering::SeqCst);
-                }
+            }
+
+            else => {
+                return;
             }
 
 
