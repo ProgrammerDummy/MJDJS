@@ -12,7 +12,7 @@ use std::{
 };
 
 use parking_lot::Mutex;
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc::Sender};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc::Sender};
 
 use scheduler_core::proto::{self};
 use std::net::SocketAddr;
@@ -143,7 +143,7 @@ async fn report_with_retry(client: &mut WorkerServiceClient<Channel>, result: pr
     }
 }
 
-async fn run_job(
+pub async fn run_job(
     job: proto::Job,
     job_uuid: uuid::Uuid,
     executor: Arc<dyn JobExecutor>,
@@ -174,12 +174,14 @@ async fn run_job(
         }
     };
 
+
     if !report_skip {
         report_with_retry(
             &mut client,
             build_result(job_id, worker_uuid, outcome_from(exec_result), dispatch_token),
         )
         .await;
+    
     }
 
     //removed only after the report finishes, so a heartbeat can never omit a dispatch whose report is in flight
@@ -247,13 +249,7 @@ async fn work_loop(
                 } else if status.code() == tonic::Code::NotFound {
                     //possible fix: branch condition on tonic::Code::NotFound? --> applied
 
-                    match reg_tx.try_send(worker_id) {
-                        Ok(_) => {}
-
-                        Err(_) => {
-                            continue;
-                        }
-                    }
+                    let _ = reg_tx.try_send(worker_id);
 
                     //for a dead worker, such as one that loses network connection past the TTL
                     //its jobs will be collected by scheduler and will be marked as dead
@@ -375,3 +371,269 @@ todo:
 - add a new oneof variant to HeartbeatControl for signaling for job cancellation
 
 */
+
+#[cfg(test)]
+mod tests {
+    use scheduler_core::proto::{job_outcome::Cancelled, worker_service_server::WorkerService};
+
+use super::*;
+    use crate::test_support::*;
+
+    /// A dispatch that runs to completion is reported exactly once, under the worker ID and
+    /// dispatch token it was dispatched with, and its token_map entry is removed afterwards.
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn run_job_normal_run_reports_once_and_cleans_up() {
+        // Arrange: a fake scheduler, a worker it knows, and one 10ms "sleep" dispatch with token 7,
+        // inserted into token_map the same way work_loop does it.
+        let (addr, fake) = FakeScheduler::spawn().await;
+        let worker_id = fake.add_worker();
+
+        let token_map = empty_token_map();
+        let root = CancellationToken::new();
+        let dispatch_token = 7;
+        let (job, job_uuid) = test_job(10, dispatch_token);
+        let (cancel, revoked) = insert_dispatch(&token_map, job_uuid, dispatch_token, &root);
+
+        // Act: run_job awaits report_with_retry before it returns, so once this await finishes the
+        // report has already reached the fake. No `eventually` needed.
+        run_job(
+            job,
+            job_uuid,
+            sleep_executor(),
+            cancel,
+            client(addr).await,
+            worker_id,
+            token_map.clone(),
+            permit().await,
+        )
+        .await;
+
+        // Assert on what the scheduler received: exactly one report...
+        let reports = fake.reports();
+        assert_eq!(reports.len(), 1, "expected exactly one report, got {reports:?}");
+        let report = &reports[0];
+
+        // ...for this job, from this worker, echoing this dispatch's token. The scheduler fences on
+        // the token, so a wrong one here means a real server would reject the result.
+        assert_eq!(report.job_id, job_uuid.as_bytes().to_vec());
+        assert_eq!(report.worker_id, worker_id.as_bytes().to_vec());
+        assert_eq!(report.dispatch_token, dispatch_token);
+
+        // ...with a Success outcome carrying the executor's result (SleepJob returns its payload).
+        let outcome = report.job_outcome.and_then(|o| o.outcome);
+        assert_eq!(
+            outcome,
+            Some(proto::job_outcome::Outcome::Success(
+                proto::job_outcome::Success { result: 10 }
+            ))
+        );
+
+        // Assert on worker state: the flag was never set, and the entry is gone. A leftover entry
+        // would keep appearing in active_jobs, so the scheduler would revoke a job that already ended.
+        assert!(!revoked.load(Ordering::SeqCst));
+        assert!(
+            !token_map.lock().contains_key(&(job_uuid, dispatch_token)),
+            "token_map entry should be removed after the report"
+        );
+    }
+
+    
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn revoke_flag_set_before_finish_test() {
+        let (addr, fake) = FakeScheduler::spawn().await;
+        let worker_id = fake.add_worker();
+
+        let token_map = empty_token_map();
+        let root = CancellationToken::new();
+        let dispatch_token = 7;
+        let (job, job_uuid) = test_job(300, dispatch_token);
+
+        let (cancel, revoked) = insert_dispatch(&token_map, job_uuid, dispatch_token, &root);
+
+        assert_eq!(token_map.lock().len(), 1);
+
+        revoked.store(true, Ordering::SeqCst);
+        
+        cancel.cancel();
+        
+        let wait = run_job(
+            job,
+            job_uuid,
+            sleep_executor(),
+            cancel.clone(),
+            client(addr).await,
+            worker_id,
+            token_map.clone(),
+            permit().await,
+        ).await;
+        
+    
+        let reports = fake.reports();
+        assert!(reports.is_empty());
+
+        assert!(token_map.lock().is_empty());
+
+        //tested by moving line 188 into !report_skip branch and moving report_with_retry outside of branch to trigger it everytime
+        
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn user_cancel() {
+        let (addr, fake) = FakeScheduler::spawn().await;
+        let worker_id = fake.add_worker();
+
+        let token_map = empty_token_map();
+        let root = CancellationToken::new();
+        let dispatch_token = 7;
+        let (job, job_uuid) = test_job(300, dispatch_token);
+
+        let (cancel, revoked) = insert_dispatch(&token_map, job_uuid, dispatch_token, &root);
+
+        assert_eq!(token_map.lock().len(), 1);
+
+
+        cancel.cancel();
+
+        let wait = run_job(
+            job,
+            job_uuid,
+            sleep_executor(),
+            cancel.clone(),
+            client(addr).await,
+            worker_id,
+            token_map.clone(),
+            permit().await,
+        ).await;
+        
+        
+        let reports = fake.reports();
+        let report = &reports[0];
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(report.job_id, job_uuid.as_bytes().to_vec());
+        assert_eq!(report.worker_id, worker_id.as_bytes().to_vec());
+        assert_eq!(report.dispatch_token, dispatch_token);
+
+        let outcome = report.job_outcome.and_then(|o| o.outcome);
+        assert_eq!(
+            outcome,
+            Some(proto::job_outcome::Outcome::Cancelled(Cancelled {}))
+        );
+
+        assert!(token_map.lock().is_empty());
+
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn worker_forgotten() {
+
+        let (addr, fake) = FakeScheduler::spawn().await;
+        let worker_id = fake.add_worker();
+
+        let locked_worker_id = Arc::new(Mutex::new(worker_id));
+
+        let token_map = empty_token_map();
+        let root = CancellationToken::new();
+        let dispatch_token = 7;
+        let (job, job_uuid) = test_job(10, dispatch_token);
+        let (cancel, revoked) = insert_dispatch(&token_map, job_uuid, dispatch_token, &root);
+
+        let (reg_tx, mut reg_rx) = tokio::sync::mpsc::channel::<uuid::Uuid>(16);
+
+        let stop_accepting_work = Arc::new(AtomicBool::new(false));
+
+        let shutting_down = Arc::new(AtomicBool::new(false));
+
+        let registry = test_registry();
+
+        fake.forget_worker(worker_id);
+
+        tokio::spawn(poll_loop(
+            addr, 
+            locked_worker_id, 
+            3, 
+            token_map, 
+            root.clone(), 
+            stop_accepting_work, 
+            shutting_down, 
+            registry, 
+            reg_tx
+        ));
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), reg_rx.recv())
+            .await
+            .expect("expected a uuid sent through the channel to signal a new registration");
+        
+
+
+
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn queued_job() {
+
+        let (addr, fake) = FakeScheduler::spawn().await;
+        let worker_id = fake.add_worker();
+
+        let locked_worker_id = Arc::new(Mutex::new(worker_id));
+
+        let token_map = empty_token_map();
+        let root = CancellationToken::new();
+        let dispatch_token = 7;
+        let (job, job_uuid) = test_job(100, dispatch_token);
+
+        fake.queue_job(job);
+
+        let (reg_tx, mut reg_rx) = tokio::sync::mpsc::channel::<uuid::Uuid>(16);
+
+        let stop_accepting_work = Arc::new(AtomicBool::new(false));
+
+        let shutting_down = Arc::new(AtomicBool::new(false));
+
+        let registry = test_registry();
+
+        tokio::spawn(poll_loop(
+            addr, 
+            locked_worker_id, 
+            3, 
+            token_map, 
+            root.clone(), 
+            stop_accepting_work, 
+            shutting_down, 
+            registry, 
+            reg_tx
+        ));
+
+
+        eventually(
+            std::time::Duration::from_millis(500), 
+            "waiting for a request work call to the scheduler from poll_loop",
+            || fake.request_work_calls() >= 1
+        )
+        .await;
+
+        eventually(
+            std::time::Duration::from_millis(500), 
+            "waiting for a request work call to the scheduler from poll_loop",
+            || fake.reports().len() >= 1
+        )
+        .await;
+
+        let reports = fake.reports();
+
+        assert_eq!(reports.len(), 1);
+        
+        let outcome = reports[0].job_outcome.and_then(|o| o.outcome);
+        assert_eq!(
+            outcome,
+            Some(proto::job_outcome::Outcome::Success(
+                proto::job_outcome::Success { result: 100 }
+            ))
+        );
+
+    }
+
+
+
+}
