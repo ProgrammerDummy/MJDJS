@@ -1,5 +1,6 @@
 mod executor;
 mod heartbeat;
+mod lifecycle;
 mod poll_loop;
 #[cfg(test)]
 mod test_support;
@@ -8,8 +9,6 @@ use parking_lot::Mutex;
 use scheduler_core::proto;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use tokio::sync::Notify;
-use tonic::Request;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,8 +20,9 @@ use executor::{AlwaysFailJob, ExecutorRegistry, SleepJob};
 
 use tokio_util::sync::CancellationToken;
 
-use crate::heartbeat::{send_heartbeats, sleep_timer};
-use crate::poll_loop::{TokenMap, connect_with_backoff, poll_loop};
+use crate::heartbeat::send_heartbeats;
+use crate::lifecycle::{ReregisterOutcome, force_shutdown, handle_reregister, register_with_retry};
+use crate::poll_loop::{TokenMap, poll_loop};
 
 pub fn cached_hostname() -> &'static str {
     static HOSTNAME: OnceLock<String> = OnceLock::new();
@@ -60,7 +60,9 @@ async fn main() {
     registry.register("always-fail".into(), Arc::new(AlwaysFailJob {}));
     let registry = Arc::new(registry);
 
-    let worker_id = register_with_retry(&args, &registry).await;
+    let worker = worker_descriptor(&args, &registry);
+
+    let worker_id = register_with_retry(args.scheduler_addr, &worker).await;
 
     /*
     now here we can check if we got a valid worker_id
@@ -119,39 +121,18 @@ async fn main() {
             }
 
             Some(received_uuid) = reg_rx.recv() => {
-
-                //in the case where the needs_reregistration signal is called, the jobs that will finish will not be accepted by scheduler server
-                //so just cancel all of them
-                if received_uuid == *worker_uuid.lock() {
-
-                    {
-                        let token_map_guard = token_map.lock();
-
-                        //during reregistration, the worker loses its lease on all jobs so
-                        //revoke flag is set and all jobs are cancelled
-                        for (cancel_token, revoked) in token_map_guard.values() {
-                            revoked.store(true, Ordering::SeqCst);
-                            cancel_token.cancel();
-                        }
-
-
-                    }
-
-                    let new_worker_id = match register_with_retry(&args, &registry).await {
-                        Some(id) => id,
-                        None => {
-                            //if it returned a None, then it means that the worker can't register
-                            //already logged wtihin register_with_retry if it is returning None, so exit
-                            return;
-                        }
-                    };
-
-                    {
-                        let mut guard = worker_uuid.lock();
-                        *guard = new_worker_id;
-                    }
+                //lifecycle::handle_reregister ignores stale ids, otherwise revokes and cancels every
+                //held dispatch, registers again and swaps worker_uuid
+                match handle_reregister(
+                    received_uuid,
+                    &worker_uuid,
+                    &token_map,
+                    args.scheduler_addr,
+                    &worker,
+                ).await {
+                    ReregisterOutcome::Stale | ReregisterOutcome::Reregistered(_) => {}
+                    ReregisterOutcome::RegistrationFailed => return,
                 }
-
             }
 
             else => {
@@ -169,22 +150,8 @@ async fn main() {
         }
    
         _ = tokio::time::sleep(tokio::time::Duration::from_secs(30)) => {
-
-
-            {
-                let token_map_guard = token_map.lock();
-
-                //during a forced shutdown, since the user isnt explicitly cancelling jobs, but rather shutting the worker machine down
-                //it will count as a lost lease, and will not report anything, and the death detector will reclaim the jobs after heartbeats stop
-                for (_cancel_token, revoked) in token_map_guard.values() {
-                    revoked.store(true, Ordering::SeqCst);
-                }
-
-            }
-
-            
-            main_token.cancel();
-            //force a shutdown if taking too long
+            //force a shutdown if taking too long: revoke every held dispatch, then cancel
+            force_shutdown(&token_map, &main_token);
         }
     }
 }
@@ -208,51 +175,14 @@ executor registry --> this ties into worker capabiliites
 metadata about worker?
 */
 
-async fn register_with_retry(args: &Args, registry: &Arc<ExecutorRegistry>) -> Option<uuid::Uuid> {
-    let mut client = connect_with_backoff(args.scheduler_addr).await;
-
-    let worker = proto::Worker {
+/// What this worker tells the scheduler about itself at Register.
+fn worker_descriptor(args: &Args, registry: &ExecutorRegistry) -> proto::Worker {
+    proto::Worker {
         capabilities: args.capabilities.clone().into_iter().collect(),
         hostname: cached_hostname().into(),
         tags: args.tags.clone().into_iter().collect(),
+        //job_types is derived from the registry
         job_types_supported: registry.job_types(),
         max_concurrent_jobs: args.max_concurrent_jobs,
-    };
-
-    //derive job_types from register
-
-    let mut retries = 0;
-
-    loop {
-        if retries != 0 {
-            sleep_timer(retries).await;
-        }
-
-        let uuid = match client.register(Request::new(worker.clone())).await {
-            Ok(worker_uuid) => worker_uuid,
-
-            Err(e) => {
-                if e.code() == tonic::Code::Unknown
-                    || e.code() == tonic::Code::Unavailable
-                    || e.code() == tonic::Code::DeadlineExceeded
-                {
-                    retries += 1;
-                    continue;
-                }
-
-                tracing::warn!("the registration request failed for non-transport related reasons");
-                return None;
-            }
-        };
-
-        let worker_uuid = uuid.into_inner();
-
-        let Ok(worker_uuid) = uuid::Uuid::from_slice(&worker_uuid.worker_id) else {
-            retries += 1;
-            tracing::warn!("invalid uuid was given for worker id, should be impossible");
-            continue;
-        };
-
-        return Some(worker_uuid);
     }
 }
