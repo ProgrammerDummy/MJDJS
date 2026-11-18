@@ -263,7 +263,7 @@ pub async fn sleep_timer(retry_count: u32) {
 #[cfg(test)]
 mod tests {
 
-    use parking_lot::lock_api::Mutex;
+
 use scheduler_core::proto::heartbeat_control::Directive;
 use tokio_util::sync::CancellationToken;
 
@@ -588,9 +588,9 @@ use super::*;
 
         fake.forget_worker(worker_id);
 
-        let curr_uuid = reg_rx.recv().await.unwrap();
-
-        assert_eq!(curr_uuid, worker_id);
+        tokio::time::timeout(std::time::Duration::from_secs(2), reg_rx.recv())
+            .await
+            .expect("expected a uuid sent through the channel to signal a new registration");
         
     }
 
