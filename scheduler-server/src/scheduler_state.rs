@@ -3,10 +3,9 @@ use scheduler_core::job_data_structures::RetryPolicy;
 use scheduler_core::worker::WorkerId;
 use tokio::sync::Notify;
 
-
 use dashmap::DashMap;
-use std::collections::HashMap;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
@@ -128,7 +127,7 @@ pub struct SchedulerState {
     //for a linear scan, its probably likely that if worker count gets real fatty then performance costs incur at heavier scales
 }
 
-impl SchedulerState {   
+impl SchedulerState {
     pub fn new() -> Self {
         SchedulerState {
             job_queue: Arc::new(Mutex::new(BTreeSet::new())),

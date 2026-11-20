@@ -99,22 +99,22 @@ pub async fn send_heartbeats(
                             //building ActiveJob vector from token_map
 
                             let token_map_guard = token_map.lock();
-                            
+
                             let owned_keys : Vec<(uuid::Uuid, u64)> = token_map_guard.keys().copied().collect();
 
                             let mut active_jobs_vec = vec![];
 
                             for (job_uuid, token) in owned_keys {
-             
+
                                 active_jobs_vec.push(ActiveJob {
-                                    job_id: job_uuid.clone().as_bytes().to_vec(), 
+                                    job_id: job_uuid.clone().as_bytes().to_vec(),
                                     dispatch_token: token,
                                 });
                             }
 
                             active_jobs_vec
 
-                        }, 
+                        },
                     }).await {
 
                         //server receiving end is gone
@@ -259,18 +259,15 @@ pub async fn sleep_timer(retry_count: u32) {
     tokio::time::sleep(std::time::Duration::from_millis(jittered)).await;
 }
 
-
 #[cfg(test)]
 mod tests {
 
+    use scheduler_core::proto::heartbeat_control::Directive;
+    use tokio_util::sync::CancellationToken;
 
-use scheduler_core::proto::heartbeat_control::Directive;
-use tokio_util::sync::CancellationToken;
-
-use super::*;
-    use crate::test_support::*;
+    use super::*;
     use crate::poll_loop::run_job;
-    
+    use crate::test_support::*;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn first_ping_test() {
@@ -280,23 +277,29 @@ use super::*;
         let locked_worker_id = Arc::new(Mutex::new(worker_id));
         let stop_accepting_work = Arc::new(AtomicBool::new(false));
 
-        let (reg_tx, mut reg_rx) = tokio::sync::mpsc::channel::<uuid::Uuid>(16);
-
+        let (reg_tx, _reg_rx) = tokio::sync::mpsc::channel::<uuid::Uuid>(16);
 
         let token_map = empty_token_map();
 
         let root = CancellationToken::new();
         let dispatch_token = 7;
-        let (job, job_uuid) = test_job(10, dispatch_token);
-        let (cancel, revoked) = insert_dispatch(&token_map, job_uuid, dispatch_token, &root);
+        let (_, job_uuid) = test_job(10, dispatch_token);
+        insert_dispatch(&token_map, job_uuid, dispatch_token, &root);
 
-        tokio::spawn(send_heartbeats(addr, locked_worker_id, stop_accepting_work, token_map, reg_tx));
+        tokio::spawn(send_heartbeats(
+            addr,
+            locked_worker_id,
+            stop_accepting_work,
+            token_map,
+            reg_tx,
+        ));
 
         eventually(
-            std::time::Duration::from_millis(400), 
-            "atleast 1 ping to come in", 
-            || fake.pings().len() >= 1
-        ).await;
+            std::time::Duration::from_millis(400),
+            "atleast 1 ping to come in",
+            || !fake.pings().is_empty(),
+        )
+        .await;
 
         let pings = fake.pings();
 
@@ -304,12 +307,13 @@ use super::*;
 
         assert_eq!(pings[0].active_jobs.len(), 1);
 
-        assert_eq!(uuid::Uuid::from_slice(&pings[0].active_jobs[0].job_id).unwrap(), job_uuid);
+        assert_eq!(
+            uuid::Uuid::from_slice(&pings[0].active_jobs[0].job_id).unwrap(),
+            job_uuid
+        );
         assert_eq!(pings[0].active_jobs[0].dispatch_token, dispatch_token);
+    }
 
-    }    
-
-        
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn after_run_job_dispatch_gone_from_ping() {
         let (addr, fake) = FakeScheduler::spawn().await;
@@ -318,23 +322,29 @@ use super::*;
         let locked_worker_id = Arc::new(Mutex::new(worker_id));
         let stop_accepting_work = Arc::new(AtomicBool::new(false));
 
-        let (reg_tx, mut reg_rx) = tokio::sync::mpsc::channel::<uuid::Uuid>(16);
-
+        let (reg_tx, _reg_rx) = tokio::sync::mpsc::channel::<uuid::Uuid>(16);
 
         let token_map = empty_token_map();
 
         let root = CancellationToken::new();
         let dispatch_token = 7;
         let (job, job_uuid) = test_job(10, dispatch_token);
-        let (cancel, revoked) = insert_dispatch(&token_map, job_uuid, dispatch_token, &root);
+        let (cancel, _revoked) = insert_dispatch(&token_map, job_uuid, dispatch_token, &root);
 
-        tokio::spawn(send_heartbeats(addr, locked_worker_id, stop_accepting_work, token_map.clone(), reg_tx));
+        tokio::spawn(send_heartbeats(
+            addr,
+            locked_worker_id,
+            stop_accepting_work,
+            token_map.clone(),
+            reg_tx,
+        ));
 
         eventually(
-            std::time::Duration::from_millis(400), 
+            std::time::Duration::from_millis(400),
             "atleast 1 ping to come in",
-            || fake.pings().len() >= 1
-        ).await;
+            || !fake.pings().is_empty(),
+        )
+        .await;
 
         run_job(
             job,
@@ -351,17 +361,15 @@ use super::*;
         let n = fake.pings().len();
 
         eventually(
-            std::time::Duration::from_millis(800), 
+            std::time::Duration::from_millis(800),
             "atleast 2 pings to come in",
-            || fake.pings().len() >= 2+n
-        ).await;
-
+            || fake.pings().len() >= 2 + n,
+        )
+        .await;
 
         let pings = fake.pings();
 
-        assert!(pings[n+1].active_jobs.is_empty());
-
-
+        assert!(pings[n + 1].active_jobs.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -372,46 +380,49 @@ use super::*;
         let locked_worker_id = Arc::new(Mutex::new(worker_id));
         let stop_accepting_work = Arc::new(AtomicBool::new(false));
 
-        let (reg_tx, mut reg_rx) = tokio::sync::mpsc::channel::<uuid::Uuid>(16);
-
+        let (reg_tx, _reg_rx) = tokio::sync::mpsc::channel::<uuid::Uuid>(16);
 
         let token_map = empty_token_map();
 
         let root = CancellationToken::new();
         let dispatch_token = 7;
         let (job, job_uuid) = test_job(300, dispatch_token);
-        let (cancel, revoked) = insert_dispatch(&token_map, job_uuid, dispatch_token, &root);
+        let (cancel, _revoked) = insert_dispatch(&token_map, job_uuid, dispatch_token, &root);
 
-        tokio::spawn(send_heartbeats(addr, locked_worker_id, stop_accepting_work, token_map.clone(), reg_tx));
+        tokio::spawn(send_heartbeats(
+            addr,
+            locked_worker_id,
+            stop_accepting_work,
+            token_map.clone(),
+            reg_tx,
+        ));
 
         eventually(
-            std::time::Duration::from_millis(400), 
+            std::time::Duration::from_millis(400),
             "atleast 1 ping to come in",
-            || fake.pings().len() >= 1
-        ).await;
+            || !fake.pings().is_empty(),
+        )
+        .await;
 
-
-        fake.push_directive(Directive::CancelJob(proto::CancelJob { 
-            job_id: job.id, 
-            dispatch_token, 
-            reason: CancelReason::Revoked as i32, 
-        })).await;
-
+        fake.push_directive(Directive::CancelJob(proto::CancelJob {
+            job_id: job.id,
+            dispatch_token,
+            reason: CancelReason::Revoked as i32,
+        }))
+        .await;
 
         eventually(
-            std::time::Duration::from_millis(200), 
-            "checking if cancelled", 
-            || cancel.is_cancelled()
-        ).await; 
-        
+            std::time::Duration::from_millis(200),
+            "checking if cancelled",
+            || cancel.is_cancelled(),
+        )
+        .await;
+
         {
             let token_map_guard = token_map.lock();
             let dum = token_map_guard.get(&(job_uuid, dispatch_token)).unwrap();
-            assert_eq!(dum.1.load(Ordering::SeqCst), true);
-
+            assert!(dum.1.load(Ordering::SeqCst));
         }
-
-
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -422,44 +433,49 @@ use super::*;
         let locked_worker_id = Arc::new(Mutex::new(worker_id));
         let stop_accepting_work = Arc::new(AtomicBool::new(false));
 
-        let (reg_tx, mut reg_rx) = tokio::sync::mpsc::channel::<uuid::Uuid>(16);
-
+        let (reg_tx, _reg_rx) = tokio::sync::mpsc::channel::<uuid::Uuid>(16);
 
         let token_map = empty_token_map();
 
         let root = CancellationToken::new();
         let dispatch_token = 7;
         let (job, job_uuid) = test_job(300, dispatch_token);
-        let (cancel, revoked) = insert_dispatch(&token_map, job_uuid, dispatch_token, &root);
+        let (cancel, _revoked) = insert_dispatch(&token_map, job_uuid, dispatch_token, &root);
 
-        tokio::spawn(send_heartbeats(addr, locked_worker_id, stop_accepting_work, token_map.clone(), reg_tx));
+        tokio::spawn(send_heartbeats(
+            addr,
+            locked_worker_id,
+            stop_accepting_work,
+            token_map.clone(),
+            reg_tx,
+        ));
 
         eventually(
-            std::time::Duration::from_millis(400), 
+            std::time::Duration::from_millis(400),
             "atleast 1 ping to come in",
-            || fake.pings().len() >= 1
-        ).await;
+            || !fake.pings().is_empty(),
+        )
+        .await;
 
-        fake.push_directive(Directive::CancelJob(proto::CancelJob { 
-            job_id: job.id, 
-            dispatch_token, 
-            reason: CancelReason::Unspecified as i32, 
-        })).await;
-
+        fake.push_directive(Directive::CancelJob(proto::CancelJob {
+            job_id: job.id,
+            dispatch_token,
+            reason: CancelReason::Unspecified as i32,
+        }))
+        .await;
 
         eventually(
-            std::time::Duration::from_millis(200), 
-            "checking if cancelled", 
-            || cancel.is_cancelled()
-        ).await;        
+            std::time::Duration::from_millis(200),
+            "checking if cancelled",
+            || cancel.is_cancelled(),
+        )
+        .await;
 
         {
             let token_map_guard = token_map.lock();
             let dum = token_map_guard.get(&(job_uuid, dispatch_token)).unwrap();
-            assert_eq!(dum.1.load(Ordering::SeqCst), true);
+            assert!(dum.1.load(Ordering::SeqCst));
         }
-
-
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -470,43 +486,49 @@ use super::*;
         let locked_worker_id = Arc::new(Mutex::new(worker_id));
         let stop_accepting_work = Arc::new(AtomicBool::new(false));
 
-        let (reg_tx, mut reg_rx) = tokio::sync::mpsc::channel::<uuid::Uuid>(16);
-
+        let (reg_tx, _reg_rx) = tokio::sync::mpsc::channel::<uuid::Uuid>(16);
 
         let token_map = empty_token_map();
 
         let root = CancellationToken::new();
         let dispatch_token = 7;
         let (job, job_uuid) = test_job(300, dispatch_token);
-        let (cancel, revoked) = insert_dispatch(&token_map, job_uuid, dispatch_token, &root);
+        let (cancel, _revoked) = insert_dispatch(&token_map, job_uuid, dispatch_token, &root);
 
-        tokio::spawn(send_heartbeats(addr, locked_worker_id, stop_accepting_work, token_map.clone(), reg_tx));
+        tokio::spawn(send_heartbeats(
+            addr,
+            locked_worker_id,
+            stop_accepting_work,
+            token_map.clone(),
+            reg_tx,
+        ));
 
         eventually(
-            std::time::Duration::from_millis(400), 
+            std::time::Duration::from_millis(400),
             "atleast 1 ping to come in",
-            || fake.pings().len() >= 1
-        ).await;
+            || !fake.pings().is_empty(),
+        )
+        .await;
 
-        fake.push_directive(Directive::CancelJob(proto::CancelJob { 
-            job_id: job.id, 
-            dispatch_token, 
-            reason: CancelReason::User as i32, 
-        })).await;
-
+        fake.push_directive(Directive::CancelJob(proto::CancelJob {
+            job_id: job.id,
+            dispatch_token,
+            reason: CancelReason::User as i32,
+        }))
+        .await;
 
         eventually(
-            std::time::Duration::from_millis(200), 
-            "checking if cancelled", 
-            || cancel.is_cancelled()
-        ).await;        
+            std::time::Duration::from_millis(200),
+            "checking if cancelled",
+            || cancel.is_cancelled(),
+        )
+        .await;
 
         {
             let token_map_guard = token_map.lock();
             let dum = token_map_guard.get(&(job_uuid, dispatch_token)).unwrap();
-            assert_eq!(dum.1.load(Ordering::SeqCst), false);
+            assert!(!dum.1.load(Ordering::SeqCst));
         }
-
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -517,46 +539,52 @@ use super::*;
         let locked_worker_id = Arc::new(Mutex::new(worker_id));
         let stop_accepting_work = Arc::new(AtomicBool::new(false));
 
-        let (reg_tx, mut reg_rx) = tokio::sync::mpsc::channel::<uuid::Uuid>(16);
-
+        let (reg_tx, _reg_rx) = tokio::sync::mpsc::channel::<uuid::Uuid>(16);
 
         let token_map = empty_token_map();
 
         let root = CancellationToken::new();
         let dispatch_token = 7;
         let (job, job_uuid) = test_job(300, dispatch_token);
-        let (cancel, revoked) = insert_dispatch(&token_map, job_uuid, dispatch_token, &root);
+        insert_dispatch(&token_map, job_uuid, dispatch_token, &root);
 
-        tokio::spawn(send_heartbeats(addr, locked_worker_id, stop_accepting_work, token_map.clone(), reg_tx));
+        tokio::spawn(send_heartbeats(
+            addr,
+            locked_worker_id,
+            stop_accepting_work,
+            token_map.clone(),
+            reg_tx,
+        ));
 
         eventually(
-            std::time::Duration::from_millis(400), 
+            std::time::Duration::from_millis(400),
             "atleast 1 ping to come in",
-            || fake.pings().len() >= 1
-        ).await;
+            || !fake.pings().is_empty(),
+        )
+        .await;
 
-        fake.push_directive(Directive::CancelJob(proto::CancelJob { 
-            job_id: job.id, 
-            dispatch_token: dispatch_token+1, 
-            reason: CancelReason::User as i32, 
-        })).await;
+        fake.push_directive(Directive::CancelJob(proto::CancelJob {
+            job_id: job.id,
+            dispatch_token: dispatch_token + 1,
+            reason: CancelReason::User as i32,
+        }))
+        .await;
 
         let n = fake.pings().len();
 
         eventually(
-            std::time::Duration::from_millis(800), 
+            std::time::Duration::from_millis(800),
             "atleast 1 ping to come in",
-            || fake.pings().len() >= n+2 
-        ).await;
+            || fake.pings().len() >= n + 2,
+        )
+        .await;
 
         {
             let token_map_guard = token_map.lock();
             let dum = token_map_guard.get(&(job_uuid, dispatch_token)).unwrap();
-            assert_eq!(dum.1.load(Ordering::SeqCst), false);
-            assert_eq!(dum.0.is_cancelled(), false);
+            assert!(!dum.1.load(Ordering::SeqCst));
+            assert!(!dum.0.is_cancelled());
         }
-
-        
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -569,20 +597,25 @@ use super::*;
 
         let (reg_tx, mut reg_rx) = tokio::sync::mpsc::channel::<uuid::Uuid>(16);
 
-
         let token_map = empty_token_map();
 
         let root = CancellationToken::new();
         let dispatch_token = 7;
-        let (job, job_uuid) = test_job(300, dispatch_token);
-        let (cancel, revoked) = insert_dispatch(&token_map, job_uuid, dispatch_token, &root);
+        let (_, job_uuid) = test_job(300, dispatch_token);
+        insert_dispatch(&token_map, job_uuid, dispatch_token, &root);
 
-        tokio::spawn(send_heartbeats(addr, locked_worker_id, stop_accepting_work, token_map.clone(), reg_tx));
+        tokio::spawn(send_heartbeats(
+            addr,
+            locked_worker_id,
+            stop_accepting_work,
+            token_map.clone(),
+            reg_tx,
+        ));
 
         eventually(
-            std::time::Duration::from_millis(400), 
+            std::time::Duration::from_millis(400),
             "atleast 1 ping to come in",
-            || fake.pings().len() >= 1
+            || !fake.pings().is_empty(),
         )
         .await;
 
@@ -591,7 +624,5 @@ use super::*;
         tokio::time::timeout(std::time::Duration::from_secs(2), reg_rx.recv())
             .await
             .expect("expected a uuid sent through the channel to signal a new registration");
-        
     }
-
 }

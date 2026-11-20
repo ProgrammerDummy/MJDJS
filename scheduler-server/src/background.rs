@@ -7,11 +7,11 @@ use crate::scheduler_state::{
 use scheduler_core::job_data_structures::{Job, JobState, now_millis};
 use scheduler_core::state_machine::{determine_reclaim_event, transition};
 use scheduler_core::worker::WorkerId;
-use tracing::warn;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
+use tracing::warn;
 
 use parking_lot::Mutex;
 
@@ -328,7 +328,10 @@ mod tests {
             ReclaimOutcome::Requeued(queued) => {
                 assert_eq!(queued.id, id);
                 assert_eq!(queued.infra_interruptions, 1);
-                assert_eq!(queued.retry_count, 2, "a lost dispatch must not spend a retry");
+                assert_eq!(
+                    queued.retry_count, 2,
+                    "a lost dispatch must not spend a retry"
+                );
             }
             other => panic!("expected Requeued, got {other:?}"),
         }

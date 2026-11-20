@@ -1,11 +1,13 @@
 mod background;
+mod integration_test;
 mod scheduler_state;
 mod service;
 mod worker;
 mod worker_service;
-mod integration_test;
 
-use scheduler_core::proto::{scheduler_service_server::SchedulerServiceServer, worker_service_server::WorkerServiceServer};
+use scheduler_core::proto::{
+    scheduler_service_server::SchedulerServiceServer, worker_service_server::WorkerServiceServer,
+};
 
 use crate::{service::MySchedulerService, worker_service::MyWorkerService};
 
@@ -19,10 +21,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let worker_service = MyWorkerService::new(scheduler_service.scheduler_state.clone());
 
     println!("scheduler-server listening on: {addr}");
-    
-    tokio::spawn(background::run_retry_queue_monitor(scheduler_service.scheduler_state.clone()));
-    tokio::spawn(background::run_death_detector(scheduler_service.scheduler_state.clone()));
 
+    tokio::spawn(background::run_retry_queue_monitor(
+        scheduler_service.scheduler_state.clone(),
+    ));
+    tokio::spawn(background::run_death_detector(
+        scheduler_service.scheduler_state.clone(),
+    ));
 
     tonic::transport::Server::builder()
         .add_service(SchedulerServiceServer::new(scheduler_service))

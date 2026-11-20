@@ -1,0 +1,87 @@
+
+Finish Week 5–6:
+5. Idempotent report_result — check completed_jobs before returning NOT_FOUND. 
+This is what makes the worker’s report_with_retry correct instead of fighting the server
+maybe also idempotentness for request_work? check if that has retry logic as well which
+may cause duplicates? if so, scan assigned_jobs upon receiving a job to ensure that no uuids 
+are same?
+
+
+6. First two-process run — worker-agent has still never talked to the server. 
+heartbeat.rs’s reconnect loop, poll_loop’s backoff, the drain path: all unexecuted
+7. Chaos test — spawn a real worker process, submit a long job, SIGKILL mid-execution, 
+verify reclaim. Ten consecutive runs, zero loss. Week 6’s exit criterion
+8. cancel_job — needs a new HeartbeatControl oneof variant, 
+since that stream is the scheduler’s only push channel to workers
+
+Week 7:
+9. SQLite persistence via sqlx in WAL mode, plus restart recovery
+10. list_jobs, list_dead_lettered, requeue_from_dlq (all three are scans over completed_jobs/job_queue — the data’s already there)
+
+Week 8:
+11. CLI client with clap
+12. criterion benchmarks
+13. README with architecture diagram, tag v1.0
+
+Items 5 and 6 are the highest value. Idempotency is a ~15-line change that fixes a real 
+correctness gap. The two-process run will surface more in ten minutes than another review 
+pass would — same reason test_death_detector just did.
+
+
+
+
+
+
+
+
+2. Dispatched job lost in transit
+
+Problem: request_work records the job as assigned before the response reaches the worker. If the response is lost, the job is stuck forever on a healthy worker and takes up one of its slots. With 1 slot, the worker sits idle permanently.
+
+Your solution:
+
+HeartbeatPing lists the (job ID, token) pairs the worker is actually running.
+assigned_jobs becomes a HashMap<Uuid, AssignedJob { token, misses }>.
+A job missing from one ping is tolerated; missing from the next, it’s reclaimed.
+Reclaiming also sends a revoke directive with the job ID and token over HeartbeatControl, and a revoked job doesn’t report.
+
+Why:
+
+The server periodically compares what it thinks is assigned with what’s actually running, so lost messages heal on their own. That’s level-triggered rather than edge-triggered.
+It keeps leasing per worker and uses the channel you already have.
+Counting pings avoids comparing timestamps from two different machines’ clocks.
+One miss is enough: the heartbeat and dispatch use separate connections and the interval is 5s, so at most one ping can legitimately miss a new job.
+Keep token_map.remove after report_with_retry returns. Otherwise a ping sent while a success report is still in flight would count a miss for a job that already succeeded.
+
+
+
+
+3. Report carries the wrong identity; re-registration cancel reported as Cancelled
+
+Problem: run_job reads the current worker ID when it reports, so a stale run can report under W′. A cancel caused by re-registration also reports Cancelled, which is final and could abandon a job that’s running elsewhere.
+
+Your solution:
+
+Pass the worker ID from dispatch time into run_job.
+Add a registration generation (AtomicU64, SeqCst). main.rs increments it before cancelling tokens.
+run_job records the generation at dispatch and checks it after execution. If it changed, skip the report but still remove the job from token_map.
+Keep cancelling jobs on re-registration.
+A user cancel from cancel_job doesn’t increment the generation, so it still reports Cancelled.
+The needs_reregister signal carries the generation the sender observed, and main.rs ignores stale signals. That fixes the double re-registration.
+
+Why:
+
+A result must carry the identity it was dispatched under.
+Cancelled is final and means a user cancelled the job. A lost lease should report nothing and let the scheduler reclaim the job.
+Incrementing before cancelling means any job that sees its token cancelled is guaranteed to also see the new generation.
+Proto changes across all three
+Job.dispatch_token
+JobResult.dispatch_token
+a list of running jobs (ID + token) on HeartbeatPing
+a cancel directive on HeartbeatControl that carries the job ID, the token, and whether it’s a user cancel or a revoke
+
+
+
+
+question:
+- why did you choose to do a parking_lot mutex wrapped hashmap instead of a dashmap?

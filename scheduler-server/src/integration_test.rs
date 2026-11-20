@@ -7,15 +7,14 @@ use std::time::Duration;
 use scheduler_core::job_data_structures::{Job, JobState, RetryPolicy};
 use scheduler_core::proto::{
     self, scheduler_service_client::SchedulerServiceClient,
-    scheduler_service_server::SchedulerServiceServer,
-    worker_service_client::WorkerServiceClient,
+    scheduler_service_server::SchedulerServiceServer, worker_service_client::WorkerServiceClient,
     worker_service_server::WorkerServiceServer,
 };
 use scheduler_core::state_machine::MAX_INFRA_INTERRUPTIONS;
 use tonic::transport::Channel;
 
 use crate::background::{run_death_detector, run_retry_queue_monitor};
-use crate::scheduler_state::{QueuedJob, SchedulerState};
+use crate::scheduler_state::SchedulerState;
 use crate::service::MySchedulerService;
 use crate::worker_service::MyWorkerService;
 
@@ -88,10 +87,7 @@ fn test_worker(job_types: &[&str], max_concurrent_jobs: u32) -> proto::Worker {
     }
 }
 
-async fn status_of(
-    client: &mut SchedulerServiceClient<Channel>,
-    job_id: &[u8],
-) -> JobState {
+async fn status_of(client: &mut SchedulerServiceClient<Channel>, job_id: &[u8]) -> JobState {
     let resp = client
         .get_job_status(tonic::Request::new(proto::JobIdRequest {
             id: job_id.to_vec(),
@@ -101,7 +97,6 @@ async fn status_of(
         .into_inner();
     scheduler_core::conversion::proto_to_job_status(resp.state).unwrap()
 }
-
 
 //tests begin here
 
@@ -176,9 +171,18 @@ async fn full_lifecycle_success() {
     let worker_uuid = uuid::Uuid::from_slice(&worker_id).unwrap();
     assert!(!state.running_jobs.contains_key(&uuid));
     assert!(state.completed_jobs.contains_key(&uuid));
-    assert!(state.workers.get(&worker_uuid).unwrap().assigned_jobs.is_empty());
+    assert!(
+        state
+            .workers
+            .get(&worker_uuid)
+            .unwrap()
+            .assigned_jobs
+            .is_empty()
+    );
     assert_eq!(
-        state.total_completed.load(std::sync::atomic::Ordering::SeqCst),
+        state
+            .total_completed
+            .load(std::sync::atomic::Ordering::SeqCst),
         1
     );
 }
@@ -264,16 +268,14 @@ async fn test_death_detector() {
         .into_inner()
         .worker_id;
 
-        
     let test_job = test_job(
-            "sleep", 
-            500, 
-            RetryPolicy::FixedDelay { 
-                delay_ms: 200, 
-                max_attempts: 5 
-            }
+        "sleep",
+        500,
+        RetryPolicy::FixedDelay {
+            delay_ms: 200,
+            max_attempts: 5,
+        },
     );
-
 
     let job_id = sched
         .submit_job(tonic::Request::new(test_job))
@@ -282,9 +284,9 @@ async fn test_death_detector() {
         .into_inner()
         .id;
 
-    worker.request_work(tonic::Request::new(
-        proto::AssignedWorkerId { 
-            worker_id: worker_id.clone() 
+    worker
+        .request_work(tonic::Request::new(proto::AssignedWorkerId {
+            worker_id: worker_id.clone(),
         }))
         .await
         .unwrap();
@@ -292,7 +294,7 @@ async fn test_death_detector() {
     let status = status_of(&mut sched, &job_id).await;
 
     match status {
-        JobState::Running { .. } => {},
+        JobState::Running { .. } => {}
         _ => {
             panic!("supposed to be Running");
         }
@@ -311,18 +313,19 @@ async fn test_death_detector() {
         let test_job = job_queue_guard.pop_first().unwrap();
         assert_eq!(test_job.infra_interruptions, 1);
         assert_eq!(test_job.retry_count, 0);
-  
     }
 
     {
-        assert!(state.workers.get(&uuid::Uuid::from_bytes(worker_id.as_slice().try_into().unwrap())).is_none());
+        assert!(
+            state
+                .workers
+                .get(&uuid::Uuid::from_bytes(
+                    worker_id.as_slice().try_into().unwrap()
+                ))
+                .is_none()
+        );
     }
-
-
-
-
 }
-
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 
@@ -336,14 +339,13 @@ async fn test_death_detector_dlq() {
         .into_inner()
         .worker_id;
 
-
     let test_job = test_job(
-            "sleep", 
-            500, 
-            RetryPolicy::FixedDelay { 
-                delay_ms: 200, 
-                max_attempts: 5 
-            }
+        "sleep",
+        500,
+        RetryPolicy::FixedDelay {
+            delay_ms: 200,
+            max_attempts: 5,
+        },
     );
 
     //submit_job calls Job::new_submitted() internally, which overwrites the uuid, state, created_at, retry_count, dispatch_token (to 0)
@@ -358,25 +360,21 @@ async fn test_death_detector_dlq() {
 
     let job_uuid = uuid::Uuid::from_slice(&job_id).unwrap();
 
-
     {
         let mut job_queue_guard = state.job_queue.lock();
 
         assert_eq!(job_queue_guard.len(), 1);
 
         let mut job_in_queue = job_queue_guard.pop_first().unwrap();
-    
+
         job_in_queue.infra_interruptions = MAX_INFRA_INTERRUPTIONS;
 
         let _ = job_queue_guard.insert(job_in_queue);
-        
     }
-    
 
-
-    worker.request_work(tonic::Request::new(
-        proto::AssignedWorkerId { 
-            worker_id: worker_id.clone() 
+    worker
+        .request_work(tonic::Request::new(proto::AssignedWorkerId {
+            worker_id: worker_id.clone(),
         }))
         .await
         .unwrap();
@@ -384,7 +382,7 @@ async fn test_death_detector_dlq() {
     let status = status_of(&mut sched, &job_id).await;
 
     match status {
-        JobState::Running { .. } => {},
+        JobState::Running { .. } => {}
         _ => {
             panic!("supposed to be Running");
         }
@@ -396,8 +394,13 @@ async fn test_death_detector_dlq() {
 
     let status = status_of(&mut sched, &job_id).await;
 
-    assert_eq!(status, JobState::DeadLettered { reason: "exceeded infrastructure interruption cap, treated as a poison pill".to_string() });
-
+    assert_eq!(
+        status,
+        JobState::DeadLettered {
+            reason: "exceeded infrastructure interruption cap, treated as a poison pill"
+                .to_string()
+        }
+    );
 
     {
         assert_eq!(state.total_dead_lettered.load(Ordering::SeqCst), 1);
@@ -407,15 +410,16 @@ async fn test_death_detector_dlq() {
 
         assert_eq!(dlq_job.infra_interruptions, MAX_INFRA_INTERRUPTIONS);
         assert_eq!(job_uuid, dlq_job.id);
-
-  
     }
 
     {
-        assert!(state.workers.get(&uuid::Uuid::from_bytes(worker_id.as_slice().try_into().unwrap())).is_none());
+        assert!(
+            state
+                .workers
+                .get(&uuid::Uuid::from_bytes(
+                    worker_id.as_slice().try_into().unwrap()
+                ))
+                .is_none()
+        );
     }
-
-
-
-
 }

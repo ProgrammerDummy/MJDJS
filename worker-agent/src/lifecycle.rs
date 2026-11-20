@@ -124,3 +124,145 @@ pub fn force_shutdown(token_map: &TokenMap, main_token: &CancellationToken) {
     //force a shutdown if taking too long
     main_token.cancel();
 }
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+    use crate::poll_loop::*;
+    use crate::test_support::*;
+
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn duplicate_signal_handle_reregister() {
+        let (addr, fake) = FakeScheduler::spawn().await;
+        let worker_id = fake.add_worker();
+
+        let locked_worker_id = Arc::new(Mutex::new(worker_id));
+
+        let token_map = empty_token_map();
+
+        let test_worker = test_worker();
+
+        let outcome =
+            handle_reregister(worker_id, &locked_worker_id, &token_map, addr, &test_worker).await;
+
+        assert_eq!(
+            outcome,
+            ReregisterOutcome::Reregistered(*locked_worker_id.lock())
+        );
+        assert_eq!(fake.registrations(), 1);
+
+        let outcome =
+            handle_reregister(worker_id, &locked_worker_id, &token_map, addr, &test_worker).await;
+
+        assert_eq!(outcome, ReregisterOutcome::Stale);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reregistration_revokes_held_dispatch() {
+        let (addr, _fake) = FakeScheduler::spawn().await;
+
+        let test_worker = test_worker();
+        let worker_id = register_with_retry(addr, &test_worker).await.unwrap();
+
+        let locked_worker_id = Arc::new(Mutex::new(worker_id));
+
+        let token_map = empty_token_map();
+        let root = CancellationToken::new();
+
+        let (_, job_one_uuid) = test_job(300, 7);
+        let (_, job_two_uuid) = test_job(300, 77);
+
+        insert_dispatch(&token_map.clone(), job_one_uuid, 7, &root);
+
+        insert_dispatch(&token_map.clone(), job_two_uuid, 77, &root);
+
+        let outcome =
+            handle_reregister(worker_id, &locked_worker_id, &token_map, addr, &test_worker).await;
+
+        assert_eq!(
+            outcome,
+            ReregisterOutcome::Reregistered(*locked_worker_id.lock())
+        );
+
+        {
+            let token_map_guard = token_map.lock();
+            let dum = token_map_guard.get(&(job_one_uuid, 7)).unwrap();
+            assert!(dum.0.is_cancelled());
+            assert!(dum.1.load(Ordering::SeqCst));
+        }
+
+        {
+            let token_map_guard = token_map.lock();
+            let dum = token_map_guard.get(&(job_two_uuid, 77)).unwrap();
+            assert!(dum.0.is_cancelled());
+            assert!(dum.1.load(Ordering::SeqCst));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reject_registrations_test() {
+        let (addr, fake) = FakeScheduler::spawn().await;
+        let worker_id = fake.add_worker();
+
+        let locked_worker_id = Arc::new(Mutex::new(worker_id));
+
+        let token_map = empty_token_map();
+
+        let test_worker = test_worker();
+
+        fake.reject_registrations();
+
+        let outcome =
+            handle_reregister(worker_id, &locked_worker_id, &token_map, addr, &test_worker).await;
+
+        assert_eq!(*locked_worker_id.lock(), worker_id);
+        assert_eq!(outcome, ReregisterOutcome::RegistrationFailed);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn force_shutdown_test() {
+        let (addr, fake) = FakeScheduler::spawn().await;
+        let worker_id = fake.add_worker();
+        let client = client(addr).await;
+
+        let token_map = empty_token_map();
+
+        let (job, job_uuid) = test_job(2000, 7);
+
+        let root = CancellationToken::new();
+
+        let (cancel, revoked) = insert_dispatch(&token_map, job_uuid, 7, &root);
+
+        let wait = tokio::spawn(run_job(
+            job,
+            job_uuid,
+            sleep_executor(),
+            cancel,
+            client,
+            worker_id,
+            token_map.clone(),
+            permit().await,
+        ));
+
+        force_shutdown(&token_map, &root);
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), wait)
+            .await
+            .expect("run_job timed out");
+
+        assert!(fake.reports().is_empty());
+
+        assert!(revoked.load(Ordering::SeqCst));
+
+        {
+            let token_map_guard = token_map.lock();
+
+            assert!(token_map_guard.is_empty());
+        }
+    }
+}

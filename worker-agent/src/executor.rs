@@ -37,8 +37,10 @@ pub trait JobExecutor: Send + Sync {
 
 #[derive(Debug, Error)]
 pub enum JobError {
+    #[allow(dead_code)] // not produced by any executor yet
     #[error("Job execution timed out")]
     Timeout,
+    #[allow(dead_code)] // not produced by any executor yet
     #[error("Job had a malformed or bad payload")]
     BadPayload,
     #[error("Job failed to execute")]

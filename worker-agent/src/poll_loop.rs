@@ -8,7 +8,8 @@
 //semaphore or atomic int?
 
 use std::{
-    collections::HashMap, sync::{Arc, atomic::AtomicBool},
+    collections::HashMap,
+    sync::{Arc, atomic::AtomicBool},
 };
 
 use parking_lot::Mutex;
@@ -143,6 +144,8 @@ async fn report_with_retry(client: &mut WorkerServiceClient<Channel>, result: pr
     }
 }
 
+//all of this function's state is passed in explicitly so tests can drive it; bundle into a struct if the list keeps growing
+#[allow(clippy::too_many_arguments)]
 pub async fn run_job(
     job: proto::Job,
     job_uuid: uuid::Uuid,
@@ -163,9 +166,7 @@ pub async fn run_job(
     let report_skip = {
         let token_map_guard = token_map.lock();
         match token_map_guard.get(&(job_uuid, dispatch_token)) {
-            Some((_, skip_report_flag)) => {
-            skip_report_flag.load(Ordering::SeqCst)
-            }
+            Some((_, skip_report_flag)) => skip_report_flag.load(Ordering::SeqCst),
 
             None => {
                 tracing::warn!("job unable to be found during run_job at worker: {worker_uuid}");
@@ -174,20 +175,25 @@ pub async fn run_job(
         }
     };
 
-
     if !report_skip {
         report_with_retry(
             &mut client,
-            build_result(job_id, worker_uuid, outcome_from(exec_result), dispatch_token),
+            build_result(
+                job_id,
+                worker_uuid,
+                outcome_from(exec_result),
+                dispatch_token,
+            ),
         )
         .await;
-    
     }
 
     //removed only after the report finishes, so a heartbeat can never omit a dispatch whose report is in flight
     token_map.lock().remove(&(job_uuid, dispatch_token));
 } //spawned separately and detached
 
+//all of this function's state is passed in explicitly so tests can drive it; bundle into a struct if the list keeps growing
+#[allow(clippy::too_many_arguments)]
 async fn work_loop(
     mut client: WorkerServiceClient<Channel>,
     worker_uuid: Arc<Mutex<uuid::Uuid>>,
@@ -228,6 +234,7 @@ async fn work_loop(
         };
 
         let worker_id = *worker_uuid.lock();
+
         let request = Request::new(proto::AssignedWorkerId {
             worker_id: worker_id.as_bytes().to_vec(),
         });
@@ -282,7 +289,11 @@ async fn work_loop(
 
         let Some(executor) = registry.get(&job.job_type) else {
             let outcome = outcome_from(Err(JobError::NoExecutor));
-            report_with_retry(&mut client, build_result(job.id, worker_id, outcome, job.dispatch_token)).await;
+            report_with_retry(
+                &mut client,
+                build_result(job.id, worker_id, outcome, job.dispatch_token),
+            )
+            .await;
             idle_polls += 1;
             continue;
         };
@@ -290,6 +301,7 @@ async fn work_loop(
         idle_polls = 0;
 
         let cancel = main_token.child_token();
+
         token_map.lock().insert(
             (job_uuid, job.dispatch_token),
             (cancel.clone(), Arc::new(AtomicBool::new(false))),
@@ -308,6 +320,8 @@ async fn work_loop(
     }
 }
 
+//all of this function's state is passed in explicitly so tests can drive it; bundle into a struct if the list keeps growing
+#[allow(clippy::too_many_arguments)]
 pub async fn poll_loop(
     addr: SocketAddr,
     worker_uuid: Arc<Mutex<uuid::Uuid>>,
@@ -329,7 +343,9 @@ pub async fn poll_loop(
                 let client = connect_with_backoff(addr).await;
 
                 work_loop( //inner work loop
-                    client, worker_uuid.clone(), semaphore.clone(),
+                    client,
+                    worker_uuid.clone(),
+                    semaphore.clone(),
                     token_map.clone(),
                     &main_token,
                     stop_accepting_work.clone(),
@@ -374,9 +390,9 @@ todo:
 
 #[cfg(test)]
 mod tests {
-    use scheduler_core::proto::{job_outcome::Cancelled, worker_service_server::WorkerService};
+    use scheduler_core::proto::job_outcome::Cancelled;
 
-use super::*;
+    use super::*;
     use crate::test_support::*;
 
     /// A dispatch that runs to completion is reported exactly once, under the worker ID and
@@ -411,7 +427,11 @@ use super::*;
 
         // Assert on what the scheduler received: exactly one report...
         let reports = fake.reports();
-        assert_eq!(reports.len(), 1, "expected exactly one report, got {reports:?}");
+        assert_eq!(
+            reports.len(),
+            1,
+            "expected exactly one report, got {reports:?}"
+        );
         let report = &reports[0];
 
         // ...for this job, from this worker, echoing this dispatch's token. The scheduler fences on
@@ -438,7 +458,6 @@ use super::*;
         );
     }
 
-    
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn revoke_flag_set_before_finish_test() {
         let (addr, fake) = FakeScheduler::spawn().await;
@@ -454,10 +473,10 @@ use super::*;
         assert_eq!(token_map.lock().len(), 1);
 
         revoked.store(true, Ordering::SeqCst);
-        
+
         cancel.cancel();
-        
-        let wait = run_job(
+
+        run_job(
             job,
             job_uuid,
             sleep_executor(),
@@ -466,16 +485,15 @@ use super::*;
             worker_id,
             token_map.clone(),
             permit().await,
-        ).await;
-        
-    
+        )
+        .await;
+
         let reports = fake.reports();
         assert!(reports.is_empty());
 
         assert!(token_map.lock().is_empty());
 
         //tested by moving line 188 into !report_skip branch and moving report_with_retry outside of branch to trigger it everytime
-        
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -488,14 +506,13 @@ use super::*;
         let dispatch_token = 7;
         let (job, job_uuid) = test_job(300, dispatch_token);
 
-        let (cancel, revoked) = insert_dispatch(&token_map, job_uuid, dispatch_token, &root);
+        let (cancel, _revoked) = insert_dispatch(&token_map, job_uuid, dispatch_token, &root);
 
         assert_eq!(token_map.lock().len(), 1);
 
-
         cancel.cancel();
 
-        let wait = run_job(
+        run_job(
             job,
             job_uuid,
             sleep_executor(),
@@ -504,13 +521,15 @@ use super::*;
             worker_id,
             token_map.clone(),
             permit().await,
-        ).await;
-        
-        
+        )
+        .await;
+
         let reports = fake.reports();
-        let report = &reports[0];
 
         assert_eq!(reports.len(), 1);
+
+        let report = &reports[0];
+
         assert_eq!(report.job_id, job_uuid.as_bytes().to_vec());
         assert_eq!(report.worker_id, worker_id.as_bytes().to_vec());
         assert_eq!(report.dispatch_token, dispatch_token);
@@ -522,12 +541,10 @@ use super::*;
         );
 
         assert!(token_map.lock().is_empty());
-
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn worker_forgotten() {
-
         let (addr, fake) = FakeScheduler::spawn().await;
         let worker_id = fake.add_worker();
 
@@ -535,9 +552,6 @@ use super::*;
 
         let token_map = empty_token_map();
         let root = CancellationToken::new();
-        let dispatch_token = 7;
-        let (job, job_uuid) = test_job(10, dispatch_token);
-        let (cancel, revoked) = insert_dispatch(&token_map, job_uuid, dispatch_token, &root);
 
         let (reg_tx, mut reg_rx) = tokio::sync::mpsc::channel::<uuid::Uuid>(16);
 
@@ -550,30 +564,44 @@ use super::*;
         fake.forget_worker(worker_id);
 
         tokio::spawn(poll_loop(
-            addr, 
-            locked_worker_id, 
-            3, 
-            token_map, 
-            root.clone(), 
-            stop_accepting_work, 
-            shutting_down, 
-            registry, 
-            reg_tx
+            addr,
+            locked_worker_id,
+            3,
+            token_map,
+            root.clone(),
+            stop_accepting_work,
+            shutting_down,
+            registry,
+            reg_tx,
         ));
 
         tokio::time::timeout(std::time::Duration::from_secs(2), reg_rx.recv())
             .await
             .expect("expected a uuid sent through the channel to signal a new registration");
-        
 
+        match tokio::time::timeout(std::time::Duration::from_secs(2), reg_rx.recv()).await {
+            Ok(Some(received_id)) => {
+                assert_eq!(received_id, worker_id);
+            }
 
+            Ok(None) => {
+                panic!("nothing came through the channel");
+            }
 
+            Err(_) => {
+                panic!("timeout failed");
+            }
+        }
+
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        assert!(fake.request_work_calls() < 10);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn queued_job() {
-
         let (addr, fake) = FakeScheduler::spawn().await;
+
         let worker_id = fake.add_worker();
 
         let locked_worker_id = Arc::new(Mutex::new(worker_id));
@@ -581,11 +609,11 @@ use super::*;
         let token_map = empty_token_map();
         let root = CancellationToken::new();
         let dispatch_token = 7;
-        let (job, job_uuid) = test_job(100, dispatch_token);
+        let (job, _) = test_job(300, dispatch_token);
 
         fake.queue_job(job);
 
-        let (reg_tx, mut reg_rx) = tokio::sync::mpsc::channel::<uuid::Uuid>(16);
+        let (reg_tx, _reg_rx) = tokio::sync::mpsc::channel::<uuid::Uuid>(16);
 
         let stop_accepting_work = Arc::new(AtomicBool::new(false));
 
@@ -594,46 +622,112 @@ use super::*;
         let registry = test_registry();
 
         tokio::spawn(poll_loop(
-            addr, 
-            locked_worker_id, 
-            3, 
-            token_map, 
-            root.clone(), 
-            stop_accepting_work, 
-            shutting_down, 
-            registry, 
-            reg_tx
+            addr,
+            locked_worker_id.clone(),
+            3,
+            token_map,
+            root.clone(),
+            stop_accepting_work,
+            shutting_down,
+            registry,
+            reg_tx,
         ));
 
-
         eventually(
-            std::time::Duration::from_millis(500), 
+            std::time::Duration::from_millis(500),
             "waiting for a request work call to the scheduler from poll_loop",
-            || fake.request_work_calls() >= 1
+            || fake.request_work_calls() >= 1,
         )
         .await;
 
+        let new_worker_uuid = fake.add_worker();
+        *locked_worker_id.lock() = new_worker_uuid;
+
         eventually(
-            std::time::Duration::from_millis(500), 
-            "waiting for a request work call to the scheduler from poll_loop",
-            || fake.reports().len() >= 1
+            std::time::Duration::from_millis(500),
+            "waiting for a report_result call to the scheduler from poll_loop",
+            || !fake.reports().is_empty(),
         )
         .await;
 
         let reports = fake.reports();
 
         assert_eq!(reports.len(), 1);
-        
+
         let outcome = reports[0].job_outcome.and_then(|o| o.outcome);
+
         assert_eq!(
             outcome,
             Some(proto::job_outcome::Outcome::Success(
-                proto::job_outcome::Success { result: 100 }
+                proto::job_outcome::Success { result: 300 }
             ))
         );
 
+        assert_eq!(
+            uuid::Uuid::from_slice(&reports[0].worker_id).unwrap(),
+            worker_id
+        );
+
+        assert_eq!(reports[0].dispatch_token, 7);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn drain_test() {
+        let (addr, fake) = FakeScheduler::spawn().await;
 
+        let worker_id = fake.add_worker();
 
+        let locked_worker_id = Arc::new(Mutex::new(worker_id));
+
+        let token_map = empty_token_map();
+        let root = CancellationToken::new();
+        let dispatch_token = 7;
+        let (job, _) = test_job(200, dispatch_token);
+
+        fake.queue_job(job);
+
+        let (reg_tx, _reg_rx) = tokio::sync::mpsc::channel::<uuid::Uuid>(16);
+
+        let stop_accepting_work = Arc::new(AtomicBool::new(false));
+
+        let shutting_down = Arc::new(AtomicBool::new(false));
+
+        let registry = test_registry();
+
+        let exit = tokio::spawn(poll_loop(
+            addr,
+            locked_worker_id.clone(),
+            3,
+            token_map,
+            root.clone(),
+            stop_accepting_work.clone(),
+            shutting_down,
+            registry,
+            reg_tx,
+        ));
+
+        eventually(
+            std::time::Duration::from_millis(500),
+            "waiting for a request work call to the scheduler from poll_loop",
+            || fake.request_work_calls() >= 1,
+        )
+        .await;
+
+        stop_accepting_work.store(true, Ordering::SeqCst);
+
+        eventually(
+            std::time::Duration::from_secs(2),
+            "waiting for running job report to come in",
+            || fake.reports().len() >= 1,
+        )
+        .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let request_work_count = fake.request_work_calls();
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        assert_eq!(request_work_count, fake.request_work_calls());
+    }
 }

@@ -33,21 +33,22 @@ impl MySchedulerService {
     #[cfg(test)]
     pub fn from_state(state: SchedulerState) -> Self {
         MySchedulerService {
-            scheduler_state: state
+            scheduler_state: state,
         }
     }
 }
 
 impl MySchedulerService {
     fn scan_lists_for_job_status(&self, requested_id: uuid::Uuid) -> Result<JobState, Status> {
-
-        
         //look for running_jobs first
 
         if let Some(running_job) = self.scheduler_state.running_jobs.get(&requested_id) {
-            
             match running_job.running_phase {
-                RunningPhase::Executing { worker_id, started_at, .. } => {
+                RunningPhase::Executing {
+                    worker_id,
+                    started_at,
+                    ..
+                } => {
                     return Ok(JobState::Running {
                         worker_id,
                         started_at,
@@ -55,7 +56,6 @@ impl MySchedulerService {
                 }
 
                 RunningPhase::Retrying => {
-
                     let retry_queue_guard = self.scheduler_state.retry_queue.lock();
                     if let Some(timeout_until) = retry_queue_guard
                         .iter()
@@ -68,19 +68,16 @@ impl MySchedulerService {
                             retry_after: timeout_until
                                 .saturating_duration_since(std::time::Instant::now()),
                         });
-                        
                     } else {
-                        return Ok(JobState::Retrying { 
-                            retry_after: std::time::Duration::ZERO, 
+                        return Ok(JobState::Retrying {
+                            retry_after: std::time::Duration::ZERO,
                         });
                     }
-                    
-                    
+
                     //since RunningPhase::Retrying doesnt hold any info, i could search within retry_queue
-                    //but might not be in retry_queue if this accessed at the window 
+                    //but might not be in retry_queue if this accessed at the window
                 }
             }
-
         }
 
         //look for completed_jobs next
@@ -179,20 +176,18 @@ impl SchedulerService for MySchedulerService {
         &self,
         request: Request<proto::JobIdRequest>,
     ) -> Result<Response<proto::JobStatus>, Status> {
-
         /*
         note:
         as of now, this can briefly return NotFound for a job that exists
-        this is if under transition during request_work, where the job is taken out of job_queue but not yet inserted 
+        this is if under transition during request_work, where the job is taken out of job_queue but not yet inserted
         into running_jobs
 
-        or 
+        or
 
-        when the retry monitor removes from running_jobs prior to inserting into job_queue 
+        when the retry monitor removes from running_jobs prior to inserting into job_queue
 
         i will fix these LATER!!!!
          */
-
 
         let job_id_request = request.into_inner();
 
@@ -341,7 +336,6 @@ async fn bind_spawn_connect_for_tests() -> (
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn job_submission_success() {
-
     use std::collections::HashMap;
 
     let (mut client, clone_check) = bind_spawn_connect_for_tests().await;
@@ -436,7 +430,6 @@ async fn job_submission_failure_invalid_retry_policy() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn get_job_status_success() {
-
     use scheduler_core::conversion::proto_to_job_status;
 
     use std::collections::HashMap;

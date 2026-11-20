@@ -1,17 +1,31 @@
-use std::{collections::HashMap, sync::atomic::Ordering::{self, SeqCst}};
+use std::{
+    collections::HashMap,
+    sync::atomic::Ordering::{self, SeqCst},
+};
 
 use dashmap::mapref::one::RefMut;
 use futures::stream::BoxStream;
 use scheduler_core::{
-    job_data_structures::{Job, JobState, now_millis}, proto::{self, ActiveJob, CancelJob, CancelReason, HeartbeatControl, HeartbeatPing, heartbeat_control::Directive, worker_service_server::WorkerService}, state_machine::{JobEvent, determine_next_event, transition}, worker::WorkerId,
+    job_data_structures::{Job, JobState, now_millis},
+    proto::{
+        self, ActiveJob, CancelJob, CancelReason, HeartbeatControl, HeartbeatPing,
+        heartbeat_control::Directive, worker_service_server::WorkerService,
+    },
+    state_machine::{JobEvent, determine_next_event, transition},
+    worker::WorkerId,
 };
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
 use crate::{
-    background::{ReclaimOutcome::{self, DeadLettered, NotExecuting, Requeued}, reclaim_job}, scheduler_state::{
+    background::{
+        ReclaimOutcome::{self, DeadLettered, NotExecuting, Requeued},
+        reclaim_job,
+    },
+    scheduler_state::{
         CompletedJob, CompletedJobOutcome, RunningJob, RunningPhase, SchedulerState,
-    }, worker::{AssignedJob, WorkerInfo, WorkerState},
+    },
+    worker::{AssignedJob, WorkerInfo, WorkerState},
 };
 
 pub struct MyWorkerService {
@@ -35,12 +49,16 @@ fn parse_uuid(raw: &[u8], message: &'static str) -> Result<Uuid, Status> {
 /// the retrying_queue. Any job in the retrying_queue only has ownership via the retrying_queue, so if a worker is still
 /// able to access it, it means an error occured in report_result and it is stale.
 /// Returns `started_at` so the failure path can rebuild the staging `Job` without re-matching.
-fn verify_executing_phase(phase: &RunningPhase, sender: WorkerId, reported_dispatch_token: u64) -> Result<u64, Status> {
+fn verify_executing_phase(
+    phase: &RunningPhase,
+    sender: WorkerId,
+    reported_dispatch_token: u64,
+) -> Result<u64, Status> {
     match *phase {
         RunningPhase::Executing {
             worker_id,
             started_at,
-            dispatch_token, 
+            dispatch_token,
         } => {
             if worker_id != sender {
                 return Err(Status::invalid_argument(
@@ -53,7 +71,7 @@ fn verify_executing_phase(phase: &RunningPhase, sender: WorkerId, reported_dispa
                     "message is stale or inaccurate, received dispatch token does not match job's assigned dispatch token",
                 ));
             }
-            
+
             Ok(started_at)
         }
 
@@ -90,20 +108,18 @@ fn no_work_available() -> Response<proto::RequestWorkResponse> {
     })
 }
 
-
-//state transitions 
+//state transitions
 
 impl MyWorkerService {
     ///Clears the slot the finished job is occupying in the worker's assigned_jobs allowing it to request for more jobs if previously full
     fn release_from_worker(&self, worker: &mut WorkerInfo, job_uuid: Uuid) -> Result<(), Status> {
-
         if worker.assigned_jobs.remove(&job_uuid).is_none() {
             tracing::warn!(
                 job_id = %job_uuid,
                 worker_id = %&worker.id,
                 "job present in running_jobs but missing from worker's assigned_jobs"
             );
-            
+
             return Err(Status::not_found(
                 "job was not found within WorkerInfo.assigned_jobs",
             ));
@@ -119,9 +135,8 @@ impl MyWorkerService {
         outcome: CompletedJobOutcome,
         reported_dispatch_token: u64,
     ) -> Result<(), Status> {
-        //locking sequence: 
+        //locking sequence:
         //workers --> running_jobs --> drop(running_jobs) --> completed_jobs
-
 
         let Some(mut worker) = self.scheduler_state.workers.get_mut(&worker_uuid) else {
             return Err(Status::not_found(format!(
@@ -129,26 +144,28 @@ impl MyWorkerService {
             )));
         };
 
-
         let Some(running_job) = self.scheduler_state.running_jobs.get(&job_uuid) else {
             return Err(Status::not_found(
                 "job uuid did not exist within running_jobs",
             ));
         };
 
-        verify_executing_phase(&running_job.running_phase, worker_uuid, reported_dispatch_token)?;
+        verify_executing_phase(
+            &running_job.running_phase,
+            worker_uuid,
+            reported_dispatch_token,
+        )?;
 
         //drop read lock to access write lock on same shard of dashmap
         drop(running_job);
 
         self.release_from_worker(&mut worker, job_uuid)?;
-        
+
         let Some((_, running_job)) = self.scheduler_state.running_jobs.remove(&job_uuid) else {
             return Err(Status::internal(
                 "None was returned for removal of job in Completed branch during report_result, race condition possibly",
             ));
         };
-
 
         let job_id = running_job.id;
         self.scheduler_state
@@ -158,16 +175,15 @@ impl MyWorkerService {
         Ok(())
     }
 
-
     /// For job failures reported by the worker, more specifically the job itself failing.
     /// Infrastructure failure is handled separately, via the run_death_detector, so anything here is for job-level failures.
-    /// The designation for retrying vs deadlettering is handled by 'transition' and 'determine_next_event' which belongs in scheduler-core/src/transition.rs. 
+    /// The designation for retrying vs deadlettering is handled by 'transition' and 'determine_next_event' which belongs in scheduler-core/src/transition.rs.
     fn handle_failure(
         &self,
         job_uuid: Uuid,
         worker_uuid: WorkerId,
         error: u64,
-        reported_dispatch_token: u64
+        reported_dispatch_token: u64,
     ) -> Result<(), Status> {
         //locking sequence: (for retrying branch)
         //workers --> running_jobs --> drop(workers) --> retry_queue
@@ -181,14 +197,17 @@ impl MyWorkerService {
             )));
         };
 
-
         let Some(mut running_job) = self.scheduler_state.running_jobs.get_mut(&job_uuid) else {
             return Err(Status::not_found(
                 "job uuid did not exist within running_jobs",
             ));
         };
 
-        let started_at = verify_executing_phase(&running_job.running_phase, worker_uuid, reported_dispatch_token)?;
+        let started_at = verify_executing_phase(
+            &running_job.running_phase,
+            worker_uuid,
+            reported_dispatch_token,
+        )?;
 
         let mut staging_job = Job {
             id: running_job.id,
@@ -253,7 +272,6 @@ impl MyWorkerService {
         }
     }
 
-
     /// Move a job out of `running_jobs` into `completed_jobs` as dead-lettered.
     /// Any guard on `job_uuid` must be dropped/released first.
     fn dead_letter(&self, job_uuid: Uuid, reason: String) -> Result<(), Status> {
@@ -271,17 +289,18 @@ impl MyWorkerService {
             build_completed_job(running_job, CompletedJobOutcome::DeadLettered { reason }),
         );
 
-        self.scheduler_state.total_dead_lettered.fetch_add(1, SeqCst);
+        self.scheduler_state
+            .total_dead_lettered
+            .fetch_add(1, SeqCst);
         Ok(())
     }
 }
-
 
 //WorkerService RPCs start here
 
 #[tonic::async_trait]
 impl WorkerService for MyWorkerService {
-    /// Registers a worker with capabilities defined by the user on the worker machine submitting them, verification 
+    /// Registers a worker with capabilities defined by the user on the worker machine submitting them, verification
     /// currently isn't possible since capabilities change per machine, a new uuid is minted by the server per registration so re-registering workers will have new uuids
     async fn register(
         &self,
@@ -353,7 +372,7 @@ impl WorkerService for MyWorkerService {
             .outcome
             .ok_or_else(|| Status::invalid_argument("no variant present within JobOutcome"))?;
 
-        match outcome {   
+        match outcome {
             proto::job_outcome::Outcome::Success(proto::job_outcome::Success { result }) => {
                 self.complete_job(
                     job_uuid,
@@ -375,14 +394,13 @@ impl WorkerService for MyWorkerService {
                     CompletedJobOutcome::Abandoned {
                         reason: "job was canceled".to_string(),
                     },
-                    job_result.dispatch_token
+                    job_result.dispatch_token,
                 )?;
             }
         }
 
         Ok(Response::new(()))
     }
-
 
     /// Called from workers to request work (pull-based dispatch). For each call at most one job is returned.
     /// note: locking sequence is workers write guard, job_queue mutex.
@@ -401,7 +419,7 @@ impl WorkerService for MyWorkerService {
             "invalid worker uuid used to request job",
         )?;
 
-        //one guard spans the state check, the capacity check, the extraction and the assignment. 
+        //one guard spans the state check, the capacity check, the extraction and the assignment.
         //splitting it would let two concurrent RequestWork calls from the same worker both pass a capacity check with one free slot between them.
         let Some(mut worker) = self.scheduler_state.workers.get_mut(&worker_uuid) else {
             return Err(Status::not_found(format!(
@@ -416,7 +434,6 @@ impl WorkerService for MyWorkerService {
             WorkerState::Draining => return Ok(no_work_available()),
         }
 
-
         if worker.max_concurrent_jobs <= worker.assigned_jobs.len() as u32 {
             return Err(Status::resource_exhausted(format!(
                 "no space in worker id: {worker_uuid} job pool for more jobs"
@@ -426,11 +443,10 @@ impl WorkerService for MyWorkerService {
         let worker_capabilities = worker.capabilities.clone();
         let worker_job_types = worker.job_types_supported.clone();
 
+        //a job is a match when a job's job_type is a subset of worker's job_types and the job's requirements
+        //is a subset of the worker's capabilities as well.
 
-        //a job is a match when a job's job_type is a subset of worker's job_types and the job's requirements 
-        //is a subset of the worker's capabilities as well. 
-        
-        //extract_if scans the BTreeSet in ascending order, which is based off highest priority, 
+        //extract_if scans the BTreeSet in ascending order, which is based off highest priority,
         //then oldest, and finally id, so the first match is the highest-priority job that is runnable with the requesting machine.
 
         let candidate = {
@@ -438,9 +454,10 @@ impl WorkerService for MyWorkerService {
             job_queue_guard
                 .extract_if(.., |job| {
                     worker_job_types.contains(&job.job_type)
-                        && job.requirements.iter().all(|(key, value)| {
-                            worker_capabilities.get(key) == Some(value)
-                        })
+                        && job
+                            .requirements
+                            .iter()
+                            .all(|(key, value)| worker_capabilities.get(key) == Some(value))
                 })
                 .next()
         };
@@ -451,7 +468,10 @@ impl WorkerService for MyWorkerService {
 
         let now = now_millis();
 
-        let dispatch_token: u64 = self.scheduler_state.next_dispatch_token.fetch_add(1, Ordering::Relaxed);
+        let dispatch_token: u64 = self
+            .scheduler_state
+            .next_dispatch_token
+            .fetch_add(1, Ordering::Relaxed);
 
         self.scheduler_state.running_jobs.insert(
             job.id,
@@ -460,7 +480,7 @@ impl WorkerService for MyWorkerService {
                 job_type: job.job_type.clone(),
                 payload: job.payload,
                 priority: job.priority,
-                created_at: job.created_at,  
+                created_at: job.created_at,
                 retry_count: job.retry_count,
                 infra_interruptions: job.infra_interruptions,
                 running_phase: RunningPhase::Executing {
@@ -513,7 +533,7 @@ impl WorkerService for MyWorkerService {
     /// Bidirectional liveness stream. The worker pushes `HeartbeatPing`s and the scheduler refreshes its TTL
     /// and pushes back an `Ack`. This is also the scheduler's only channel for pushing directives
     /// to a worker, which is what `cancel_job` will eventually be transmitted by.
-    /// 
+    ///
     /// TODO: cancel_job implementation and new oneof variant for cancel_job in proto file
     async fn heartbeat(
         &self,
@@ -522,7 +542,6 @@ impl WorkerService for MyWorkerService {
         let mut pings = request.into_inner();
         let (tx, rx) = tokio::sync::mpsc::channel(16);
 
-        
         //the spawned task outlives this call, so it takes its own handle. SchedulerState is all Arcs,
         //so this clone is cheap, and it gives reconciliation access to running_jobs and job_queue for reclaims.
         let state = self.scheduler_state.clone();
@@ -562,8 +581,7 @@ impl WorkerService for MyWorkerService {
                     break;
                 }
 
-
-                //key is (deadline, worker_id), so to renew TTL, the old pair must be removed and replaced, 
+                //key is (deadline, worker_id), so to renew TTL, the old pair must be removed and replaced,
                 //due to no in place updates.
                 {
                     let mut guard = state.worker_heartbeat_timer.lock();
@@ -583,17 +601,18 @@ impl WorkerService for MyWorkerService {
                 //only after the guard is dropped: notifying while holding it makes the woken
                 //task immediately block on the lock we still own.
                 state.new_worker_deadline_notify.notify_one();
-                
+
                 //compare with ping.active_jobs with the worker's assigned_jobs to possibly reconciliate inconsistencies in jobs
 
-                let jobs_taken_back : Vec<(Uuid, u64)>;
-                let jobs_to_revoke : Vec<(Uuid, u64)>;
+                let jobs_taken_back: DispatchList;
+                let jobs_to_revoke: DispatchList;
 
                 if let Some(worker) = state.workers.get_mut(&worker_uuid) {
                     {
                         //assigned_jobs is accessed wtihin unreported_job_reconciliation_comparison
                         //assigned_job(job_id) is removed within the method, and it is later reclaimed at line 621 by removing from running_jobs
-                        (jobs_taken_back, jobs_to_revoke) = unreported_job_reconciliation_comparison(ping, worker);
+                        (jobs_taken_back, jobs_to_revoke) =
+                            unreported_job_reconciliation_comparison(ping, worker);
                     }
                 } else {
                     let _ = tx
@@ -603,7 +622,7 @@ impl WorkerService for MyWorkerService {
                         .await;
                     break;
                 }
-                
+
                 let ack = HeartbeatControl {
                     directive: Some(proto::heartbeat_control::Directive::Ack(proto::Ack {})),
                 };
@@ -611,28 +630,27 @@ impl WorkerService for MyWorkerService {
                 //needs to remove job from assigned_job, running_job, and requeue/dlq
 
                 if !jobs_taken_back.is_empty() {
-
-                    //send back CancelJob directive for jobs who's heartbeat threshold has passed 
+                    //send back CancelJob directive for jobs who's heartbeat threshold has passed
                     //let cancel_jobs = create_cancel_jobs(jobs_taken_back);
 
                     for job in jobs_taken_back {
-                        let reclaim_outcome : ReclaimOutcome;
+                        let reclaim_outcome: ReclaimOutcome;
 
                         if let Some(recycled_job) = state.running_jobs.remove(&job.0) {
-                            
                             if recycled_job.1.running_phase == RunningPhase::Retrying {
-                                let _  = state.running_jobs.insert(recycled_job.1.id, recycled_job.1.clone());
+                                let _ = state
+                                    .running_jobs
+                                    .insert(recycled_job.1.id, recycled_job.1.clone());
                             }
 
                             reclaim_outcome = reclaim_job(recycled_job.1);
-  
+
                             match reclaim_outcome {
                                 Requeued(queued_job) => {
                                     //reinsert into job_queue
 
                                     let mut job_queue_guard = state.job_queue.lock();
                                     let _ = job_queue_guard.insert(queued_job);
-                                
                                 }
 
                                 DeadLettered(dlq_job) => {
@@ -640,7 +658,6 @@ impl WorkerService for MyWorkerService {
 
                                     let _ = state.completed_jobs.insert(dlq_job.id, dlq_job);
                                     state.total_dead_lettered.fetch_add(1, Ordering::Relaxed);
-
                                 }
 
                                 NotExecuting(running_job) => {
@@ -649,26 +666,41 @@ impl WorkerService for MyWorkerService {
                                     let _ = state.running_jobs.insert(running_job.id, running_job);
                                 }
                             }
-
                         } else {
                             let warning_job_id = job.0;
-                            tracing::warn!("job was not found within running_jobs for job_id: {warning_job_id}");
+                            tracing::warn!(
+                                "job was not found within running_jobs for job_id: {warning_job_id}"
+                            );
                         }
 
-                        if tx.send(Ok(build_cancel_job(job.0, job.1, CancelReason::Revoked as i32))).await.is_err() {
+                        if tx
+                            .send(Ok(build_cancel_job(
+                                job.0,
+                                job.1,
+                                CancelReason::Revoked as i32,
+                            )))
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }
-
                 }
 
                 if !jobs_to_revoke.is_empty() {
-
-                    //send back CancelJob directive for jobs who's heartbeat threshold has passed 
+                    //send back CancelJob directive for jobs who's heartbeat threshold has passed
                     //let cancel_jobs = create_cancel_jobs(jobs_taken_back);
 
                     for job in jobs_to_revoke {
-                        if tx.send(Ok(build_cancel_job(job.0, job.1, CancelReason::Revoked as i32))).await.is_err() {
+                        if tx
+                            .send(Ok(build_cancel_job(
+                                job.0,
+                                job.1,
+                                CancelReason::Revoked as i32,
+                            )))
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -676,17 +708,13 @@ impl WorkerService for MyWorkerService {
                     if tx.send(Ok(ack.clone())).await.is_err() {
                         break;
                     }
-
                 }
 
-                
                 //Err here means the worker's receive half is gone, nothing left to serve.
                 if tx.send(Ok(ack)).await.is_err() {
                     break;
                 }
-                
             }
-            
         });
 
         let output_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
@@ -694,59 +722,53 @@ impl WorkerService for MyWorkerService {
     }
 }
 
-/// A helper function to check jobs returned by worker HeartbeatPings. Checks reported active_jobs against the worker's assigned_jobs, 
-/// increments missed_heartbeats, and returns a tuple of vectors of (job_uuid, dispatch tokens) for the scheduler to relinquish control of. 
+/// One dispatch, identified by (job_id, dispatch_token).
+pub type DispatchList = Vec<(Uuid, u64)>;
+
+/// A helper function to check jobs returned by worker HeartbeatPings. Checks reported active_jobs against the worker's assigned_jobs,
+/// increments missed_heartbeats, and returns a tuple of vectors of (job_uuid, dispatch tokens) for the scheduler to relinquish control of.
 /// If empty, it means that no jobs are to be cancelled.   
 /// Used by worker_service.rs: heartbeat RPC
 pub fn unreported_job_reconciliation_comparison(
-    ping: HeartbeatPing, 
+    ping: HeartbeatPing,
     mut worker: RefMut<Uuid, WorkerInfo>,
-) -> (Vec<(Uuid, u64)>, Vec<(Uuid, u64)>) {
-    
+) -> (DispatchList, DispatchList) {
     let worker_id = worker.id;
 
     let mut cancel_jobs = vec![];
 
     for id_job_pair in &mut worker.assigned_jobs {
-
         let dummy = ActiveJob {
             job_id: id_job_pair.0.as_bytes().to_vec(),
             dispatch_token: id_job_pair.1.dispatch_token,
         };
 
         if !ping.active_jobs.contains(&dummy) {
-
             if id_job_pair.1.missed_heartbeats >= 1 {
                 cancel_jobs.push((*id_job_pair.0, id_job_pair.1.dispatch_token));
-
             } else {
                 id_job_pair.1.missed_heartbeats += 1;
             }
         } else {
-            //reset missed heartbeats   
+            //reset missed heartbeats
             id_job_pair.1.missed_heartbeats = 0;
         }
-    
     }
 
     //check for any jobs the worker might be holding that the scheduler does not know about to revoke
 
-    let mut jobs_to_revoke= vec![];
+    let mut jobs_to_revoke = vec![];
 
     for jobs in ping.active_jobs {
-
         match uuid::Uuid::from_slice(&jobs.job_id) {
             Ok(job_id) => {
-
                 if let Some(assigned_job) = worker.assigned_jobs.get(&job_id) {
                     if jobs.dispatch_token != assigned_job.dispatch_token {
                         jobs_to_revoke.push((job_id, jobs.dispatch_token));
                     }
-
                 } else {
                     jobs_to_revoke.push((job_id, jobs.dispatch_token));
                 }
-
             }
 
             Err(_) => {
@@ -755,35 +777,28 @@ pub fn unreported_job_reconciliation_comparison(
                 continue;
             }
         }
-        
     }
-
 
     for id_token_pair in &cancel_jobs {
         let _ = worker.assigned_jobs.remove(&id_token_pair.0);
     }
 
-
     (cancel_jobs, jobs_to_revoke)
-    
 }
 
-
 pub fn build_cancel_job(id: Uuid, token: u64, reason: i32) -> HeartbeatControl {
-    
     HeartbeatControl {
-        directive: Some(Directive::CancelJob(CancelJob { 
-            job_id: id.as_bytes().to_vec(), 
-            dispatch_token: token, 
+        directive: Some(Directive::CancelJob(CancelJob {
+            job_id: id.as_bytes().to_vec(),
+            dispatch_token: token,
             reason,
-        }))
+        })),
     }
-
 }
 
 //tests start here
 
-#[cfg(test)]   
+#[cfg(test)]
 mod tests {
     use super::*;
     use scheduler_core::job_data_structures::RetryPolicy;
@@ -793,7 +808,7 @@ mod tests {
     type SchedulerClient = proto::scheduler_service_client::SchedulerServiceClient<Channel>;
     type WorkerClient = proto::worker_service_client::WorkerServiceClient<Channel>;
 
-    const MAX_INFRA_INTERRUPTIONS : u64 = 5;
+    const MAX_INFRA_INTERRUPTIONS: u64 = 5;
     /// Everything a report_result test needs after setup has run.
     struct Fixture {
         worker_client: WorkerClient,
@@ -821,9 +836,7 @@ mod tests {
         tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(
-                    proto::scheduler_service_server::SchedulerServiceServer::new(
-                        scheduler_service,
-                    ),
+                    proto::scheduler_service_server::SchedulerServiceServer::new(scheduler_service),
                 )
                 .add_service(proto::worker_service_server::WorkerServiceServer::new(
                     worker_service,
@@ -919,10 +932,7 @@ mod tests {
         }
     }
 
-    fn job_result(
-        f: &Fixture,
-        outcome: proto::job_outcome::Outcome,
-    ) -> Request<proto::JobResult> {
+    fn job_result(f: &Fixture, outcome: proto::job_outcome::Outcome) -> Request<proto::JobResult> {
         Request::new(proto::JobResult {
             job_id: f.job.id.clone(),
             worker_id: f.worker_id.clone(),
@@ -969,7 +979,11 @@ mod tests {
         assert_eq!(f.state.total_completed.load(SeqCst), 1);
         assert!(!f.state.running_jobs.contains_key(&job_uuid));
 
-        if let Some(worker) = f.state.workers.get(&Uuid::from_slice(&f.worker_id).unwrap()) {
+        if let Some(worker) = f
+            .state
+            .workers
+            .get(&Uuid::from_slice(&f.worker_id).unwrap())
+        {
             assert!(worker.assigned_jobs.is_empty());
         }
     }
@@ -1002,7 +1016,11 @@ mod tests {
             assert_eq!(job_ref.job_type, "test".to_string());
             assert_eq!(f.state.total_failed.load(SeqCst), 1);
 
-            if let Some(worker) = f.state.workers.get(&Uuid::from_slice(&f.worker_id).unwrap()) {
+            if let Some(worker) = f
+                .state
+                .workers
+                .get(&Uuid::from_slice(&f.worker_id).unwrap())
+            {
                 assert!(worker.assigned_jobs.is_empty());
             } else {
                 panic!("worker uuid missing from workers in scheduler_state");
@@ -1038,14 +1056,17 @@ mod tests {
                 }
             );
 
-            if let Some(worker) = f.state.workers.get(&Uuid::from_slice(&f.worker_id).unwrap()) {
+            if let Some(worker) = f
+                .state
+                .workers
+                .get(&Uuid::from_slice(&f.worker_id).unwrap())
+            {
                 assert!(worker.assigned_jobs.is_empty());
             } else {
                 panic!("worker uuid missing from workers in scheduler_state")
             }
         }
     }
-
 
     // dispatch token tests
 
@@ -1283,7 +1304,12 @@ mod tests {
 
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                if f.state.job_queue.lock().iter().any(|job| job.id == job_uuid) {
+                if f.state
+                    .job_queue
+                    .lock()
+                    .iter()
+                    .any(|job| job.id == job_uuid)
+                {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -1315,7 +1341,11 @@ mod tests {
         //attempt 1's report arrives again (the worker retrying after a lost response)
         let err = f
             .worker_client
-            .report_result(job_result_with_token(&f, attempt_1_failure, attempt_1_token))
+            .report_result(job_result_with_token(
+                &f,
+                attempt_1_failure,
+                attempt_1_token,
+            ))
             .await
             .expect_err("attempt 1's stale report was applied to attempt 2");
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
@@ -1333,7 +1363,10 @@ mod tests {
                 }
                 RunningPhase::Retrying => panic!("the stale report moved attempt 2 to Retrying"),
             }
-            assert_eq!(running.retry_count, 1, "the stale report counted a second failure");
+            assert_eq!(
+                running.retry_count, 1,
+                "the stale report counted a second failure"
+            );
         }
         assert_eq!(f.state.total_failed.load(SeqCst), 1);
 
@@ -1356,10 +1389,6 @@ mod tests {
             CompletedJobOutcome::Succeeded { result: 7 }
         );
     }
-
-
-
-
 
     //heartbeat stream harness (for reconciliation tests)
 
@@ -1466,7 +1495,10 @@ mod tests {
                 .expect("ping not sent");
 
             let reply = directives_until_ack(&mut controls).await;
-            assert!(reply.is_empty(), "healthy ping produced directives: {reply:?}");
+            assert!(
+                reply.is_empty(),
+                "healthy ping produced directives: {reply:?}"
+            );
         }
 
         assert_still_dispatched(&f);
@@ -1526,12 +1558,11 @@ mod tests {
         assert_still_dispatched(&f);
     }
 
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn reconciliation_no_reports_test() {
         let mut f = submit_register_dispatch(RetryPolicy::NoRetry).await;
         let (tx, mut controls) = open_heartbeat(&mut f.worker_client).await;
-        
+
         let job_id = uuid::Uuid::from_slice(&f.job.id).unwrap();
 
         tx.send(ping(&f.worker_id, vec![]))
@@ -1550,12 +1581,18 @@ mod tests {
             .await
             .expect("ping not sent");
 
-        
         let reply = directives_until_ack(&mut controls).await;
-        assert_eq!(cancels_in(&reply), vec![(job_id, f.job.dispatch_token, CancelReason::Revoked)]);
+        assert_eq!(
+            cancels_in(&reply),
+            vec![(job_id, f.job.dispatch_token, CancelReason::Revoked)]
+        );
 
         {
-            let worker = f.state.workers.get(&uuid::Uuid::from_slice(&f.worker_id).unwrap()).unwrap();
+            let worker = f
+                .state
+                .workers
+                .get(&uuid::Uuid::from_slice(&f.worker_id).unwrap())
+                .unwrap();
             assert!(worker.assigned_jobs.is_empty());
         }
 
@@ -1567,22 +1604,22 @@ mod tests {
             let job_queue_guard = f.state.job_queue.lock();
             let job_id = uuid::Uuid::from_slice(&f.job.id).unwrap();
 
-            let job = job_queue_guard.iter().find(|queued| queued.id == job_id).unwrap();
+            let job = job_queue_guard
+                .iter()
+                .find(|queued| queued.id == job_id)
+                .unwrap();
 
             assert_eq!(job.infra_interruptions, 1);
         }
-
     }
-
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn reset_test() {
-
         //miss, send in correct heartbeatPing, then miss and check missed_heartbeat count
 
         let mut f = submit_register_dispatch(RetryPolicy::NoRetry).await;
         let (tx, mut controls) = open_heartbeat(&mut f.worker_client).await;
-       
+
         let job_id = uuid::Uuid::from_slice(&f.job.id).unwrap();
         let worker_id = uuid::Uuid::from_slice(&f.worker_id).unwrap();
 
@@ -1605,7 +1642,7 @@ mod tests {
 
         tx.send(ping(&f.worker_id, vec![active(&f.job)]))
             .await
-            .expect("ping not sent");  
+            .expect("ping not sent");
 
         let reply = directives_until_ack(&mut controls).await;
         assert_eq!(cancels_in(&reply), vec![]);
@@ -1638,7 +1675,6 @@ mod tests {
         }
 
         //tried breaking the code at line 731, test failed as expected upon changing
-
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1665,17 +1701,23 @@ mod tests {
         };
 
         let unknown_job_id = job.id;
-        let unknown_job_dispatch_token = job.dispatch_token.clone();
-        
+        let unknown_job_dispatch_token = job.dispatch_token;
+
         let proto_job = proto::Job::try_from(job).unwrap();
 
-        
         tx.send(ping(&f.worker_id, vec![active(&proto_job)]))
             .await
             .expect("ping not sent");
 
         let reply = directives_until_ack(&mut controls).await;
-        assert_eq!(cancels_in(&reply), vec![(unknown_job_id, unknown_job_dispatch_token, CancelReason::Revoked)]);
+        assert_eq!(
+            cancels_in(&reply),
+            vec![(
+                unknown_job_id,
+                unknown_job_dispatch_token,
+                CancelReason::Revoked
+            )]
+        );
 
         {
             let worker = f.state.workers.get(&worker_id).unwrap();
@@ -1683,7 +1725,6 @@ mod tests {
 
             assert_eq!(original_job.missed_heartbeats, 1);
         }
-
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1693,17 +1734,23 @@ mod tests {
 
         let job_id = uuid::Uuid::from_slice(&f.job.id).unwrap();
 
-        let old = proto::ActiveJob { job_id: f.job.id.clone(), dispatch_token: f.job.dispatch_token - 1 };
+        let old = proto::ActiveJob {
+            job_id: f.job.id.clone(),
+            dispatch_token: f.job.dispatch_token - 1,
+        };
 
-        tx.send(ping(&f.worker_id, vec![old, active(&f.job)])).await.unwrap();
+        tx.send(ping(&f.worker_id, vec![old, active(&f.job)]))
+            .await
+            .unwrap();
 
         let reply = directives_until_ack(&mut controls).await;
 
-        assert_eq!(cancels_in(&reply), vec![(job_id, f.job.dispatch_token - 1, CancelReason::Revoked)]);
+        assert_eq!(
+            cancels_in(&reply),
+            vec![(job_id, f.job.dispatch_token - 1, CancelReason::Revoked)]
+        );
 
         assert_still_dispatched(&f);
-
-
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1713,9 +1760,11 @@ mod tests {
 
         let job_id = uuid::Uuid::from_slice(&f.job.id).unwrap();
 
-        f.state.running_jobs.get_mut(&job_id).unwrap().infra_interruptions = MAX_INFRA_INTERRUPTIONS;
-
-
+        f.state
+            .running_jobs
+            .get_mut(&job_id)
+            .unwrap()
+            .infra_interruptions = MAX_INFRA_INTERRUPTIONS;
 
         tx.send(ping(&f.worker_id, vec![]))
             .await
@@ -1734,17 +1783,23 @@ mod tests {
             .expect("ping not sent");
 
         let reply = directives_until_ack(&mut controls).await;
-        assert_eq!(cancels_in(&reply), vec![(job_id, f.job.dispatch_token, CancelReason::Revoked)]);
+        assert_eq!(
+            cancels_in(&reply),
+            vec![(job_id, f.job.dispatch_token, CancelReason::Revoked)]
+        );
 
         {
             assert_eq!(f.state.total_dead_lettered.load(Ordering::Relaxed), 1);
-            
+
             let dlq_job = f.state.completed_jobs.get(&job_id).unwrap();
 
-            assert_eq!(dlq_job.outcome, CompletedJobOutcome::DeadLettered { reason: "exceeded infrastructure interruption cap, treated as a poison pill".to_string() });
+            assert_eq!(
+                dlq_job.outcome,
+                CompletedJobOutcome::DeadLettered {
+                    reason: "exceeded infrastructure interruption cap, treated as a poison pill"
+                        .to_string()
+                }
+            );
         }
-
-
     }
-
 }

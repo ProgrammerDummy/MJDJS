@@ -83,9 +83,7 @@ async fn main() {
     let stop_accepting_work = Arc::new(AtomicBool::new(false));
     let shutting_down = Arc::new(AtomicBool::new(false));
 
-
     let (reg_tx, mut reg_rx) = tokio::sync::mpsc::channel::<uuid::Uuid>(16);
-
 
     //spawn tasks with clone and wait for reregistration or user shutdown
 
@@ -98,7 +96,7 @@ async fn main() {
     ));
 
     let work_handle = tokio::spawn(poll_loop(
-        args.scheduler_addr,  
+        args.scheduler_addr,
         worker_uuid.clone(),
         args.max_concurrent_jobs,
         token_map.clone(),
@@ -108,8 +106,6 @@ async fn main() {
         registry.clone(),
         reg_tx.clone(),
     ));
-
-
 
     loop {
         tokio::select! {
@@ -148,7 +144,7 @@ async fn main() {
         _ = work_handle => {
 
         }
-   
+
         _ = tokio::time::sleep(tokio::time::Duration::from_secs(30)) => {
             //force a shutdown if taking too long: revoke every held dispatch, then cancel
             force_shutdown(&token_map, &main_token);

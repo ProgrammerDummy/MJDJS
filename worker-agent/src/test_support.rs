@@ -20,10 +20,10 @@
 #![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::AtomicBool;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -33,8 +33,8 @@ use scheduler_core::proto::{
     worker_service_server::{WorkerService, WorkerServiceServer},
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
-use tokio_util::sync::CancellationToken;
 use tokio_stream::Stream;
+use tokio_util::sync::CancellationToken;
 use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
 
@@ -93,14 +93,20 @@ impl FakeScheduler {
     /// fake already recognises without going through Register.
     pub fn add_worker(&self) -> uuid::Uuid {
         let id = uuid::Uuid::now_v7();
-        self.state.lock().known_workers.insert(id.as_bytes().to_vec());
+        self.state
+            .lock()
+            .known_workers
+            .insert(id.as_bytes().to_vec());
         id
     }
 
     /// Forgets a worker: from now on its request_work and heartbeat calls get NOT_FOUND, as with
     /// the real server after the death detector removes it.
     pub fn forget_worker(&self, id: uuid::Uuid) {
-        self.state.lock().known_workers.remove(id.as_bytes().as_slice());
+        self.state
+            .lock()
+            .known_workers
+            .remove(id.as_bytes().as_slice());
     }
 
     /// Queues a job for the next RequestWork call.
@@ -167,7 +173,9 @@ impl WorkerService for FakeScheduler {
         state.registrations += 1;
 
         if state.reject_registrations {
-            return Err(Status::invalid_argument("fake scheduler is rejecting registrations"));
+            return Err(Status::invalid_argument(
+                "fake scheduler is rejecting registrations",
+            ));
         }
 
         state.known_workers.insert(id.clone());
@@ -325,9 +333,10 @@ pub fn insert_dispatch(
     let cancel = parent.child_token();
     let revoked = Arc::new(AtomicBool::new(false));
 
-    token_map
-        .lock()
-        .insert((job_uuid, dispatch_token), (cancel.clone(), revoked.clone()));
+    token_map.lock().insert(
+        (job_uuid, dispatch_token),
+        (cancel.clone(), revoked.clone()),
+    );
 
     (cancel, revoked)
 }
@@ -468,15 +477,12 @@ mod tests {
             Some(proto::heartbeat_control::Directive::CancelJob(cancel))
         );
     }
-
-
 }
-
 
 /*
 tests to write:
 - needs_reregister test, ensuring duplicate signals are ignored
 - stop_accepting_work and drain test
-- 
-- 
+-
+-
 */
