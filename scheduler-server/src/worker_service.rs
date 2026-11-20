@@ -1,1126 +1,1805 @@
-use core::time;
-use std::{collections::{HashMap, HashSet}, sync::atomic::Ordering::SeqCst};
+use std::{
+    collections::HashMap,
+    sync::atomic::Ordering::{self, SeqCst},
+};
 
-use scheduler_core::{job_data_structures::{Job, JobState, now_millis}, proto::{HeartbeatControl, worker_service_server::WorkerService}, state_machine::{JobEvent, determine_next_event, transition}, worker::WorkerId};
-
-use tonic::{Request, Response, Status};
-use scheduler_core::proto;
+use dashmap::mapref::one::RefMut;
 use futures::stream::BoxStream;
+use scheduler_core::{
+    job_data_structures::{Job, JobState, now_millis},
+    proto::{
+        self, ActiveJob, CancelJob, CancelReason, HeartbeatControl, HeartbeatPing,
+        heartbeat_control::Directive, worker_service_server::WorkerService,
+    },
+    state_machine::{JobEvent, determine_next_event, transition},
+    worker::WorkerId,
+};
+use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
-
-
-
-use crate::{scheduler_state::{QueuedJob, CompletedJob, CompletedJobOutcome, RunningJob, RunningPhase, SchedulerState}, worker::{WorkerInfo, WorkerState}};
-
-const NEXT_HEARTBEAT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+use crate::{
+    background::{
+        ReclaimOutcome::{self, DeadLettered, NotExecuting, Requeued},
+        reclaim_job,
+    },
+    scheduler_state::{
+        CompletedJob, CompletedJobOutcome, RunningJob, RunningPhase, SchedulerState,
+    },
+    worker::{AssignedJob, WorkerInfo, WorkerState},
+};
 
 pub struct MyWorkerService {
-    pub scheduler_state: SchedulerState, //copy SchedulerState over from MySchedulerService during initialization
-    //safe to copy since all fields are Arc wrapped
+    //Shared with MySchedulerService. Every field inside is `Arc`-wrapped,
+    //so both services mutate the same maps and queues.
+    pub scheduler_state: SchedulerState,
 }
 
 impl MyWorkerService {
-    
+    pub fn new(scheduler_state: SchedulerState) -> Self {
+        MyWorkerService { scheduler_state }
+    }
 }
 
-
-async fn fullside_bind_spawn_connect_for_tests() -> (
-        proto::scheduler_service_client::SchedulerServiceClient<tonic::transport::Channel>, 
-        proto::worker_service_client::WorkerServiceClient<tonic::transport::Channel>,
-        SchedulerState
-    ) { //return back the job_queue clone instead
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let incoming = tonic::transport::server::TcpIncoming::from(listener);
-
-    let service = crate::service::MySchedulerService::new();
-
-    let worker_service = MyWorkerService {
-        scheduler_state: service.scheduler_state.clone(),
-    };
-
-    let clone_check = worker_service.scheduler_state.clone();
-
-    tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(proto::scheduler_service_server::SchedulerServiceServer::new(service))
-            .add_service(proto::worker_service_server::WorkerServiceServer::new(worker_service))
-            .serve_with_incoming(incoming)
-            .await
-            .unwrap();
-    });
-
-    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
-        .unwrap()
-        .connect()
-        .await
-        .unwrap();
-
-    (proto::scheduler_service_client::SchedulerServiceClient::new(channel.clone()), proto::worker_service_client::WorkerServiceClient::new(channel), clone_check)
-    
+///Transforms raw bytes from proto to uuids.
+fn parse_uuid(raw: &[u8], message: &'static str) -> Result<Uuid, Status> {
+    Uuid::from_slice(raw).map_err(|_| Status::invalid_argument(message))
 }
 
+/// Verifies the executing phase of the Job, ensuring that the worker id is correct and that it is not in
+/// the retrying_queue. Any job in the retrying_queue only has ownership via the retrying_queue, so if a worker is still
+/// able to access it, it means an error occured in report_result and it is stale.
+/// Returns `started_at` so the failure path can rebuild the staging `Job` without re-matching.
+fn verify_executing_phase(
+    phase: &RunningPhase,
+    sender: WorkerId,
+    reported_dispatch_token: u64,
+) -> Result<u64, Status> {
+    match *phase {
+        RunningPhase::Executing {
+            worker_id,
+            started_at,
+            dispatch_token,
+        } => {
+            if worker_id != sender {
+                return Err(Status::invalid_argument(
+                    "message is stale or inaccurate, worker id does not match sender",
+                ));
+            }
 
+            if reported_dispatch_token != dispatch_token {
+                return Err(Status::invalid_argument(
+                    "message is stale or inaccurate, received dispatch token does not match job's assigned dispatch token",
+                ));
+            }
 
+            Ok(started_at)
+        }
+
+        RunningPhase::Retrying => Err(Status::invalid_argument(
+            "JobResult is stale/inaccurate, worker should not have access to Job currently in retry_queue",
+        )),
+    }
+}
+
+/// Every terminal outcome produces the same record, differing only in `outcome`.
+fn build_completed_job(job: RunningJob, outcome: CompletedJobOutcome) -> CompletedJob {
+    CompletedJob {
+        id: job.id,
+        job_type: job.job_type,
+        payload: job.payload,
+        priority: job.priority,
+        created_at: job.created_at,
+        retry_policy: job.retry_policy,
+        requirements: job.requirements,
+        retry_count: job.retry_count,
+        infra_interruptions: job.infra_interruptions,
+        completed_at: now_millis(),
+        outcome,
+        metadata: job.metadata,
+    }
+}
+
+/// Creates a tonic Response for the case where work is current unavailable in response to request_work from workers
+fn no_work_available() -> Response<proto::RequestWorkResponse> {
+    Response::new(proto::RequestWorkResponse {
+        result: Some(proto::request_work_response::Result::None(
+            proto::NoWorkAvailable {},
+        )),
+    })
+}
+
+//state transitions
+
+impl MyWorkerService {
+    ///Clears the slot the finished job is occupying in the worker's assigned_jobs allowing it to request for more jobs if previously full
+    fn release_from_worker(&self, worker: &mut WorkerInfo, job_uuid: Uuid) -> Result<(), Status> {
+        if worker.assigned_jobs.remove(&job_uuid).is_none() {
+            tracing::warn!(
+                job_id = %job_uuid,
+                worker_id = %&worker.id,
+                "job present in running_jobs but missing from worker's assigned_jobs"
+            );
+
+            return Err(Status::not_found(
+                "job was not found within WorkerInfo.assigned_jobs",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Used for Success/Cancelled paths, validates sender uuid, removes job from running_jobs, releases job slot from worker, places in completed_jobs.
+    fn complete_job(
+        &self,
+        job_uuid: Uuid,
+        worker_uuid: WorkerId,
+        outcome: CompletedJobOutcome,
+        reported_dispatch_token: u64,
+    ) -> Result<(), Status> {
+        //locking sequence:
+        //workers --> running_jobs --> drop(running_jobs) --> completed_jobs
+
+        let Some(mut worker) = self.scheduler_state.workers.get_mut(&worker_uuid) else {
+            return Err(Status::not_found(format!(
+                "worker with id: {worker_uuid} was not found in worker pool"
+            )));
+        };
+
+        let Some(running_job) = self.scheduler_state.running_jobs.get(&job_uuid) else {
+            return Err(Status::not_found(
+                "job uuid did not exist within running_jobs",
+            ));
+        };
+
+        verify_executing_phase(
+            &running_job.running_phase,
+            worker_uuid,
+            reported_dispatch_token,
+        )?;
+
+        //drop read lock to access write lock on same shard of dashmap
+        drop(running_job);
+
+        self.release_from_worker(&mut worker, job_uuid)?;
+
+        let Some((_, running_job)) = self.scheduler_state.running_jobs.remove(&job_uuid) else {
+            return Err(Status::internal(
+                "None was returned for removal of job in Completed branch during report_result, race condition possibly",
+            ));
+        };
+
+        let job_id = running_job.id;
+        self.scheduler_state
+            .completed_jobs
+            .insert(job_id, build_completed_job(running_job, outcome));
+
+        Ok(())
+    }
+
+    /// For job failures reported by the worker, more specifically the job itself failing.
+    /// Infrastructure failure is handled separately, via the run_death_detector, so anything here is for job-level failures.
+    /// The designation for retrying vs deadlettering is handled by 'transition' and 'determine_next_event' which belongs in scheduler-core/src/transition.rs.
+    fn handle_failure(
+        &self,
+        job_uuid: Uuid,
+        worker_uuid: WorkerId,
+        error: u64,
+        reported_dispatch_token: u64,
+    ) -> Result<(), Status> {
+        //locking sequence: (for retrying branch)
+        //workers --> running_jobs --> drop(workers) --> retry_queue
+
+        //locking sequence: (for deadlettered branch)
+        //workers --> running_jobs --> drop(workers) --> completed_jobs
+
+        let Some(mut worker) = self.scheduler_state.workers.get_mut(&worker_uuid) else {
+            return Err(Status::not_found(format!(
+                "worker with id: {worker_uuid} was not found in worker pool"
+            )));
+        };
+
+        let Some(mut running_job) = self.scheduler_state.running_jobs.get_mut(&job_uuid) else {
+            return Err(Status::not_found(
+                "job uuid did not exist within running_jobs",
+            ));
+        };
+
+        let started_at = verify_executing_phase(
+            &running_job.running_phase,
+            worker_uuid,
+            reported_dispatch_token,
+        )?;
+
+        let mut staging_job = Job {
+            id: running_job.id,
+            job_type: running_job.job_type.clone(),
+            payload: running_job.payload,
+            priority: running_job.priority,
+            retry_count: running_job.retry_count,
+            infra_interruptions: running_job.infra_interruptions,
+            dispatch_token: 0, //staging job only feeds the state machine, the token is not read here
+            created_at: running_job.created_at,
+            state: JobState::Running {
+                worker_id: worker_uuid,
+                started_at,
+            },
+            retry_policy: running_job.retry_policy.clone(),
+            requirements: running_job.requirements.clone(),
+            metadata: running_job.metadata.clone(),
+        };
+
+        //increments retry_count by applying Fail to Job and passing to state machine
+        transition(&mut staging_job, JobEvent::Fail { error })
+            .map_err(|e| Status::internal(format!("invalid transition: {e:?}")))?;
+
+        //determines whether to retry or deadletter
+        let next = determine_next_event(&staging_job);
+
+        transition(&mut staging_job, next)
+            .map_err(|e| Status::internal(format!("invalid transition: {e:?}")))?;
+
+        self.release_from_worker(&mut worker, job_uuid)?;
+
+        //deadlettered jobs count as failed, so increment regardless
+        self.scheduler_state.total_failed.fetch_add(1, SeqCst);
+
+        drop(worker);
+
+        match staging_job.state {
+            JobState::Retrying { retry_after } => {
+                running_job.retry_count = staging_job.retry_count;
+                running_job.running_phase = RunningPhase::Retrying;
+
+                {
+                    let mut retry_queue_guard = self.scheduler_state.retry_queue.lock();
+                    //absolute deadline, not a duration. the monitor sleeps until this Instant.
+                    retry_queue_guard.insert((std::time::Instant::now() + retry_after, job_uuid));
+                }
+
+                self.scheduler_state.retry_notify.notify_one();
+                Ok(())
+            }
+
+            JobState::DeadLettered { reason } => {
+                //must release before dead_letter() calls remove() on the same key to avoid deadlock
+                running_job.retry_count = staging_job.retry_count;
+                drop(running_job);
+                self.dead_letter(job_uuid, reason)
+            }
+
+            _ => Err(Status::internal(
+                "a job transition other than retrying or deadlettered should not be possible",
+            )),
+        }
+    }
+
+    /// Move a job out of `running_jobs` into `completed_jobs` as dead-lettered.
+    /// Any guard on `job_uuid` must be dropped/released first.
+    fn dead_letter(&self, job_uuid: Uuid, reason: String) -> Result<(), Status> {
+        let Some((_, running_job)) = self.scheduler_state.running_jobs.remove(&job_uuid) else {
+            tracing::warn!(
+                job_id = %job_uuid,
+                "job disappeared from running_jobs before it could be dead-lettered"
+            );
+            return Ok(());
+        };
+
+        let job_id = running_job.id;
+        self.scheduler_state.completed_jobs.insert(
+            job_id,
+            build_completed_job(running_job, CompletedJobOutcome::DeadLettered { reason }),
+        );
+
+        self.scheduler_state
+            .total_dead_lettered
+            .fetch_add(1, SeqCst);
+        Ok(())
+    }
+}
+
+//WorkerService RPCs start here
 
 #[tonic::async_trait]
 impl WorkerService for MyWorkerService {
-    async fn register(&self, request: Request<proto::Worker>) -> Result<Response<proto::AssignedWorkerId>, Status> {
-        
-        //receive Request<proto::Worker> which holds capabilities and tags (extra metadata)
-        /*
-        take inner() and create new WorkerInfo struct 
-
-        generate the unique id of the worker
-
-        new entry within self.workers
-
-
-        currnetly, there are no checks to establish that the capabilities of a worker are valid, is it even possible without 
-        a bank of "valid" capabilities for a worker?
-
-        actually, this is impossible since this always changes per machine and for each machine, the capabilities can change
-         */
-
-    
-        
-        let new_worker_id: WorkerId = uuid::Uuid::now_v7(); //for now a placeholder until i figure out how to generate unique 64 bit ids
-
+    /// Registers a worker with capabilities defined by the user on the worker machine submitting them, verification
+    /// currently isn't possible since capabilities change per machine, a new uuid is minted by the server per registration so re-registering workers will have new uuids
+    async fn register(
+        &self,
+        request: Request<proto::Worker>,
+    ) -> Result<Response<proto::AssignedWorkerId>, Status> {
         let registered_worker = request.into_inner();
 
         if registered_worker.max_concurrent_jobs == 0 {
-            return Err(Status::invalid_argument("worker's max_concurrent_jobs field was set to 0, unusable worker registration rejected"))
+            return Err(Status::invalid_argument(
+                "worker's max_concurrent_jobs field was set to 0, unusable worker registration rejected",
+            ));
         }
-    
+
+        let new_worker_id: WorkerId = Uuid::now_v7();
         let now = std::time::Instant::now();
 
+        //seeding heartbeat deadline immediately after uuid creation
+        //if unresponsive, will be detected by run_death_detector
         {
             let mut guard = self.scheduler_state.worker_heartbeat_timer.lock();
-            guard.insert((now+NEXT_HEARTBEAT_DEADLINE, new_worker_id));
+            guard.insert((now + self.scheduler_state.heartbeat_deadline, new_worker_id));
         }
 
+        self.scheduler_state.workers.insert(
+            new_worker_id,
+            WorkerInfo {
+                id: new_worker_id,
+                hostname: registered_worker.hostname,
+                job_types_supported: registered_worker.job_types_supported,
+                max_concurrent_jobs: registered_worker.max_concurrent_jobs,
+                assigned_jobs: HashMap::new(),
+                last_heartbeat_at: now,
+                capabilities: registered_worker.capabilities,
+                tags: registered_worker.tags,
+                state: WorkerState::Active,
+            },
+        );
 
-        let new_worker = WorkerInfo {
-            id: new_worker_id,
-            hostname: registered_worker.hostname,
-            job_types_supported: registered_worker.job_types_supported,
-            max_concurrent_jobs: registered_worker.max_concurrent_jobs,
-            assigned_jobs: HashSet::new(),
-            last_heartbeat_at: now,
-            capabilities: registered_worker.capabilities,
-            tags: registered_worker.tags,
-            state: WorkerState::Active,
-        };
-         
-        self.scheduler_state.workers.insert(new_worker_id, new_worker);
-
-        //notify background task for worker heartbeats of new registered worker
-
+        //notify run_death_detector to possibly recalibrate sleeping time
         self.scheduler_state.new_worker_deadline_notify.notify_one();
 
-        return Ok(Response::new(proto::AssignedWorkerId { worker_id: new_worker_id.as_bytes().to_vec() }));
-
+        //return worker uuid back to registered machine
+        Ok(Response::new(proto::AssignedWorkerId {
+            worker_id: new_worker_id.as_bytes().to_vec(),
+        }))
     }
 
-    async fn report_result(&self, request: Request<proto::JobResult>) -> Result<Response<()>, Status> {
+    async fn report_result(
+        &self,
+        request: Request<proto::JobResult>,
+    ) -> Result<Response<()>, Status> {
+        let job_result = request.into_inner();
 
-        //receive a proto::JobResult, we get job_id, worker_id, and job_outcome
+        //check uuids of job and worker
+        let job_uuid = parse_uuid(
+            &job_result.job_id,
+            "invalid job uuid was entered when attempting to report_result",
+        )?;
+        let worker_uuid = parse_uuid(
+            &job_result.worker_id,
+            "invalid worker uuid was entered when attempting to report_result",
+        )?;
 
-        let result = request.into_inner();
+        //proto3 wraps every message field in Option and every oneof in a second Option
+        //peel off here before accessing logic section
+        let outcome = job_result
+            .job_outcome
+            .ok_or_else(|| Status::invalid_argument("no JobOutcome was sent"))?
+            .outcome
+            .ok_or_else(|| Status::invalid_argument("no variant present within JobOutcome"))?;
 
-        let job_uuid = match uuid::Uuid::from_slice(&result.job_id) {
-            Ok(uuid) => uuid,
-            Err(e) => {
-                return Err(Status::invalid_argument("invalid job uuid was entered when attempting to report_result"));
+        match outcome {
+            proto::job_outcome::Outcome::Success(proto::job_outcome::Success { result }) => {
+                self.complete_job(
+                    job_uuid,
+                    worker_uuid,
+                    CompletedJobOutcome::Succeeded { result },
+                    job_result.dispatch_token,
+                )?;
+                self.scheduler_state.total_completed.fetch_add(1, SeqCst);
             }
-        };
 
-        let worker_uuid = match uuid::Uuid::from_slice(&result.worker_id) {
-            Ok(uuid) => uuid,
-            Err(e) => {
-                return Err(Status::invalid_argument("invalid worker uuid was entered when attempting to report_result"));
+            proto::job_outcome::Outcome::Failure(proto::job_outcome::Failure { error }) => {
+                self.handle_failure(job_uuid, worker_uuid, error, job_result.dispatch_token)?;
             }
-        };
 
-        match result.job_outcome {
-            Some(job_outcome) => {
-                match job_outcome.outcome {
-                    Some(outcome) => { //unlayering the proto layers
-                        match outcome {
-                            //regardless of outcome, transition the RunningJob into a CompletedJob
-                            //pop out the RunningJob and create a new CompletedJob
-                            //also pop out of worker's job pool
-
-                            proto::job_outcome::Outcome::Success(proto::job_outcome::Success { result }) => {
-                                
-                                if let Some(running_job) = self.scheduler_state.running_jobs.get(&job_uuid) {
-                                    //check to see if sender is actually correct worker
-                                    //and check to see if job is in executing phase or retrying phase
-                                    match running_job.running_phase {
-                                        RunningPhase::Executing { worker_id, started_at } => {
-                                            if worker_id != worker_uuid {
-                                                return Err(Status::invalid_argument("message is stale or inaccurate, worker id does not match sender"));
-                                            }
-                                        },
-
-                                        RunningPhase::Retrying => {
-                                            return Err(Status::invalid_argument("JobResult is stale/inaccurate, worker should not have access to Job currently in retry_queue"));
-                                        }
-                                    }
-                                } else {
-                                    //doesnt erxist within running_job
-                                    return Err(Status::not_found("job uuid did not exist within running_jobs"));
-                                }
-
-                                //now checks have passed for staleness of messages and existence within running_jobs, safe to remove
-                                
-                                if let Some((running_job_uuid, running_job)) = self.scheduler_state.running_jobs.remove(&job_uuid) {
-
-                                    //pop out of worker job pool
-
-                                    if let Some(mut worker) = self.scheduler_state.workers.get_mut(&worker_uuid) {
-
-                                        if !worker.assigned_jobs.contains(&running_job_uuid) {
-                                            tracing::warn!(
-                                                job_id = %running_job_uuid,
-                                                worker_id = %worker_uuid,
-                                                "job present in running_jobs but missing from worker's assigned_jobs"
-                                            );
-                                            return Err(Status::not_found("job was not found within WorkerInfo.assigned_jobs"))
-                                        }
-                                        worker.assigned_jobs.remove(&running_job_uuid);
-                                           
-
-                                    } else {
-                                        return Err(Status::not_found(format!("worker with id: {} was not found in worker pool", worker_uuid)));
-                                    }
-
-
-                                    let completed_job = CompletedJob {
-                                        id: running_job_uuid,
-                                        job_type: running_job.job_type,
-                                        payload: running_job.payload,
-                                        priority: running_job.priority,
-                                        created_at: running_job.created_at,
-                                        retry_policy: running_job.retry_policy,
-                                        requirements: running_job.requirements,
-                                        retry_count: running_job.retry_count,
-                                        infra_interruptions: running_job.infra_interruptions,
-                                        completed_at: now_millis(),
-                                        outcome: CompletedJobOutcome::Succeeded { result },
-                                        metadata: running_job.metadata,
-                                    };
-
-                                    self.scheduler_state.completed_jobs.insert(running_job_uuid, completed_job);
-
-                                    self.scheduler_state.total_completed.fetch_add(1, SeqCst);
-
-                                    return Ok(Response::new(()));
-
-                                }
-                                
-                            },
-
-                            proto::job_outcome::Outcome::Failure(proto::job_outcome::Failure { error}) => {
-
-                                //how do i tell if it failed becasue of infrastructure or because of job itself?
-                                //if the infrastructure breaks, i can automatically detect it because of the loss in heartbeats
-                                //therefore all jobs within that worker will be flagged as an infrastructure interruption once their heartbeat leases expire
-
-                                //so i just need to account for the actual job failure here since infrastruture failures wont be reported at all
-
-
-
-                                //before incrementations, compare against RetryPolicy using next_delay
-                                //if next_delay returns None, then deadletter it, if not then retry it
-
-                                
-                                //timeout calculation using next_delay
-
-                                //insert into retry_queue
-
-                                //change the running_phase to retrying
-                                
-                                if let Some(mut running_job) = self.scheduler_state.running_jobs.get_mut(&job_uuid) {
-
-                                    //check to see if sender is actually correct worker
-                                    //and check to see if job is in executing phase or retrying phase
-                                    let started_at_bind;
-
-                                    match running_job.running_phase {
-                                        RunningPhase::Executing { worker_id, started_at } => {
-                                            started_at_bind = started_at;
-                                            if worker_id != worker_uuid {
-                                                return Err(Status::invalid_argument("message is stale or inaccurate, worker id does not match sender"));
-                                            }
-                                        },
-
-                                        RunningPhase::Retrying => {
-                                            return Err(Status::invalid_argument("JobResult is stale/inaccurate, worker should not have access to Job currently in retry_queue"));
-                                        }
-                                    }
-
-                                    //pop out of worker job pool
-
-                                    if let Some(mut worker) = self.scheduler_state.workers.get_mut(&worker_uuid) {
-
-                                        if !worker.assigned_jobs.contains(&job_uuid) {
-                                            tracing::warn!(
-                                                job_id = %&running_job.id,
-                                                worker_id = %worker_uuid,
-                                                "job present in running_jobs but missing from worker's assigned_jobs"
-                                            );
-                                            return Err(Status::not_found("job was not found within WorkerInfo.assigned_jobs"))
-                                        }
-                                        worker.assigned_jobs.remove(&job_uuid);
-                                           
-
-                                    } else {
-                                        return Err(Status::not_found(format!("worker with id: {} was not found in worker pool", worker_uuid)));
-                                    }
-
-                                    //for the failure case, create a temporary job instance then use transition() to apply an increment
-                                    //then use determine_next_event on the new retry_count, re-enter into the transition method again and match from there?
-
-                                    let mut temp_job = Job {
-                                        id: running_job.id,
-                                        job_type: running_job.job_type.clone(),
-                                        payload: running_job.payload,
-                                        priority: running_job.priority,
-                                        retry_count: running_job.retry_count,
-                                        infra_interruptions: running_job.infra_interruptions,
-                                        created_at: running_job.created_at,
-                                        state: JobState::Running { worker_id: worker_uuid, started_at: started_at_bind },
-                                        retry_policy: running_job.retry_policy.clone(),
-                                        requirements: running_job.requirements.clone(),
-                                        metadata: running_job.metadata.clone(),
-                                    };
-
-                                    transition(&mut temp_job, JobEvent::Fail { error })
-                                        .map_err(|e| Status::internal(format!("invalid transition: {e:?}")))?; //increment retry_count by 1
-
-                                    let next = determine_next_event(&temp_job);
-
-                                    transition(&mut temp_job, next)
-                                        .map_err(|e| Status::internal(format!("invalid transition: {e:?}")))?;
-
-
-                                    //increment total_failed counter regardless of retry or deadletter
-                                    self.scheduler_state.total_failed.fetch_add(1, SeqCst);
-
-                                    match temp_job.state {
-                                        JobState::Retrying { retry_after } => {
-
-                                            running_job.retry_count = temp_job.retry_count;
-                                            running_job.running_phase = RunningPhase::Retrying;
-                                            
-                                            {
-                                                let mut retry_queue_guard = self.scheduler_state.retry_queue.lock();
-                                                retry_queue_guard.insert((std::time::Instant::now()+retry_after, job_uuid));
-                                                //insert job into retry_queue with calculated timeout with jitter
-
-                                                //increment total_failed
-                                            
-                                                
-                                            }
-
-                                            //notify background retry_queue drain task
-
-                                            self.scheduler_state.retry_notify.notify_one();
-
-                                        },
-
-                                        JobState::DeadLettered { reason } => {
-                                            drop(running_job); //deadlock prevention
-
-                                            if let Some((_, job_to_be_deadlettered)) = self.scheduler_state.running_jobs.remove(&job_uuid) {
-                                                let deadlettered_job = CompletedJob {
-                                                    id: job_to_be_deadlettered.id,
-                                                    job_type: job_to_be_deadlettered.job_type,
-                                                    payload: job_to_be_deadlettered.payload,
-                                                    priority: job_to_be_deadlettered.priority,
-                                                    created_at: job_to_be_deadlettered.created_at,
-                                                    retry_policy: job_to_be_deadlettered.retry_policy,
-                                                    requirements: job_to_be_deadlettered.requirements,
-                                                    retry_count: job_to_be_deadlettered.retry_count,
-                                                    infra_interruptions: job_to_be_deadlettered.infra_interruptions,
-                                                    completed_at: now_millis(),
-                                                    outcome: CompletedJobOutcome::DeadLettered { reason },
-                                                    metadata: job_to_be_deadlettered.metadata,
-                                                };
-
-                                                //store in completed_jobs with deadlettered status
-
-                                                self.scheduler_state.completed_jobs.insert(job_to_be_deadlettered.id, deadlettered_job);
-                                                
-                                                //increment atomic
-                                                self.scheduler_state.total_dead_lettered.fetch_add(1, SeqCst);
-                                                
-                                            }
-                                        },
-
-                                        _ => {
-                                            return Err(Status::internal("a job transition other than retrying or deadlettered should not be possible"));
-
-                                        }
-                                    }
-
-                                    return Ok(Response::new(()));
-
-                                } else {
-                                    return Err(Status::not_found("job uuid did not exist within running_jobs"));
-                                }
-
-                            },
-
-                            proto::job_outcome::Outcome::Cancelled(proto::job_outcome::Cancelled {}) => {
-                                
-                                //same flow as Outcome::Success variant
-
-                                if let Some(running_job) = self.scheduler_state.running_jobs.get(&job_uuid) {
-                                    //check to see if sender is actually correct worker
-                                    //and check to see if job is in executing phase or retrying phase
-                                    match running_job.running_phase {
-                                        RunningPhase::Executing { worker_id, started_at } => {
-                                            if worker_id != worker_uuid {
-                                                return Err(Status::internal("message is stale or inaccurate, worker id does not match sender"));
-                                            }
-                                        },
-
-                                        RunningPhase::Retrying => {
-                                            return Err(Status::internal("JobResult is stale/inaccurate, worker should not have access to Job currently in retry_queue"));
-                                        }
-                                    }
-                                } else {
-                                    //doesnt erxist within running_job
-                                    return Err(Status::internal("job uuid did not exist within running_jobs"));
-                                }
-
-                                
-                                if let Some((running_job_uuid, running_job)) = self.scheduler_state.running_jobs.remove(&job_uuid) {
-
-                                    //pop out of worker job pool
-
-                                    if let Some(mut worker) = self.scheduler_state.workers.get_mut(&worker_uuid) {
-
-                                        if !worker.assigned_jobs.contains(&running_job_uuid) {
-                                            tracing::warn!(
-                                                job_id = %running_job_uuid,
-                                                worker_id = %worker_uuid,
-                                                "job present in running_jobs but missing from worker's assigned_jobs"
-                                            );
-                                            return Err(Status::not_found("job was not found within WorkerInfo.assigned_jobs"))
-                                        }
-                                        worker.assigned_jobs.remove(&running_job_uuid);
-                                           
-
-                                    } else {
-                                        return Err(Status::not_found(format!("worker with id: {} was not found in worker pool", worker_uuid)));
-                                    }
-
-
-                                    let completed_job = CompletedJob {
-                                        id: running_job_uuid,
-                                        job_type: running_job.job_type,
-                                        payload: running_job.payload,
-                                        priority: running_job.priority,
-                                        created_at: running_job.created_at,
-                                        retry_policy: running_job.retry_policy,
-                                        requirements: running_job.requirements,
-                                        retry_count: running_job.retry_count,
-                                        infra_interruptions: running_job.infra_interruptions,
-                                        completed_at: now_millis(),
-                                        outcome: CompletedJobOutcome::Abandoned { reason: "job was canceled".to_string() },
-                                        metadata: running_job.metadata,
-                                    };
-
-                                    self.scheduler_state.completed_jobs.insert(running_job_uuid, completed_job);
-
-
-                                    return Ok(Response::new(()));
-
-                                }
-
-
-                            }
-                        }
+            proto::job_outcome::Outcome::Cancelled(proto::job_outcome::Cancelled {}) => {
+                self.complete_job(
+                    job_uuid,
+                    worker_uuid,
+                    CompletedJobOutcome::Abandoned {
+                        reason: "job was canceled".to_string(),
                     },
-
-                    None => {
-                        return Err(Status::invalid_argument("no variant present within JobOutcome"));
-                    }
-                }
-            },
-
-            None => {
-                return Err(Status::invalid_argument("no JobOutcome was sent"));
+                    job_result.dispatch_token,
+                )?;
             }
         }
 
-
-
-        //free job_id from worker with worker_id working job pool
-
-        /*
-        
-        if job_outcome is Success { result }, transition RunningJob to CompletedJob, insert with uuid, CompletedJob kv pair
-        increment total_completed in SchedulerState
-
-        if job_outcome is Failure { error }, increment job's retry_count/infra_interruptions, how do i tell which caused it??
-
-        also check against max_cap as well before i do the incrementation, to possibly drop and increment total_dead_lettered
-        
-         */
-
-        Err(Status::unimplemented("report_result not yet implemented"))
+        Ok(Response::new(()))
     }
 
-    async fn request_work(&self, request: Request<proto::AssignedWorkerId>) -> Result<Response<proto::RequestWorkResponse>, Status> {
-        //check that worker exists and worker has enough space in job pool
+    /// Called from workers to request work (pull-based dispatch). For each call at most one job is returned.
+    /// note: locking sequence is workers write guard, job_queue mutex.
+    /// DO NOT CHANGE SEQUENCE UNLESS DEADLOCKS ARE WANTED!!
+    async fn request_work(
+        &self,
+        request: Request<proto::AssignedWorkerId>,
+    ) -> Result<Response<proto::RequestWorkResponse>, Status> {
+        //locking sequence:
+        //workers --> job_queue --> running_jobs
 
-        
-        let job_requesting_worker_id = request.into_inner().worker_id;
+        //this will be my standard locking sequence
 
-        let job_requesting_worker_id = match Uuid::from_slice(&job_requesting_worker_id) {
-            Ok(uuid) => {
-                uuid
-            },
-            Err(e) => {
-                return Err(Status::invalid_argument("invalid worker uuid used to request job"))
-            }
+        let worker_uuid = parse_uuid(
+            &request.into_inner().worker_id,
+            "invalid worker uuid used to request job",
+        )?;
+
+        //one guard spans the state check, the capacity check, the extraction and the assignment.
+        //splitting it would let two concurrent RequestWork calls from the same worker both pass a capacity check with one free slot between them.
+        let Some(mut worker) = self.scheduler_state.workers.get_mut(&worker_uuid) else {
+            return Err(Status::not_found(format!(
+                "worker with id: {worker_uuid} was not found in worker pool"
+            )));
         };
 
-        let mut worker_capabilities: HashMap<String, String> = HashMap::new();
-        let mut worker_job_types: Vec<String>;
+        match worker.state {
+            WorkerState::Active => {}
 
-        if let Some(mut worker) = self.scheduler_state.workers.get_mut(&job_requesting_worker_id) {
-            worker_capabilities = worker.capabilities.clone();
-            worker_job_types = worker.job_types_supported.clone();
-
-            match worker.state {
-                WorkerState::Active => {},
-                WorkerState::Draining => {
-                    return Ok(Response::new(proto::RequestWorkResponse {
-                        result: Some(proto::request_work_response::Result::None(proto::NoWorkAvailable {}))
-                    }));
-                },
-                WorkerState::Dead => {
-                    return Err(Status::failed_precondition("work requesting worker is dead"))
-                }
-            }
-
-            if worker.max_concurrent_jobs <= worker.assigned_jobs.len() as u32 { //check to see if the job pool is full
-                return Err(Status::resource_exhausted(format!("no space in worker id: {} job pool for more jobs", job_requesting_worker_id)))
-            } else {
-
-                {
-
-                    let mut job_queue_guard = self.scheduler_state.job_queue.lock();
-
-                    let mut extractor = job_queue_guard.extract_if(.., |job| {
-                        worker_job_types.contains(&job.job_type) &&
-                        job.requirements.iter().all(|(requirements_key, requirements_value)| worker_capabilities.get(requirements_key) == Some(requirements_value))
-                    }); //iterates over requirements to check that the requirements hashmap is a subset of capabilities hashmap
-                    //if it matches, then the QueuedJob is unlinked from the btreeset
-
-
-                    if let Some(job) = extractor.next() { //executes the extractor, if there is a job whose requirements match the worker's capabilities
-
-                        //create a RunningJob and pass the values from the QueuedJob into it
-
-                        let now = now_millis();
-
-                        let new_running_job = RunningJob {
-                            id: job.id,
-                            job_type: job.job_type.clone(),
-                            payload: job.payload,
-                            priority: job.priority,
-                            created_at: job.created_at,
-                            retry_count: job.retry_count,
-                            running_phase: RunningPhase::Executing { 
-                                worker_id: job_requesting_worker_id, 
-                                started_at: now, 
-                            },
-                            infra_interruptions: job.infra_interruptions,
-                            requirements: job.requirements.clone(),
-                            metadata: job.metadata.clone(),
-                            retry_policy: job.retry_policy.clone(),
-                        };
-
-                        self.scheduler_state.running_jobs.insert(job.id, new_running_job);
-                        
-                        worker.assigned_jobs.insert(job.id);
-
-                        //insert new job into worker's job hashset and incremement max_concurrent_job counter by 1
-                        //check should have been done before the mutex for job_queue was locked
-
-                        let proto_job = Job {
-                            id: job.id, 
-                            job_type: job.job_type,
-                            payload: job.payload,
-                            priority: job.priority,
-                            retry_count: job.retry_count,
-                            infra_interruptions: job.infra_interruptions,
-                            created_at: job.created_at,
-                            state: JobState::Running { worker_id: job_requesting_worker_id, started_at: now },
-                            retry_policy: job.retry_policy,
-                            requirements: job.requirements,
-                            metadata: job.metadata,
-                        };
-
-                        if let Ok(proto_job) = proto::Job::try_from(proto_job) {
-                            return Ok(Response::new(proto::RequestWorkResponse {
-                                result: Some(proto::request_work_response::Result::Job(proto_job))
-                            }))
-                        } else {
-                            return Err(Status::internal("job was invalid"));
-                        }
-
-
-
-                        //insert new RunningJob into running_job dashmap
-
-                        /*
-                        think about when noworkavailable would be sent back --> when there are no jobs in queue at all or when there are no matching jobs?
-
-                    
-                        
-                        now modify SchedulerState.workers to add in new job to WorkerInfo.max_concurrent_jobs
-                        and WorkerInfo.assigned_jobs
-
-                        create Job, then use try_from to turn into proto::Job in converison.rs
-                        return the proto::Job
-                            */
-                        
-                    } else {
-                        return Ok(Response::new(proto::RequestWorkResponse {
-                            result: Some(proto::request_work_response::Result::None(proto::NoWorkAvailable {}))
-                        }))
-                    }
-
-                    
-
-                } 
-            }
-        } else { //worker doesn't exist
-            return Err(Status::not_found(format!("worker with id: {} was not found in worker pool", job_requesting_worker_id)))
+            //draining allows for workers to finish current jobs while not taking any new jobs
+            WorkerState::Draining => return Ok(no_work_available()),
         }
 
-    
+        if worker.max_concurrent_jobs <= worker.assigned_jobs.len() as u32 {
+            return Err(Status::resource_exhausted(format!(
+                "no space in worker id: {worker_uuid} job pool for more jobs"
+            )));
+        }
 
-        //note: lock acquisition must be in this order in the future to avoid deadlocks
-        //acquire write lock for workers dashmap, then job_queue mutex
+        let worker_capabilities = worker.capabilities.clone();
+        let worker_job_types = worker.job_types_supported.clone();
 
-        //also dont try to reacquire the same lock again, dont acquire read lock adn then try to do write lock 
+        //a job is a match when a job's job_type is a subset of worker's job_types and the job's requirements
+        //is a subset of the worker's capabilities as well.
 
+        //extract_if scans the BTreeSet in ascending order, which is based off highest priority,
+        //then oldest, and finally id, so the first match is the highest-priority job that is runnable with the requesting machine.
+
+        let candidate = {
+            let mut job_queue_guard = self.scheduler_state.job_queue.lock();
+            job_queue_guard
+                .extract_if(.., |job| {
+                    worker_job_types.contains(&job.job_type)
+                        && job
+                            .requirements
+                            .iter()
+                            .all(|(key, value)| worker_capabilities.get(key) == Some(value))
+                })
+                .next()
+        };
+
+        let Some(job) = candidate else {
+            return Ok(no_work_available());
+        };
+
+        let now = now_millis();
+
+        let dispatch_token: u64 = self
+            .scheduler_state
+            .next_dispatch_token
+            .fetch_add(1, Ordering::Relaxed);
+
+        self.scheduler_state.running_jobs.insert(
+            job.id,
+            RunningJob {
+                id: job.id,
+                job_type: job.job_type.clone(),
+                payload: job.payload,
+                priority: job.priority,
+                created_at: job.created_at,
+                retry_count: job.retry_count,
+                infra_interruptions: job.infra_interruptions,
+                running_phase: RunningPhase::Executing {
+                    worker_id: worker_uuid,
+                    started_at: now,
+                    dispatch_token,
+                },
+                requirements: job.requirements.clone(),
+                metadata: job.metadata.clone(),
+                retry_policy: job.retry_policy.clone(),
+            },
+        );
+
+        worker.assigned_jobs.insert(
+            job.id,
+            AssignedJob {
+                dispatch_token,
+                missed_heartbeats: 0,
+            },
+        );
+
+        let dispatched = Job {
+            id: job.id,
+            job_type: job.job_type,
+            payload: job.payload,
+            priority: job.priority,
+            retry_count: job.retry_count,
+            infra_interruptions: job.infra_interruptions,
+            dispatch_token,
+            created_at: job.created_at,
+            state: JobState::Running {
+                worker_id: worker_uuid,
+                started_at: now,
+            },
+            retry_policy: job.retry_policy,
+            requirements: job.requirements,
+            metadata: job.metadata,
+        };
+
+        let proto_job =
+            proto::Job::try_from(dispatched).map_err(|_| Status::internal("job was invalid"))?;
+
+        Ok(Response::new(proto::RequestWorkResponse {
+            result: Some(proto::request_work_response::Result::Job(proto_job)),
+        }))
     }
-    
+
     type HeartbeatStream = BoxStream<'static, Result<proto::HeartbeatControl, Status>>;
 
-    async fn heartbeat(&self, request: Request<tonic::Streaming<proto::HeartbeatPing>>) -> Result<Response<Self::HeartbeatStream>, Status> {
-        
-        let mut incoming_heartbeat_ping_stream = request.into_inner();
-
+    /// Bidirectional liveness stream. The worker pushes `HeartbeatPing`s and the scheduler refreshes its TTL
+    /// and pushes back an `Ack`. This is also the scheduler's only channel for pushing directives
+    /// to a worker, which is what `cancel_job` will eventually be transmitted by.
+    ///
+    /// TODO: cancel_job implementation and new oneof variant for cancel_job in proto file
+    async fn heartbeat(
+        &self,
+        request: Request<tonic::Streaming<proto::HeartbeatPing>>,
+    ) -> Result<Response<Self::HeartbeatStream>, Status> {
+        let mut pings = request.into_inner();
         let (tx, rx) = tokio::sync::mpsc::channel(16);
 
-        let workers = self.scheduler_state.workers.clone(); //arc clone
-        let heartbeat_timer_lock = self.scheduler_state.worker_heartbeat_timer.clone();
-        let worker_deadline_notify = self.scheduler_state.new_worker_deadline_notify.clone();
-
-        //one spawned task that continously loops in the background for heartbeats
-        //poll for the heartbeats, i can tell what is happening on the channel based on the returned values
-        
-        //on main function thread, pass the receiver stream to the caller of the RPC 
+        //the spawned task outlives this call, so it takes its own handle. SchedulerState is all Arcs,
+        //so this clone is cheap, and it gives reconciliation access to running_jobs and job_queue for reclaims.
+        let state = self.scheduler_state.clone();
 
         tokio::spawn(async move {
             loop {
-                match incoming_heartbeat_ping_stream.message().await {
-                    Ok(Some(ping)) => {
-                        //received a ping successfully, so update worker_heartbeat_timer and WorkerInfo.last_heartbeat_at
-                        //acquire worker_heartbeat_timer lock first
-
-                        let worker_uuid = match uuid::Uuid::from_slice(&ping.worker_id) {
-                            Ok(uuid) => uuid,
-                            Err(e) => {
-                                let _ = tx.send(Err(Status::internal(format!("invalid worker uuid: {e}")))).await;
-                                break;
-                            }
-                        };
-
-                        let now = std::time::Instant::now();
-                        
-                        {
-                            let mut guard = heartbeat_timer_lock.lock();
-                            let worker_timer = guard
-                                .iter()
-                                .find(|(_, uuid)| *uuid == worker_uuid)
-                                .map(|(instant, _)| *instant);
-
-                            if let Some(old_instant) = worker_timer {
-                                guard.remove(&(old_instant, worker_uuid));
-                            } //find and replace old Instant with new one at now + 15s
-
-                            guard.insert((now + NEXT_HEARTBEAT_DEADLINE, worker_uuid));
-
-
-                            
-                        } 
-
-                        worker_deadline_notify.notify_one();
-
-                        //notify worker heartbeat deadline background task of updated heartbeat deadline                  
-                        
-                        //now modify the workers to update last_heartbeat_at
-                        if let Some(mut workers_mutref) = workers.get_mut(&worker_uuid) {
-                            workers_mutref.last_heartbeat_at = now;
-                        } else {
-                            let _ = tx.send(Err(Status::internal("invalid worker uuid present in workers"))).await;
-                            break;
-                        }
-
-                        
-
-
-                        let ack = HeartbeatControl {
-                            directive: Some(proto::heartbeat_control::Directive::Ack(proto::Ack {}))
-                        }; //construct ack 
-
-                        if tx.send(Ok(ack)).await.is_err() {
-                            //if the client/worker's receiving end is gone
-                            break;
-                        }
-
-                    },
-
-                    Ok(None) => {
-                        //stream closed by worker
-                        break;
-                    },
-
+                let ping = match pings.message().await {
+                    Ok(Some(ping)) => ping,
+                    Ok(None) => break, // worker closed its send half cleanly
                     Err(e) => {
                         let _ = tx.send(Err(e)).await;
                         break;
                     }
-                    
+                };
 
+                let worker_uuid = match Uuid::from_slice(&ping.worker_id) {
+                    Ok(uuid) => uuid,
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(Status::internal(format!("invalid worker uuid: {e}"))))
+                            .await;
+                        break;
+                    }
+                };
+
+                //using monotonic clocks, not wall clocks due to drift/jumps/unreliability in time across separate machines
+                let now = std::time::Instant::now();
+
+                if let Some(mut worker) = state.workers.get_mut(&worker_uuid) {
+                    worker.last_heartbeat_at = now;
+                } else {
+                    let _ = tx
+                        .send(Err(Status::not_found(
+                            "invalid worker uuid present in workers",
+                        )))
+                        .await;
+                    break;
+                }
+
+                //key is (deadline, worker_id), so to renew TTL, the old pair must be removed and replaced,
+                //due to no in place updates.
+                {
+                    let mut guard = state.worker_heartbeat_timer.lock();
+
+                    let old_deadline = guard
+                        .iter()
+                        .find(|(_, id)| *id == worker_uuid)
+                        .map(|(instant, _)| *instant);
+
+                    if let Some(old_deadline) = old_deadline {
+                        guard.remove(&(old_deadline, worker_uuid));
+                    }
+
+                    guard.insert((now + state.heartbeat_deadline, worker_uuid));
+                }
+
+                //only after the guard is dropped: notifying while holding it makes the woken
+                //task immediately block on the lock we still own.
+                state.new_worker_deadline_notify.notify_one();
+
+                //compare with ping.active_jobs with the worker's assigned_jobs to possibly reconciliate inconsistencies in jobs
+
+                let jobs_taken_back: DispatchList;
+                let jobs_to_revoke: DispatchList;
+
+                if let Some(worker) = state.workers.get_mut(&worker_uuid) {
+                    {
+                        //assigned_jobs is accessed wtihin unreported_job_reconciliation_comparison
+                        //assigned_job(job_id) is removed within the method, and it is later reclaimed at line 621 by removing from running_jobs
+                        (jobs_taken_back, jobs_to_revoke) =
+                            unreported_job_reconciliation_comparison(ping, worker);
+                    }
+                } else {
+                    let _ = tx
+                        .send(Err(Status::not_found(
+                            "invalid worker uuid present in workers",
+                        )))
+                        .await;
+                    break;
+                }
+
+                let ack = HeartbeatControl {
+                    directive: Some(proto::heartbeat_control::Directive::Ack(proto::Ack {})),
+                };
+
+                //needs to remove job from assigned_job, running_job, and requeue/dlq
+
+                if !jobs_taken_back.is_empty() {
+                    //send back CancelJob directive for jobs who's heartbeat threshold has passed
+                    //let cancel_jobs = create_cancel_jobs(jobs_taken_back);
+
+                    for job in jobs_taken_back {
+                        let reclaim_outcome: ReclaimOutcome;
+
+                        if let Some(recycled_job) = state.running_jobs.remove(&job.0) {
+                            if recycled_job.1.running_phase == RunningPhase::Retrying {
+                                let _ = state
+                                    .running_jobs
+                                    .insert(recycled_job.1.id, recycled_job.1.clone());
+                            }
+
+                            reclaim_outcome = reclaim_job(recycled_job.1);
+
+                            match reclaim_outcome {
+                                Requeued(queued_job) => {
+                                    //reinsert into job_queue
+
+                                    let mut job_queue_guard = state.job_queue.lock();
+                                    let _ = job_queue_guard.insert(queued_job);
+                                }
+
+                                DeadLettered(dlq_job) => {
+                                    //insert into dlq and increment atomic
+
+                                    let _ = state.completed_jobs.insert(dlq_job.id, dlq_job);
+                                    state.total_dead_lettered.fetch_add(1, Ordering::Relaxed);
+                                }
+
+                                NotExecuting(running_job) => {
+                                    //put it back in running_jobs, job was retrying
+
+                                    let _ = state.running_jobs.insert(running_job.id, running_job);
+                                }
+                            }
+                        } else {
+                            let warning_job_id = job.0;
+                            tracing::warn!(
+                                "job was not found within running_jobs for job_id: {warning_job_id}"
+                            );
+                        }
+
+                        if tx
+                            .send(Ok(build_cancel_job(
+                                job.0,
+                                job.1,
+                                CancelReason::Revoked as i32,
+                            )))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+
+                if !jobs_to_revoke.is_empty() {
+                    //send back CancelJob directive for jobs who's heartbeat threshold has passed
+                    //let cancel_jobs = create_cancel_jobs(jobs_taken_back);
+
+                    for job in jobs_to_revoke {
+                        if tx
+                            .send(Ok(build_cancel_job(
+                                job.0,
+                                job.1,
+                                CancelReason::Revoked as i32,
+                            )))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+
+                    if tx.send(Ok(ack.clone())).await.is_err() {
+                        break;
+                    }
+                }
+
+                //Err here means the worker's receive half is gone, nothing left to serve.
+                if tx.send(Ok(ack)).await.is_err() {
+                    break;
                 }
             }
         });
 
         let output_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-
-        return Ok(Response::new(Box::pin(output_stream)));
-        
-        //return back stream with HeartbeatStream trait to caller
-
+        Ok(Response::new(Box::pin(output_stream)))
     }
-    
-
 }
 
+/// One dispatch, identified by (job_id, dispatch_token).
+pub type DispatchList = Vec<(Uuid, u64)>;
 
+/// A helper function to check jobs returned by worker HeartbeatPings. Checks reported active_jobs against the worker's assigned_jobs,
+/// increments missed_heartbeats, and returns a tuple of vectors of (job_uuid, dispatch tokens) for the scheduler to relinquish control of.
+/// If empty, it means that no jobs are to be cancelled.   
+/// Used by worker_service.rs: heartbeat RPC
+pub fn unreported_job_reconciliation_comparison(
+    ping: HeartbeatPing,
+    mut worker: RefMut<Uuid, WorkerInfo>,
+) -> (DispatchList, DispatchList) {
+    let worker_id = worker.id;
 
+    let mut cancel_jobs = vec![];
 
-#[tokio::test]
-async fn report_result_success() {
+    for id_job_pair in &mut worker.assigned_jobs {
+        let dummy = ActiveJob {
+            job_id: id_job_pair.0.as_bytes().to_vec(),
+            dispatch_token: id_job_pair.1.dispatch_token,
+        };
 
-    //this test should set up the gRPC server, and submit a job into job_queue, register a worker into workers, and then request work
-    //after the worker requests work, the job should be bound to the worker
-    //call report result after, with success, check to see if total_completed is 1, and see if job is in completed_jobs
-
-    //overall this tests the dispatch flow as well as matching, and then the completion result reporting flow and reassignemtn
-
-    let (mut scheduler_client, mut worker_client, clone_check) = fullside_bind_spawn_connect_for_tests().await;
-
-    let job = Job {
-        id: uuid::Uuid::now_v7(),
-        job_type: "test".to_string(),
-        payload: 0,
-        priority: 1,
-        retry_count: 0,
-        infra_interruptions: 0,
-        created_at: 0,
-        state: JobState::Queued,
-        retry_policy: scheduler_core::job_data_structures::RetryPolicy::NoRetry,
-        requirements: HashMap::new(),
-        metadata: HashMap::new(),
-    };
-
-    let job = tonic::Request::new(proto::Job::try_from(job).unwrap());
-
-    //send job into queued_jobs and check for existence
-
-    match scheduler_client.submit_job(job).await {
-        Ok(dum) => {
-            let dum = dum.into_inner();
-            match uuid::Uuid::from_slice(&dum.id) {
-                Ok(id) => {
-                    {
-                        let queued_jobs_stored = clone_check.job_queue.lock();
-                        if !queued_jobs_stored.iter().any(|job| job.id == id) {
-                            panic!();
-                        }
-                    }
-                },
-                Err(e) => {
-                    eprintln!("{e}");
-                    panic!();
-                }
-            }
-            
-        },
-
-        Err(e) => {
-            eprintln!("{e}");
-            panic!();
-        }
-    }
-
-    let test_worker = proto::Worker {
-        tags: HashMap::new(),
-        capabilities: HashMap::new(),
-        hostname: "test".to_string(),
-        job_types_supported: vec!["test".to_string()],
-        max_concurrent_jobs: 3,
-    };
-
-    let worker_uuid = match worker_client.register(Request::new(test_worker)).await {
-        Ok(response) => {
-            let worker_uuid = response.into_inner();
-            worker_uuid.worker_id
-            
-        },
-
-        Err(_) => {
-            panic!("registration of test_worker failed")
-        }
-    };
-
-
-    let job = match worker_client.request_work(Request::new(proto::AssignedWorkerId {
-        worker_id: worker_uuid.clone(),
-        })).await {
-
-        Ok(response) => {
-            let a = response.into_inner();
-            if let Some(job) = a.result {
-                if let proto::request_work_response::Result::Job(job) = job {
-                    job
-                } else {
-                    panic!("no work was available somehow")
-                }
+        if !ping.active_jobs.contains(&dummy) {
+            if id_job_pair.1.missed_heartbeats >= 1 {
+                cancel_jobs.push((*id_job_pair.0, id_job_pair.1.dispatch_token));
             } else {
-                panic!("None was sent over in response to request work")
-            }
-        },
-
-        Err(_) => {
-            panic!("requesting work failed")
-        }
-    };
-
-
-    //now that we have a job and the worker_uuid,
-
-    match worker_client.report_result(Request::new(proto::JobResult {
-        job_id: job.id.clone(),
-        worker_id: worker_uuid.clone(),
-        job_outcome: Some(proto::JobOutcome {
-            outcome: Some(proto::job_outcome::Outcome::Success(proto::job_outcome::Success { result: 1})),
-        }),
-    })).await {
-
-        Ok(_) => {
-
-        },
-
-        Err(_) => {
-            panic!("report result failed")
-        }
-
-    }
-
-    {
-        let lock = clone_check.job_queue.lock();
-        assert!(lock.is_empty()); 
-        //check that queued jobs is empty
-    }
-
-    {
-        if let Ok(job_uuid) = uuid::Uuid::from_slice(&job.id) {
-            let completed_job = clone_check.completed_jobs.get(&job_uuid);
-
-            if let Some(kv_ref) = completed_job {
-                assert_eq!(kv_ref.value().job_type, "test".to_string());
-                assert_eq!(kv_ref.value().outcome, CompletedJobOutcome::Succeeded { result: 1 });
-                assert_eq!(clone_check.total_completed.load(SeqCst), 1);
-                assert!(!clone_check.running_jobs.contains_key(&job_uuid));
-            } else {
-                panic!("id did not exist in completed_jobs")
+                id_job_pair.1.missed_heartbeats += 1;
             }
         } else {
-            panic!("uuid failed to form")
+            //reset missed heartbeats
+            id_job_pair.1.missed_heartbeats = 0;
         }
-        
     }
 
-    if let Some(worker) = clone_check.workers.get(&uuid::Uuid::from_slice(&worker_uuid).unwrap()) {
-        assert!(worker.assigned_jobs.is_empty());
+    //check for any jobs the worker might be holding that the scheduler does not know about to revoke
+
+    let mut jobs_to_revoke = vec![];
+
+    for jobs in ping.active_jobs {
+        match uuid::Uuid::from_slice(&jobs.job_id) {
+            Ok(job_id) => {
+                if let Some(assigned_job) = worker.assigned_jobs.get(&job_id) {
+                    if jobs.dispatch_token != assigned_job.dispatch_token {
+                        jobs_to_revoke.push((job_id, jobs.dispatch_token));
+                    }
+                } else {
+                    jobs_to_revoke.push((job_id, jobs.dispatch_token));
+                }
+            }
+
+            Err(_) => {
+                //probably should log error here
+                tracing::warn!("malformed job id detected at worker: {worker_id}");
+                continue;
+            }
+        }
     }
 
+    for id_token_pair in &cancel_jobs {
+        let _ = worker.assigned_jobs.remove(&id_token_pair.0);
+    }
 
-
+    (cancel_jobs, jobs_to_revoke)
 }
 
-#[tokio::test]
-async fn report_result_failure_to_retry() {
-    let (mut scheduler_client, mut worker_client, clone_check) = fullside_bind_spawn_connect_for_tests().await;
-
-    let job = Job {
-        id: uuid::Uuid::now_v7(),
-        job_type: "test".to_string(),
-        payload: 0,
-        priority: 1,
-        retry_count: 0,
-        infra_interruptions: 0,
-        created_at: 0,
-        state: JobState::Queued,
-        retry_policy: scheduler_core::job_data_structures::RetryPolicy::FixedDelay { delay_ms: 100, max_attempts: 3 },
-        requirements: HashMap::new(),
-        metadata: HashMap::new(),
-    };
-
-    let job = tonic::Request::new(proto::Job::try_from(job).unwrap());
-
-    //send job into queued_jobs and check for existence
-
-    match scheduler_client.submit_job(job).await {
-        Ok(dum) => {
-            let dum = dum.into_inner();
-            match uuid::Uuid::from_slice(&dum.id) {
-                Ok(id) => {
-                    {
-                        let queued_jobs_stored = clone_check.job_queue.lock();
-                        if !queued_jobs_stored.iter().any(|job| job.id == id) {
-                            panic!();
-                        }
-                    }
-                },
-                Err(e) => {
-                    eprintln!("{e}");
-                    panic!();
-                }
-            }
-            
-        },
-
-        Err(e) => {
-            eprintln!("{e}");
-            panic!();
-        }
+pub fn build_cancel_job(id: Uuid, token: u64, reason: i32) -> HeartbeatControl {
+    HeartbeatControl {
+        directive: Some(Directive::CancelJob(CancelJob {
+            job_id: id.as_bytes().to_vec(),
+            dispatch_token: token,
+            reason,
+        })),
     }
-
-    let test_worker = proto::Worker {
-        tags: HashMap::new(),
-        capabilities: HashMap::new(),
-        hostname: "test".to_string(),
-        job_types_supported: vec!["test".to_string()],
-        max_concurrent_jobs: 3,
-    };
-
-    let worker_uuid = match worker_client.register(Request::new(test_worker)).await {
-        Ok(response) => {
-            let worker_uuid = response.into_inner();
-            worker_uuid.worker_id
-            
-        },
-
-        Err(_) => {
-            panic!("registration of test_worker failed")
-        }
-    };
-
-
-    let job = match worker_client.request_work(Request::new(proto::AssignedWorkerId {
-        worker_id: worker_uuid.clone(),
-        })).await {
-
-        Ok(response) => {
-            let a = response.into_inner();
-            if let Some(job) = a.result {
-                if let proto::request_work_response::Result::Job(job) = job {
-                    job
-                } else {
-                    panic!("no work was available somehow")
-                }
-            } else {
-                panic!("None was sent over in response to request work")
-            }
-        },
-
-        Err(_) => {
-            panic!("requesting work failed")
-        }
-    };
-
-
-    let job_result = proto::JobResult {
-        job_id: job.id.clone(),
-        worker_id: worker_uuid.clone(),
-        job_outcome: Some(proto::JobOutcome { outcome: Some(proto::job_outcome::Outcome::Failure(proto::job_outcome::Failure { error: 1})) })
-    };
-
-    match worker_client.report_result(Request::new(job_result)).await {
-        Ok(_) => {},
-        Err(_) => { panic!("report result failed" )},
-    }
-
-    //check fields now
-
-    {
-        if let Ok(job_uuid) = uuid::Uuid::from_slice(&job.id) {
-            let retrying_job = clone_check.running_jobs.get(&job_uuid);
-
-            if let Some(job_ref) = retrying_job {
-         
-                assert_eq!(job_ref.retry_count, 1);
-                assert_eq!(job_ref.running_phase, RunningPhase::Retrying);
-                assert_eq!(job_ref.job_type, "test".to_string());
-                assert_eq!(clone_check.total_failed.load(SeqCst), 1);
-                
-                if let Some(worker) = clone_check.workers.get(&uuid::Uuid::from_slice(&worker_uuid).unwrap()) {
-                    assert!(worker.assigned_jobs.is_empty());
-                }
-            }
-        }
-    }
-
-
-
 }
 
-#[tokio::test]
-async fn report_result_failure_to_dlq() {
-    let (mut scheduler_client, mut worker_client, clone_check) = fullside_bind_spawn_connect_for_tests().await;
+//tests start here
 
-    let job = Job {
-        id: uuid::Uuid::now_v7(),
-        job_type: "test".to_string(),
-        payload: 0,
-        priority: 1,
-        retry_count: 0,
-        infra_interruptions: 0,
-        created_at: 0,
-        state: JobState::Queued,
-        retry_policy: scheduler_core::job_data_structures::RetryPolicy::NoRetry,
-        requirements: HashMap::new(),
-        metadata: HashMap::new(),
-    };
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scheduler_core::job_data_structures::RetryPolicy;
+    use std::collections::{HashMap, HashSet};
+    use tonic::transport::Channel;
 
-    let job = tonic::Request::new(proto::Job::try_from(job).unwrap());
+    type SchedulerClient = proto::scheduler_service_client::SchedulerServiceClient<Channel>;
+    type WorkerClient = proto::worker_service_client::WorkerServiceClient<Channel>;
 
-    //send job into queued_jobs and check for existence
+    const MAX_INFRA_INTERRUPTIONS: u64 = 5;
+    /// Everything a report_result test needs after setup has run.
+    struct Fixture {
+        worker_client: WorkerClient,
+        /// Clone of the server's `SchedulerState` — the same Arcs, so assertions see live state.
+        state: SchedulerState,
+        /// Raw proto bytes, since that is what the RPCs take.
+        worker_id: Vec<u8>,
+        job: proto::Job,
+    }
 
-    match scheduler_client.submit_job(job).await {
-        Ok(dum) => {
-            let dum = dum.into_inner();
-            match uuid::Uuid::from_slice(&dum.id) {
-                Ok(id) => {
-                    {
-                        let queued_jobs_stored = clone_check.job_queue.lock();
-                        if !queued_jobs_stored.iter().any(|job| job.id == id) {
-                            panic!();
-                        }
-                    }
-                },
-                Err(e) => {
-                    eprintln!("{e}");
-                    panic!();
-                }
+    /// Bind both services to an ephemeral port and serve them on a background task.
+    ///
+    /// Note: the background tasks (retry monitor, death detector) are deliberately *not*
+    /// spawned here. These tests assert on the state left behind by an RPC, and a running
+    /// retry monitor would drain the retry queue out from under them.
+    async fn spawn_server() -> (SchedulerClient, WorkerClient, SchedulerState) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let incoming = tonic::transport::server::TcpIncoming::from(listener);
+
+        let scheduler_service = crate::service::MySchedulerService::new();
+        let state = scheduler_service.scheduler_state.clone();
+        let worker_service = MyWorkerService::new(state.clone());
+
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(
+                    proto::scheduler_service_server::SchedulerServiceServer::new(scheduler_service),
+                )
+                .add_service(proto::worker_service_server::WorkerServiceServer::new(
+                    worker_service,
+                ))
+                .serve_with_incoming(incoming)
+                .await
+                .unwrap();
+        });
+
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+
+        (
+            SchedulerClient::new(channel.clone()),
+            WorkerClient::new(channel),
+            state,
+        )
+    }
+
+    /// Walk the full happy path up to the point of reporting: submit one job, register a
+    /// worker that can run it, and dispatch it via RequestWork.
+    async fn submit_register_dispatch(retry_policy: RetryPolicy) -> Fixture {
+        let (mut scheduler_client, mut worker_client, state) = spawn_server().await;
+
+        let job = Job {
+            id: Uuid::now_v7(),
+            job_type: "test".to_string(),
+            payload: 0,
+            priority: 1,
+            retry_count: 0,
+            infra_interruptions: 0,
+            dispatch_token: 0,
+            created_at: 0,
+            state: JobState::Queued,
+            retry_policy,
+            requirements: HashMap::new(),
+            metadata: HashMap::new(),
+        };
+
+        let submitted = scheduler_client
+            .submit_job(Request::new(proto::Job::try_from(job).unwrap()))
+            .await
+            .expect("submit_job failed")
+            .into_inner();
+
+        let submitted_id = Uuid::from_slice(&submitted.id).expect("submit_job returned a bad uuid");
+
+        {
+            let queued = state.job_queue.lock();
+            assert!(
+                queued.iter().any(|job| job.id == submitted_id),
+                "submitted job never landed in job_queue"
+            );
+        }
+
+        let worker_id = worker_client
+            .register(Request::new(proto::Worker {
+                tags: HashMap::new(),
+                capabilities: HashMap::new(),
+                hostname: "test".to_string(),
+                job_types_supported: vec!["test".to_string()],
+                max_concurrent_jobs: 3,
+            }))
+            .await
+            .expect("registration of test_worker failed")
+            .into_inner()
+            .worker_id;
+
+        let response = worker_client
+            .request_work(Request::new(proto::AssignedWorkerId {
+                worker_id: worker_id.clone(),
+            }))
+            .await
+            .expect("requesting work failed")
+            .into_inner();
+
+        let job = match response.result {
+            Some(proto::request_work_response::Result::Job(job)) => job,
+            Some(proto::request_work_response::Result::None(_)) => {
+                panic!("no work was available somehow")
             }
-            
-        },
+            None => panic!("None was sent over in response to request work"),
+        };
 
-        Err(e) => {
-            eprintln!("{e}");
-            panic!();
+        Fixture {
+            worker_client,
+            state,
+            worker_id,
+            job,
         }
     }
 
-    let test_worker = proto::Worker {
-        tags: HashMap::new(),
-        capabilities: HashMap::new(),
-        hostname: "test".to_string(),
-        job_types_supported: vec!["test".to_string()],
-        max_concurrent_jobs: 3,
-    };
+    fn job_result(f: &Fixture, outcome: proto::job_outcome::Outcome) -> Request<proto::JobResult> {
+        Request::new(proto::JobResult {
+            job_id: f.job.id.clone(),
+            worker_id: f.worker_id.clone(),
+            job_outcome: Some(proto::JobOutcome {
+                outcome: Some(outcome),
+            }),
+            dispatch_token: f.job.dispatch_token,
+        })
+    }
 
-    let worker_uuid = match worker_client.register(Request::new(test_worker)).await {
-        Ok(response) => {
-            let worker_uuid = response.into_inner();
-            worker_uuid.worker_id
-            
-        },
+    /// Covers submit -> register -> dispatch -> report success, i.e. the whole green path
+    /// including capability matching and slot release.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn report_result_success() {
+        let mut f = submit_register_dispatch(RetryPolicy::NoRetry).await;
 
-        Err(_) => {
-            panic!("registration of test_worker failed")
+        let report = job_result(
+            &f,
+            proto::job_outcome::Outcome::Success(proto::job_outcome::Success { result: 1 }),
+        );
+        f.worker_client
+            .report_result(report)
+            .await
+            .expect("report result failed");
+
+        assert!(f.state.job_queue.lock().is_empty());
+
+        let job_uuid = Uuid::from_slice(&f.job.id).expect("uuid failed to form");
+
+        {
+            let completed = f
+                .state
+                .completed_jobs
+                .get(&job_uuid)
+                .expect("id did not exist in completed_jobs");
+
+            assert_eq!(completed.job_type, "test".to_string());
+            assert_eq!(
+                completed.outcome,
+                CompletedJobOutcome::Succeeded { result: 1 }
+            );
         }
-    };
 
+        assert_eq!(f.state.total_completed.load(SeqCst), 1);
+        assert!(!f.state.running_jobs.contains_key(&job_uuid));
 
-    let job = match worker_client.request_work(Request::new(proto::AssignedWorkerId {
-        worker_id: worker_uuid.clone(),
-        })).await {
+        if let Some(worker) = f
+            .state
+            .workers
+            .get(&Uuid::from_slice(&f.worker_id).unwrap())
+        {
+            assert!(worker.assigned_jobs.is_empty());
+        }
+    }
 
-        Ok(response) => {
-            let a = response.into_inner();
-            if let Some(job) = a.result {
-                if let proto::request_work_response::Result::Job(job) = job {
-                    job
-                } else {
-                    panic!("no work was available somehow")
-                }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn report_result_failure_to_retry() {
+        let mut f = submit_register_dispatch(RetryPolicy::FixedDelay {
+            delay_ms: 100,
+            max_attempts: 3,
+        })
+        .await;
+
+        let report = job_result(
+            &f,
+            proto::job_outcome::Outcome::Failure(proto::job_outcome::Failure { error: 1 }),
+        );
+        f.worker_client
+            .report_result(report)
+            .await
+            .expect("report result failed");
+
+        let job_uuid = Uuid::from_slice(&f.job.id).expect("uuid failed to form");
+
+        // NOTE (preserved from the original): this is an `if let` with no `else`. If the job
+        // is NOT in running_jobs, every assertion below is skipped and the test passes without
+        // checking anything. See my notes — one-line fix.
+        if let Some(job_ref) = f.state.running_jobs.get(&job_uuid) {
+            assert_eq!(job_ref.retry_count, 1);
+            assert_eq!(job_ref.running_phase, RunningPhase::Retrying);
+            assert_eq!(job_ref.job_type, "test".to_string());
+            assert_eq!(f.state.total_failed.load(SeqCst), 1);
+
+            if let Some(worker) = f
+                .state
+                .workers
+                .get(&Uuid::from_slice(&f.worker_id).unwrap())
+            {
+                assert!(worker.assigned_jobs.is_empty());
             } else {
-                panic!("None was sent over in response to request work")
+                panic!("worker uuid missing from workers in scheduler_state");
             }
-        },
-
-        Err(_) => {
-            panic!("requesting work failed")
         }
-    };
-
-
-    let job_result = proto::JobResult {
-        job_id: job.id.clone(),
-        worker_id: worker_uuid.clone(),
-        job_outcome: Some(proto::JobOutcome { outcome: Some(proto::job_outcome::Outcome::Failure(proto::job_outcome::Failure { error: 1})) })
-    };
-
-    match worker_client.report_result(Request::new(job_result)).await {
-        Ok(_) => {},
-        Err(_) => { panic!("report result failed" )},
     }
 
-    //check fields now
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn report_result_failure_to_dlq() {
+        //NoRetry means determine_next_event dead-letters on the first failure.
+        let mut f = submit_register_dispatch(RetryPolicy::NoRetry).await;
 
-    {
-        if let Ok(job_uuid) = uuid::Uuid::from_slice(&job.id) {
-            let deadlettered_job = clone_check.completed_jobs.get(&job_uuid);
+        let report = job_result(
+            &f,
+            proto::job_outcome::Outcome::Failure(proto::job_outcome::Failure { error: 1 }),
+        );
+        f.worker_client
+            .report_result(report)
+            .await
+            .expect("report result failed");
 
-            if let Some(job_ref) = deadlettered_job {
-         
-                assert_eq!(job_ref.retry_count, 0);
-                assert_eq!(job_ref.job_type, "test".to_string());
-                assert_eq!(clone_check.total_dead_lettered.load(SeqCst), 1);
-                assert_eq!(job_ref.outcome, CompletedJobOutcome::DeadLettered { reason: "retries exhausted".to_string() });
-                if let Some(worker) = clone_check.workers.get(&uuid::Uuid::from_slice(&worker_uuid).unwrap()) {
-                    assert!(worker.assigned_jobs.is_empty());
+        let job_uuid = Uuid::from_slice(&f.job.id).expect("uuid failed to form");
+
+        // NOTE (preserved from the original): same vacuous-pass hazard as above.
+        if let Some(job_ref) = f.state.completed_jobs.get(&job_uuid) {
+            assert_eq!(job_ref.retry_count, 1);
+            assert_eq!(job_ref.job_type, "test".to_string());
+            assert_eq!(f.state.total_dead_lettered.load(SeqCst), 1);
+            assert_eq!(
+                job_ref.outcome,
+                CompletedJobOutcome::DeadLettered {
+                    reason: "retries exhausted".to_string()
                 }
+            );
+
+            if let Some(worker) = f
+                .state
+                .workers
+                .get(&Uuid::from_slice(&f.worker_id).unwrap())
+            {
+                assert!(worker.assigned_jobs.is_empty());
+            } else {
+                panic!("worker uuid missing from workers in scheduler_state")
             }
         }
     }
 
+    // dispatch token tests
+
+    /// Same as `job_result`, but with an explicit dispatch token instead of the fixture's.
+    fn job_result_with_token(
+        f: &Fixture,
+        outcome: proto::job_outcome::Outcome,
+        dispatch_token: u64,
+    ) -> Request<proto::JobResult> {
+        Request::new(proto::JobResult {
+            job_id: f.job.id.clone(),
+            worker_id: f.worker_id.clone(),
+            job_outcome: Some(proto::JobOutcome {
+                outcome: Some(outcome),
+            }),
+            dispatch_token,
+        })
+    }
+
+    /// The job must still be exactly where dispatch left it: Executing on this worker under
+    /// the dispatched token, holding its slot, not completed, not retrying, no counters moved.
+    fn assert_still_dispatched(f: &Fixture) {
+        let job_uuid = Uuid::from_slice(&f.job.id).unwrap();
+        let worker_uuid = Uuid::from_slice(&f.worker_id).unwrap();
+
+        {
+            let running = f
+                .state
+                .running_jobs
+                .get(&job_uuid)
+                .expect("job left running_jobs");
+
+            match running.running_phase {
+                RunningPhase::Executing {
+                    worker_id,
+                    dispatch_token,
+                    ..
+                } => {
+                    assert_eq!(worker_id, worker_uuid);
+                    assert_eq!(dispatch_token, f.job.dispatch_token);
+                }
+                RunningPhase::Retrying => panic!("job was moved to Retrying"),
+            }
+            assert_eq!(running.retry_count, 0, "a failure was counted");
+        } //drop the running_jobs guard before touching workers
+
+        {
+            let worker = f.state.workers.get(&worker_uuid).expect("worker missing");
+            assert!(
+                worker.assigned_jobs.contains_key(&job_uuid),
+                "the worker's slot was released"
+            );
+        }
+
+        assert!(!f.state.completed_jobs.contains_key(&job_uuid));
+        assert!(f.state.retry_queue.lock().is_empty());
+        assert_eq!(f.state.total_completed.load(SeqCst), 0);
+        assert_eq!(f.state.total_failed.load(SeqCst), 0);
+        assert_eq!(f.state.total_dead_lettered.load(SeqCst), 0);
+    }
+
+    /// Success and Cancelled reports (the complete_job path) carrying a token other than the
+    /// current dispatch's are rejected and change nothing. The genuine report still lands after.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn report_result_stale_token_rejected_on_complete_path() {
+        let mut f = submit_register_dispatch(RetryPolicy::NoRetry).await;
+        assert_ne!(f.job.dispatch_token, 0, "dispatch must mint a real token");
+
+        let stale_tokens = [0, f.job.dispatch_token + 1];
+
+        for stale_token in stale_tokens {
+            for outcome in [
+                proto::job_outcome::Outcome::Success(proto::job_outcome::Success { result: 1 }),
+                proto::job_outcome::Outcome::Cancelled(proto::job_outcome::Cancelled {}),
+            ] {
+                let err = f
+                    .worker_client
+                    .report_result(job_result_with_token(&f, outcome, stale_token))
+                    .await
+                    .expect_err("report with a stale dispatch token was accepted");
+                assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+                assert_still_dispatched(&f);
+            }
+        }
+
+        //the rejections must not have damaged anything: the genuine report is still accepted
+        let genuine = job_result(
+            &f,
+            proto::job_outcome::Outcome::Success(proto::job_outcome::Success { result: 1 }),
+        );
+        f.worker_client
+            .report_result(genuine)
+            .await
+            .expect("genuine report rejected after stale ones");
+
+        let job_uuid = Uuid::from_slice(&f.job.id).unwrap();
+        assert_eq!(
+            f.state
+                .completed_jobs
+                .get(&job_uuid)
+                .expect("job not in completed_jobs")
+                .outcome,
+            CompletedJobOutcome::Succeeded { result: 1 }
+        );
+    }
+
+    /// A Failure report (the handle_failure path) carrying a stale token is rejected and changes
+    /// nothing: no retry_count increment, no Retrying, no retry_queue entry, slot still held.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn report_result_stale_token_rejected_on_failure_path() {
+        let mut f = submit_register_dispatch(RetryPolicy::FixedDelay {
+            delay_ms: 100,
+            max_attempts: 3,
+        })
+        .await;
+
+        for stale_token in [0, f.job.dispatch_token + 1] {
+            let err = f
+                .worker_client
+                .report_result(job_result_with_token(
+                    &f,
+                    proto::job_outcome::Outcome::Failure(proto::job_outcome::Failure { error: 1 }),
+                    stale_token,
+                ))
+                .await
+                .expect_err("failure report with a stale dispatch token was accepted");
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+            assert_still_dispatched(&f);
+        }
+    }
+
+    /// Every dispatch gets its own nonzero token, and the token stored in RunningPhase is the
+    /// one that was sent to the worker.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn request_work_mints_a_distinct_token_per_dispatch() {
+        let (mut scheduler_client, mut worker_client, state) = spawn_server().await;
+
+        const JOBS: usize = 3;
+
+        for _ in 0..JOBS {
+            let job = Job {
+                id: Uuid::now_v7(),
+                job_type: "test".to_string(),
+                payload: 0,
+                priority: 1,
+                retry_count: 0,
+                infra_interruptions: 0,
+                dispatch_token: 0,
+                created_at: 0,
+                state: JobState::Queued,
+                retry_policy: RetryPolicy::NoRetry,
+                requirements: HashMap::new(),
+                metadata: HashMap::new(),
+            };
+            scheduler_client
+                .submit_job(Request::new(proto::Job::try_from(job).unwrap()))
+                .await
+                .expect("submit_job failed");
+        }
+
+        let worker_id = worker_client
+            .register(Request::new(proto::Worker {
+                tags: HashMap::new(),
+                capabilities: HashMap::new(),
+                hostname: "test".to_string(),
+                job_types_supported: vec!["test".to_string()],
+                max_concurrent_jobs: JOBS as u32,
+            }))
+            .await
+            .expect("registration failed")
+            .into_inner()
+            .worker_id;
+
+        let mut tokens = HashSet::new();
+
+        for _ in 0..JOBS {
+            let response = worker_client
+                .request_work(Request::new(proto::AssignedWorkerId {
+                    worker_id: worker_id.clone(),
+                }))
+                .await
+                .expect("request_work failed")
+                .into_inner();
+
+            let job = match response.result {
+                Some(proto::request_work_response::Result::Job(job)) => job,
+                other => panic!("expected a job, got {other:?}"),
+            };
+
+            assert_ne!(job.dispatch_token, 0, "dispatch must mint a real token");
+            assert!(
+                tokens.insert(job.dispatch_token),
+                "token {} was handed out twice",
+                job.dispatch_token
+            );
+
+            let job_uuid = Uuid::from_slice(&job.id).unwrap();
+            let running = state.running_jobs.get(&job_uuid).expect("job not running");
+            match running.running_phase {
+                RunningPhase::Executing { dispatch_token, .. } => {
+                    assert_eq!(dispatch_token, job.dispatch_token)
+                }
+                RunningPhase::Retrying => panic!("freshly dispatched job is Retrying"),
+            }
+        }
+    }
+
+    /// The bug the token exists for: attempt 1 fails, its report is retried by the worker after
+    /// the job has been re-dispatched to the SAME worker as attempt 2. The retried report must be
+    /// rejected without touching attempt 2, and attempt 2's own result must still be accepted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn report_result_rejects_earlier_attempt_after_redispatch_to_same_worker() {
+        let mut f = submit_register_dispatch(RetryPolicy::FixedDelay {
+            delay_ms: 50,
+            max_attempts: 3,
+        })
+        .await;
+
+        let job_uuid = Uuid::from_slice(&f.job.id).unwrap();
+        let attempt_1_token = f.job.dispatch_token;
+
+        //the fixture does not spawn the retry monitor; this test needs the requeue
+        tokio::spawn(crate::background::run_retry_queue_monitor(f.state.clone()));
+
+        let attempt_1_failure =
+            proto::job_outcome::Outcome::Failure(proto::job_outcome::Failure { error: 1 });
+
+        //attempt 1 fails -> Retrying -> requeued after ~50ms
+        f.worker_client
+            .report_result(job_result(&f, attempt_1_failure))
+            .await
+            .expect("attempt 1's failure report was rejected");
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if f.state
+                    .job_queue
+                    .lock()
+                    .iter()
+                    .any(|job| job.id == job_uuid)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("job was never requeued after its retry delay");
+
+        //attempt 2: the same worker gets the same job back
+        let response = f
+            .worker_client
+            .request_work(Request::new(proto::AssignedWorkerId {
+                worker_id: f.worker_id.clone(),
+            }))
+            .await
+            .expect("request_work failed")
+            .into_inner();
+
+        let attempt_2 = match response.result {
+            Some(proto::request_work_response::Result::Job(job)) => job,
+            other => panic!("expected the job back, got {other:?}"),
+        };
+        assert_eq!(attempt_2.id, f.job.id, "a different job was dispatched");
+        assert_ne!(
+            attempt_2.dispatch_token, attempt_1_token,
+            "re-dispatch must mint a new token"
+        );
+
+        //attempt 1's report arrives again (the worker retrying after a lost response)
+        let err = f
+            .worker_client
+            .report_result(job_result_with_token(
+                &f,
+                attempt_1_failure,
+                attempt_1_token,
+            ))
+            .await
+            .expect_err("attempt 1's stale report was applied to attempt 2");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        //attempt 2 is untouched
+        {
+            let running = f
+                .state
+                .running_jobs
+                .get(&job_uuid)
+                .expect("attempt 2 left running_jobs");
+            match running.running_phase {
+                RunningPhase::Executing { dispatch_token, .. } => {
+                    assert_eq!(dispatch_token, attempt_2.dispatch_token)
+                }
+                RunningPhase::Retrying => panic!("the stale report moved attempt 2 to Retrying"),
+            }
+            assert_eq!(
+                running.retry_count, 1,
+                "the stale report counted a second failure"
+            );
+        }
+        assert_eq!(f.state.total_failed.load(SeqCst), 1);
+
+        //attempt 2's own result lands
+        f.worker_client
+            .report_result(job_result_with_token(
+                &f,
+                proto::job_outcome::Outcome::Success(proto::job_outcome::Success { result: 7 }),
+                attempt_2.dispatch_token,
+            ))
+            .await
+            .expect("attempt 2's genuine report was rejected");
+
+        assert_eq!(
+            f.state
+                .completed_jobs
+                .get(&job_uuid)
+                .expect("job not in completed_jobs")
+                .outcome,
+            CompletedJobOutcome::Succeeded { result: 7 }
+        );
+    }
+
+    //heartbeat stream harness (for reconciliation tests)
+
+    /// Opens a heartbeat stream the way a worker would. Push pings into the returned sender;
+    /// read the scheduler's control messages from the returned stream.
+    async fn open_heartbeat(
+        worker_client: &mut WorkerClient,
+    ) -> (
+        tokio::sync::mpsc::Sender<proto::HeartbeatPing>,
+        tonic::Streaming<proto::HeartbeatControl>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let controls = worker_client
+            .heartbeat(tokio_stream::wrappers::ReceiverStream::new(rx))
+            .await
+            .expect("heartbeat RPC failed")
+            .into_inner();
+        (tx, controls)
+    }
+
+    /// A ping from `worker_id` claiming to hold exactly `active_jobs`.
+    fn ping(worker_id: &[u8], active_jobs: Vec<proto::ActiveJob>) -> proto::HeartbeatPing {
+        proto::HeartbeatPing {
+            worker_id: worker_id.to_vec(),
+            sent_at: 0,
+            active_jobs,
+        }
+    }
+
+    /// The (job_id, dispatch_token) entry a worker would list for a dispatched job.
+    fn active(job: &proto::Job) -> proto::ActiveJob {
+        proto::ActiveJob {
+            job_id: job.id.clone(),
+            dispatch_token: job.dispatch_token,
+        }
+    }
+
+    /// The next directive the scheduler sends. Panics if nothing arrives within 2s, the stream
+    /// errors or closes, or the message has no directive.
+    async fn next_directive(
+        controls: &mut tonic::Streaming<proto::HeartbeatControl>,
+    ) -> proto::heartbeat_control::Directive {
+        tokio::time::timeout(std::time::Duration::from_secs(2), controls.message())
+            .await
+            .expect("no control message within 2s")
+            .expect("heartbeat stream errored")
+            .expect("heartbeat stream closed")
+            .directive
+            .expect("control message carried no directive")
+    }
+
+    /// One ping's complete reply: reads control messages up to and including the Ack that closes
+    /// the reply, and returns every directive that came before it, in order.
+    ///
+    /// Relies on the heartbeat contract that every ping is answered with exactly one Ack, sent
+    /// last. That is what lets a test prove "this ping produced nothing else" without waiting on
+    /// a timeout. If the server ever sends two Acks for one ping, the second is left in the
+    /// stream and the next call returns early with an empty Vec, so a test that suddenly sees
+    /// nothing where it expected a cancel should suspect a doubled Ack first.
+    ///
+    /// Panics if any message takes longer than 2s, or the stream errors or closes.
+    async fn directives_until_ack(
+        controls: &mut tonic::Streaming<proto::HeartbeatControl>,
+    ) -> Vec<proto::heartbeat_control::Directive> {
+        let mut directives = Vec::new();
+
+        loop {
+            match next_directive(controls).await {
+                proto::heartbeat_control::Directive::Ack(_) => return directives,
+                other => directives.push(other),
+            }
+        }
+    }
+
+    /// The CancelJob directives in a reply, as (job_id, dispatch_token, reason) so a test can
+    /// compare the whole set with one assert_eq!. Panics on any directive that is not a
+    /// CancelJob, so an unexpected directive fails the test instead of being filtered away.
+    fn cancels_in(
+        directives: &[proto::heartbeat_control::Directive],
+    ) -> Vec<(Uuid, u64, CancelReason)> {
+        directives
+            .iter()
+            .map(|directive| match directive {
+                proto::heartbeat_control::Directive::CancelJob(cancel) => (
+                    Uuid::from_slice(&cancel.job_id).expect("CancelJob carried a malformed job id"),
+                    cancel.dispatch_token,
+                    cancel.reason(),
+                ),
+                other => panic!("expected only CancelJob directives, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// Harness smoke test: a ping listing the worker's one dispatch with the right token gets a
+    /// reply containing nothing but the closing Ack.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn heartbeat_reply_to_a_healthy_ping_is_only_an_ack() {
+        let mut f = submit_register_dispatch(RetryPolicy::NoRetry).await;
+        let (tx, mut controls) = open_heartbeat(&mut f.worker_client).await;
+
+        for _ in 0..3 {
+            tx.send(ping(&f.worker_id, vec![active(&f.job)]))
+                .await
+                .expect("ping not sent");
+
+            let reply = directives_until_ack(&mut controls).await;
+            assert!(
+                reply.is_empty(),
+                "healthy ping produced directives: {reply:?}"
+            );
+        }
+
+        assert_still_dispatched(&f);
+    }
+
+    /// Harness smoke test: a ping listing a dispatch the scheduler never handed out gets a reply
+    /// of exactly one Revoked CancelJob for it, closed by a single Ack, and the next healthy
+    /// ping's reply starts cleanly (nothing left over from the previous one).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn heartbeat_reply_reads_a_revoke_then_realigns() {
+        let mut f = submit_register_dispatch(RetryPolicy::NoRetry).await;
+        let (tx, mut controls) = open_heartbeat(&mut f.worker_client).await;
+
+        let unknown_job = Uuid::now_v7();
+        let unknown = proto::ActiveJob {
+            job_id: unknown_job.as_bytes().to_vec(),
+            dispatch_token: 999,
+        };
+
+        tx.send(ping(&f.worker_id, vec![active(&f.job), unknown]))
+            .await
+            .expect("ping not sent");
+
+        let reply = directives_until_ack(&mut controls).await;
+        assert_eq!(
+            cancels_in(&reply),
+            vec![(unknown_job, 999, CancelReason::Revoked)]
+        );
+
+        tx.send(ping(&f.worker_id, vec![active(&f.job)]))
+            .await
+            .expect("ping not sent");
+        assert!(directives_until_ack(&mut controls).await.is_empty());
+
+        assert_still_dispatched(&f);
+    }
+
+    /// Harness smoke test: a ping that lists the worker's one dispatch, with the right token,
+    /// is acknowledged and leaves the dispatch exactly as it was.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn heartbeat_acks_a_ping_listing_its_dispatch() {
+        let mut f = submit_register_dispatch(RetryPolicy::NoRetry).await;
+        let (tx, mut controls) = open_heartbeat(&mut f.worker_client).await;
+
+        tx.send(ping(&f.worker_id, vec![active(&f.job)]))
+            .await
+            .expect("ping not sent");
+
+        assert!(
+            matches!(
+                next_directive(&mut controls).await,
+                proto::heartbeat_control::Directive::Ack(_)
+            ),
+            "expected an Ack"
+        );
+
+        assert_still_dispatched(&f);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reconciliation_no_reports_test() {
+        let mut f = submit_register_dispatch(RetryPolicy::NoRetry).await;
+        let (tx, mut controls) = open_heartbeat(&mut f.worker_client).await;
+
+        let job_id = uuid::Uuid::from_slice(&f.job.id).unwrap();
+
+        tx.send(ping(&f.worker_id, vec![]))
+            .await
+            .expect("ping not sent");
+
+        assert!(
+            matches!(
+                next_directive(&mut controls).await,
+                proto::heartbeat_control::Directive::Ack(_)
+            ),
+            "expected an Ack"
+        );
+
+        tx.send(ping(&f.worker_id, vec![]))
+            .await
+            .expect("ping not sent");
+
+        let reply = directives_until_ack(&mut controls).await;
+        assert_eq!(
+            cancels_in(&reply),
+            vec![(job_id, f.job.dispatch_token, CancelReason::Revoked)]
+        );
+
+        {
+            let worker = f
+                .state
+                .workers
+                .get(&uuid::Uuid::from_slice(&f.worker_id).unwrap())
+                .unwrap();
+            assert!(worker.assigned_jobs.is_empty());
+        }
+
+        {
+            assert!(f.state.running_jobs.is_empty());
+        }
+
+        {
+            let job_queue_guard = f.state.job_queue.lock();
+            let job_id = uuid::Uuid::from_slice(&f.job.id).unwrap();
+
+            let job = job_queue_guard
+                .iter()
+                .find(|queued| queued.id == job_id)
+                .unwrap();
+
+            assert_eq!(job.infra_interruptions, 1);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reset_test() {
+        //miss, send in correct heartbeatPing, then miss and check missed_heartbeat count
+
+        let mut f = submit_register_dispatch(RetryPolicy::NoRetry).await;
+        let (tx, mut controls) = open_heartbeat(&mut f.worker_client).await;
+
+        let job_id = uuid::Uuid::from_slice(&f.job.id).unwrap();
+        let worker_id = uuid::Uuid::from_slice(&f.worker_id).unwrap();
+
+        tx.send(ping(&f.worker_id, vec![]))
+            .await
+            .expect("ping not sent");
+
+        let reply = directives_until_ack(&mut controls).await;
+        assert_eq!(cancels_in(&reply), vec![]);
+
+        {
+            let _ = f.state.running_jobs.get(&job_id).unwrap();
+
+            let worker = f.state.workers.get(&worker_id).unwrap();
+
+            let assigned_job = worker.assigned_jobs.get(&job_id).unwrap();
+
+            assert_eq!(assigned_job.missed_heartbeats, 1);
+        }
+
+        tx.send(ping(&f.worker_id, vec![active(&f.job)]))
+            .await
+            .expect("ping not sent");
+
+        let reply = directives_until_ack(&mut controls).await;
+        assert_eq!(cancels_in(&reply), vec![]);
+
+        {
+            let _ = f.state.running_jobs.get(&job_id).unwrap();
+
+            let worker = f.state.workers.get(&worker_id).unwrap();
+
+            let assigned_job = worker.assigned_jobs.get(&job_id).unwrap();
+
+            assert_eq!(assigned_job.missed_heartbeats, 0);
+        }
+
+        tx.send(ping(&f.worker_id, vec![]))
+            .await
+            .expect("ping not sent");
+
+        let reply = directives_until_ack(&mut controls).await;
+        assert_eq!(cancels_in(&reply), vec![]);
+
+        {
+            let _ = f.state.running_jobs.get(&job_id).unwrap();
+
+            let worker = f.state.workers.get(&worker_id).unwrap();
+
+            let assigned_job = worker.assigned_jobs.get(&job_id).unwrap();
+
+            assert_eq!(assigned_job.missed_heartbeats, 1);
+        }
+
+        //tried breaking the code at line 731, test failed as expected upon changing
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unknown_dispatch_test() {
+        let mut f = submit_register_dispatch(RetryPolicy::NoRetry).await;
+        let (tx, mut controls) = open_heartbeat(&mut f.worker_client).await;
+
+        let job_id = uuid::Uuid::from_slice(&f.job.id).unwrap();
+        let worker_id = uuid::Uuid::from_slice(&f.worker_id).unwrap();
+
+        let job = Job {
+            id: Uuid::now_v7(),
+            job_type: "test".to_string(),
+            payload: 0,
+            priority: 1,
+            retry_count: 0,
+            infra_interruptions: 0,
+            dispatch_token: 100,
+            created_at: 0,
+            state: JobState::Queued,
+            retry_policy: RetryPolicy::NoRetry,
+            requirements: HashMap::new(),
+            metadata: HashMap::new(),
+        };
+
+        let unknown_job_id = job.id;
+        let unknown_job_dispatch_token = job.dispatch_token;
+
+        let proto_job = proto::Job::try_from(job).unwrap();
+
+        tx.send(ping(&f.worker_id, vec![active(&proto_job)]))
+            .await
+            .expect("ping not sent");
+
+        let reply = directives_until_ack(&mut controls).await;
+        assert_eq!(
+            cancels_in(&reply),
+            vec![(
+                unknown_job_id,
+                unknown_job_dispatch_token,
+                CancelReason::Revoked
+            )]
+        );
+
+        {
+            let worker = f.state.workers.get(&worker_id).unwrap();
+            let original_job = worker.assigned_jobs.get(&job_id).unwrap();
+
+            assert_eq!(original_job.missed_heartbeats, 1);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mixed_case_test() {
+        let mut f = submit_register_dispatch(RetryPolicy::NoRetry).await;
+        let (tx, mut controls) = open_heartbeat(&mut f.worker_client).await;
+
+        let job_id = uuid::Uuid::from_slice(&f.job.id).unwrap();
+
+        let old = proto::ActiveJob {
+            job_id: f.job.id.clone(),
+            dispatch_token: f.job.dispatch_token - 1,
+        };
+
+        tx.send(ping(&f.worker_id, vec![old, active(&f.job)]))
+            .await
+            .unwrap();
+
+        let reply = directives_until_ack(&mut controls).await;
+
+        assert_eq!(
+            cancels_in(&reply),
+            vec![(job_id, f.job.dispatch_token - 1, CancelReason::Revoked)]
+        );
+
+        assert_still_dispatched(&f);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dlq_test() {
+        let mut f = submit_register_dispatch(RetryPolicy::NoRetry).await;
+        let (tx, mut controls) = open_heartbeat(&mut f.worker_client).await;
+
+        let job_id = uuid::Uuid::from_slice(&f.job.id).unwrap();
+
+        f.state
+            .running_jobs
+            .get_mut(&job_id)
+            .unwrap()
+            .infra_interruptions = MAX_INFRA_INTERRUPTIONS;
+
+        tx.send(ping(&f.worker_id, vec![]))
+            .await
+            .expect("ping not sent");
+
+        assert!(
+            matches!(
+                next_directive(&mut controls).await,
+                proto::heartbeat_control::Directive::Ack(_)
+            ),
+            "expected an Ack"
+        );
+
+        tx.send(ping(&f.worker_id, vec![]))
+            .await
+            .expect("ping not sent");
+
+        let reply = directives_until_ack(&mut controls).await;
+        assert_eq!(
+            cancels_in(&reply),
+            vec![(job_id, f.job.dispatch_token, CancelReason::Revoked)]
+        );
+
+        {
+            assert_eq!(f.state.total_dead_lettered.load(Ordering::Relaxed), 1);
+
+            let dlq_job = f.state.completed_jobs.get(&job_id).unwrap();
+
+            assert_eq!(
+                dlq_job.outcome,
+                CompletedJobOutcome::DeadLettered {
+                    reason: "exceeded infrastructure interruption cap, treated as a poison pill"
+                        .to_string()
+                }
+            );
+        }
+    }
 }

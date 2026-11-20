@@ -47,6 +47,13 @@ message Job {
     map<string, string> requirements = 9;
     map<string, string> metadata = 10;
     uint64 infra_interruptions = 11;
+
+    //dispatch_token is a way to have idempotency with report_result, basically a atomic U64 incremented by the scheduler for every dispatch
+    //during request_work.
+    //for each report_result, the stored dispatch token within RunningPhase::Executing is compared to the reported dispatch token
+    //if there is a mismatch, then it means the report belongs to a previous attempt at the job and should be Ignored
+    //also 0 means "not dispatched" 
+    uint64 dispatch_token = 12;
 }
 
 message JobStatus {
@@ -95,6 +102,8 @@ message JobResult {
     bytes job_id = 1;
     bytes worker_id = 2;
     JobOutcome job_outcome = 3;
+    // echo of Job.dispatch_token for the dispatch this result belongs to.
+    uint64 dispatch_token = 4;
 }
 
 message JobOutcome {
@@ -166,16 +175,43 @@ message AssignedWorkerID {
 message HeartbeatPing {
     bytes worker_id = 1;
     uint64 sent_at = 2;
+    // active_jobs is a list of ActiveJobs which are the dispatches the worker is currently holding, this will
+    //be echoed to make sure that the jobs the worker thinks it has and the scheduler thinks it has is consistent.
+    // if not consistent, then the scheduler can reclaim the jobs and has a 1 heartbeat tolerance (currently 5 seconds)
+    // for jobs that are brand new and might be missed by the first heartbeat --> slow worker is same as dead
+    repeated ActiveJob active_jobs = 3;
+}
+
+message ActiveJob {
+    bytes job_id = 1;
+    uint64 dispatch_token = 2;
 }
 
 message HeartbeatControl {
     oneof directive {
         Ack ack = 1;
         StopAcceptingWork stop_accepting_work = 2;
+        CancelJob cancel_job = 3;
     }
 }
 message Ack {}
 message StopAcceptingWork {}
+
+// Stop one specific dispatch. Ignored by the worker if job_id + dispatch_token
+// does not match a dispatch it is holding.
+message CancelJob {
+    bytes job_id = 1;
+    uint64 dispatch_token = 2;
+    CancelReason reason = 3;
+}
+
+enum CancelReason {
+    CANCEL_REASON_UNSPECIFIED = 0;
+    // a user asked to cancel the job, report Cancelled.
+    CANCEL_REASON_USER = 1;
+    // the scheduler took the job back (reconciliation), report nothing.
+    CANCEL_REASON_REVOKED = 2;
+}
 
 message SubmitJobResponse {
     bytes id = 1;
