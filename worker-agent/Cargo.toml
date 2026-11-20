@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 async-trait = "0.1.92"
 clap = { version = "4.6.6", features = ["derive"] }
-futures = "0.3.34"
+#futures = "0.3.34"
 gethostname = "1.1.0"
 ordered-float = "5.5.0"
 parking_lot = "0.12.5"

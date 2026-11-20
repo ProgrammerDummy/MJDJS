@@ -718,7 +718,7 @@ mod tests {
         eventually(
             std::time::Duration::from_secs(2),
             "waiting for running job report to come in",
-            || fake.reports().len() >= 1,
+            || !fake.reports().is_empty(),
         )
         .await;
 
