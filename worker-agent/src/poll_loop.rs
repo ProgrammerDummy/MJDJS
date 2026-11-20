@@ -694,7 +694,7 @@ mod tests {
 
         let registry = test_registry();
 
-        let exit = tokio::spawn(poll_loop(
+        tokio::spawn(poll_loop(
             addr,
             locked_worker_id.clone(),
             3,
